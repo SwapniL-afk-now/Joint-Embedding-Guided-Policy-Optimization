@@ -1,0 +1,116 @@
+# JEPA-GRPO Ray overrides — merged on top of ppo_trainer base in main_ray.py.
+# Only override what differs from ppo_trainer defaults.
+
+defaults:
+  - _self_
+
+# ── JEPA hyperparameters ────────────────────────────────────────────────────
+jepa:
+  enable: true
+  n_cot: 4
+  n_code: 4
+  alpha: 0.1
+  alpha_warmup_steps: 0
+  ema_decay: 0.99
+  max_grad_norm: 0.5
+  embed_micro_batch_size: 16
+  min_valid_pairs: 2
+  n_projections: 1024
+  t_min: -5.0
+  t_max: 5.0
+  epps_pulley_s: 1.0
+  code_system_prompt: "You are a Python programming expert. Solve the following math problem by writing a complete, executable Python program that prints the answer."
+  loss_type: jepa-tcr-dual     # only supported ray/worker objective
+  predictor_k: 0
+  triplet_sigreg_lambda: 0.05  # SIGReg lambda for the jepa-tcr-dual loss
+  # -- jepa-tcr-dual teacher caches --
+  teacher_cache_path: ""       # .pt of {dataset_index: (n_i,d)} teacher-correct targets
+  n_targets_per_q: 4           # cap of cached targets used per question
+  tcr_match: cycle             # anchor->target pairing: cycle | random
+  jepa_anchor_set: correct     # anchors: correct | all | wrong (reward-stratified)
+  # -- jepa-tcr-dual teacher-alignment reward shaping --
+  tcr_reward_beta: 0.5         # advantage-shaping strength (standardized score scale)
+  tcr_reward_sigma_floor: 0.1  # min within-stratum std (noise guard)
+  # -- jepa-tcr-dual (CoT + Code dual-target) --
+  code_teacher_cache_path: ""  # .pt of {dataset_index: (n_i,d)} code-view teacher targets
+  self_consist_w: 1.0          # weight of the self-consistency align term (dual differentiable)
+  # -- auto-off on alignment plateau (gates both reward shaping and differentiable jepa) --
+  auto_off_enable: false
+  auto_off_metric: ""          # "" = auto-pick by mode (shaping/s_mean_correct or jepa/cos_cot)
+  auto_off_patience: 10
+  auto_off_min_delta: 0.002
+  auto_off_warmup_steps: 20
+  auto_off_min_cos: 0.0        # plateau counter only starts once arm cosine >= this value (0.0 = disabled)
+
+# ── Algorithm (GRPO, no KL) ─────────────────────────────────────────────────
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+  use_kl_in_reward: false
+
+# ── Critic disabled for GRPO ─────────────────────────────────────────────────
+critic:
+  enable: false
+
+# ── Trainer defaults ─────────────────────────────────────────────────────────
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 1
+  total_training_steps: 3000
+  save_freq: 20
+  test_freq: 10
+  val_before_train: true
+  project_name: verl_jepa_grpo_ray
+  experiment_name: jepa_grpo_ray
+  default_local_dir: checkpoints/jepa_grpo_ray
+  logger:
+    - console
+  max_actor_ckpt_to_keep: 2
+
+# ── Data defaults ─────────────────────────────────────────────────────────────
+data:
+  train_batch_size: 64
+  max_prompt_length: 1024
+  max_response_length: 2048
+  filter_overlong_prompts: true
+  truncation: error
+
+# ── Actor / rollout defaults ─────────────────────────────────────────────────
+actor_rollout_ref:
+  model:
+    lora_rank: 128
+    lora_alpha: 256
+    target_modules: all-linear
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+
+  actor:
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    use_kl_loss: false
+    kl_loss_coef: 0.0
+    entropy_coeff: 0.0
+    ppo_epochs: 1
+    ppo_mini_batch_size: 256
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 32768
+    checkpoint:
+      save_contents:
+        - model
+        - optimizer
+        - extra
+      load_contents:
+        - model
+        - optimizer
+        - extra
+
+  rollout:
+    name: vllm
+    n: 8
+    temperature: 1.0
+    top_p: 0.95
+    gpu_memory_utilization: 0.55
+    max_num_seqs: 1024
+    free_cache_engine: true
+    log_prob_max_token_len_per_gpu: 32768
