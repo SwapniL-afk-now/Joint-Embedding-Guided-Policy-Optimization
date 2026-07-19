@@ -624,6 +624,9 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        # Exact prompt+response rows for optional representation probes.
+        sample_rep_token_ids = []
+        sample_rep_prompt_ids = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -684,6 +687,14 @@ class RayPPOTrainer:
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
+            if "input_ids" in test_batch.batch and "attention_mask" in test_batch.batch:
+                prompt_width = test_batch.batch["prompts"].shape[1]
+                for ids, mask, prompt in zip(
+                    test_batch.batch["input_ids"], test_batch.batch["attention_mask"], test_batch.batch["prompts"]
+                ):
+                    sample_rep_token_ids.append(ids[mask.bool()].detach().cpu())
+                    sample_rep_prompt_ids.append(prompt[mask[:prompt_width].bool()].detach().cpu())
+
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
             # TODO: Can we keep special tokens except for padding tokens?
@@ -736,6 +747,16 @@ class RayPPOTrainer:
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+        # The final validation seed remains available to the t-SNE callback.
+        self._last_validation_rep_samples = {
+            "token_ids": sample_rep_token_ids,
+            "prompt_ids": sample_rep_prompt_ids,
+            "data_sources": [str(x) for arr in data_source_lst for x in arr],
+            "uids": [str(x) for x in sample_uids],
+            "scores": [float(x) for x in sample_scores],
+            "ground_truths": [str(x) for x in sample_gts],
+        }
 
         if merged:
             print("_merge_validation_results validate result will be merged")
@@ -1257,7 +1278,25 @@ class RayPPOTrainer:
         avg_at_k = sum(avg_scores) / len(avg_scores) if avg_scores else None
         pass_at_k = sum(pass_scores) / len(pass_scores) if pass_scores else None
 
-        if "@" in metric and metric.split("@", 1)[0] in ("avg", "pass"):
+        if "+" in metric:
+            # Equal-weight composite of explicit sub-budget metrics, e.g.
+            # "pass+pass". Every component must be available.
+            component_scores = []
+            for component in metric.split("+"):
+                kind, sep, budget = component.partition("@")
+                if not sep or kind not in ("avg", "pass") or not budget:
+                    return None, avg_at_k, pass_at_k
+                field = f"{kind}_at_{budget}"
+                values = [
+                    val_metrics[f"val/{source}/{field}"]
+                    for source in best_ckpt_sources
+                    if f"val/{source}/{field}" in val_metrics
+                ]
+                if not values:
+                    return None, avg_at_k, pass_at_k
+                component_scores.append(sum(values) / len(values))
+            return sum(component_scores) / len(component_scores), avg_at_k, pass_at_k
+        elif "@" in metric and metric.split("@", 1)[0] in ("avg", "pass"):
             kind, _, budget = metric.partition("@")
             field = f"{kind}_at_{budget}"
             sub_scores = [
@@ -1306,7 +1345,7 @@ class RayPPOTrainer:
         metrics_list = self.config.trainer.get("best_ckpt_metrics", None)
         if metrics_list:
             # Sanitise metric string for use as a directory name (@ -> _at_).
-            entries = [(str(m).lower(), f"best_{str(m).lower().replace('@', '_at_')}") for m in metrics_list]
+            entries = [(str(m).lower(), f"best_{str(m).lower().replace('@', '_at_').replace('+', '_plus_')}") for m in metrics_list]
         else:
             metric = str(self.config.trainer.get("best_ckpt_metric", "combined")).lower()
             entries = [(metric, "best")]

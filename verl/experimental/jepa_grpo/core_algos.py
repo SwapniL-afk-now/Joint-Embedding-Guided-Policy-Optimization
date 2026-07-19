@@ -227,6 +227,93 @@ def lejepa_loss(
 
 
 # ---------------------------------------------------------------------------
+# LLM-JEPA (paper-exact) loss — Huang, LeCun, Balestriero 2025, arXiv:2509.14252
+# ---------------------------------------------------------------------------
+
+def llm_jepa_paper_loss(
+    pred: torch.Tensor,          # (N, d) Pred(Enc([x, y_S, [PRED]×k])) — student CoT reads, L2-normalized
+    target_cot: torch.Tensor,    # (N, d) Enc([x, y_T_cot]) — teacher CoT view, L2-normalized, NOT detached
+    target_code: torch.Tensor,   # (N, d) Enc([x, y_T_code]) — teacher Code view, L2-normalized, NOT detached
+    has_code: torch.Tensor,      # (N,) bool — rows with a code target (False -> code arm skips that row)
+    align_cot_on: bool = True,
+    align_code_on: bool = True,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Exact replication of the official LLM-JEPA fine-tuning loss (finetune.py):
+
+        L_JEPA = 1 - mean_i cos(Pred(Enc(Text_i)), Enc(Code_i))
+
+    Paper/reference-implementation properties preserved verbatim:
+      - metric d(.,.) = cosine distance via F.cosine_similarity (here: dot product
+        of pre-L2-normalized embeddings — mathematically identical, including the
+        gradient, since normalization is part of the cosine derivative);
+      - a FLAT mean over pairs (no reward stratification, no prompt averaging);
+      - NO stop-gradient on either branch: the reference concatenates all views
+        into one differentiable forward, so Enc(target) receives gradient exactly
+        like Pred(Enc(text)) does. Callers must therefore pass NON-detached
+        target embeddings from a grad-enabled forward;
+      - no SIGReg / InfoNCE / variance term (those are ablations, not the loss).
+
+    Deviation (per project design, not the paper): the paper's single (Text, Code)
+    view pair becomes TWO pairs sharing one prediction — the student's generated
+    CoT predicts BOTH the teacher's CoT response and the teacher's Code response:
+
+        L = d(p, Enc([x, y^T_cot])) + d(p, Enc([x, y^T_code]))
+
+    Each arm is the unmodified paper loss; they are summed with equal weight.
+    """
+    device, dtype = pred.device, pred.dtype
+    N = pred.shape[0]
+    if N == 0:
+        zero = torch.zeros((), device=device, dtype=dtype)
+        return zero, {
+            "jepa/llm_jepa_loss": 0.0, "jepa/align_cot": 0.0, "jepa/align_code": 0.0,
+            "jepa/cos_cot": 0.0, "jepa/cos_code": 0.0,
+            "jepa/n_anchors_cot": 0, "jepa/n_anchors_code": 0, "jepa/pool_size": 0,
+        }
+
+    # Embeddings arrive unit-norm; dot == F.cosine_similarity of the raw states.
+    cos_cot = (pred * target_cot).sum(dim=-1)                  # (N,)
+    align_cot = (1.0 - cos_cot).mean()
+
+    hc = has_code.to(device=device, dtype=torch.bool)
+    n_code = int(hc.sum().item())
+    if n_code > 0:
+        cos_code = (pred[hc] * target_code[hc]).sum(dim=-1)    # (n_code,)
+        align_code = (1.0 - cos_code).mean()
+    else:
+        cos_code = pred.new_zeros((0,))
+        align_code = torch.zeros((), device=device, dtype=dtype)
+
+    c_cot = 1.0 if align_cot_on else 0.0
+    c_code = 1.0 if align_code_on else 0.0
+    loss = c_cot * align_cot + c_code * align_code
+
+    metrics = {
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
+        "jepa/tcr_loss": float(loss.detach().cpu()),  # alias: keeps wandb key parity with prior runs
+        "jepa/align_cot": float(align_cot.detach().cpu()),
+        "jepa/align_code": float(align_code.detach().cpu()),
+        "jepa/cos_cot": float(cos_cot.detach().mean().cpu()),
+        "jepa/cos_code": float(cos_code.detach().mean().cpu()) if n_code > 0 else 0.0,
+        "jepa/n_anchors_cot": int(N),
+        "jepa/n_anchors_code": int(n_code),
+        "jepa/pool_size": int(N),
+        "jepa/arm_cot_on": float(align_cot_on),
+        "jepa/arm_code_on": float(align_code_on),
+        # Constant-zero keys kept ONLY for wandb panel parity with prior
+        # jepa-tcr-dual runs (e.g. grpo-qwen-3b/jxorb8w4): the paper loss has no
+        # SIGReg, self-consistency, or lambda mixing.
+        "jepa/self_consist_loss": 0.0,
+        "jepa/tcr_sigreg_loss": 0.0,
+        "jepa/cos_self": 0.0,
+        "jepa/n_self_pairs": 0,
+        "jepa/tcr_lambda": 0.0,
+        "jepa/arm_self_on": 0.0,
+    }
+    return loss, metrics
+
+
+# ---------------------------------------------------------------------------
 # LLM-JEPA loss: cosine-distance prediction alignment + SIGReg
 # ---------------------------------------------------------------------------
 

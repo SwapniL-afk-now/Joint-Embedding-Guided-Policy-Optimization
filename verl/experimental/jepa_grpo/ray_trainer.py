@@ -33,6 +33,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 
 from verl import DataProto
 from verl.experimental.fepo.math_parser import compute_math_reward
@@ -107,33 +108,43 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             import dataclasses
 
             if self.jepa_cfg.predictor_k > 0:
-                self.jepa_cfg.predictor_token_id = self._resolve_predictor_token_id()
+                self.jepa_cfg.predictor_token_ids = self._resolve_predictor_token_ids(
+                    self.jepa_cfg.predictor_k
+                )
 
             cfg_dict = dataclasses.asdict(self.jepa_cfg)
             self.actor_rollout_wg.jepa_init(cfg_dict)
 
-    def _resolve_predictor_token_id(self) -> int:
-        """Pick a token id to use for the LLM-JEPA tied-weight predictor (paper §3.1).
+    def _resolve_predictor_token_ids(self, k: int) -> list[int]:
+        """Add the paper's LITERAL predictor special tokens and return the append
+        sequence — exactly the official finetune.py mechanics:
 
-        The paper introduces a literal new [PRED] token. We avoid resizing the
-        embedding matrix (which would also have to be threaded through LoRA)
-        by instead reusing an existing, otherwise-unused token:
-          1. Prefer an unused reserved/special token already in the tokenizer's
-             vocab (e.g. Qwen-style `<|extra_0|>`...) that isn't part of the
-             active chat template — the model has trained (if rarely-used)
-             embeddings for these and no architecture change is needed.
-          2. Fall back to pad_token_id (or eos_token_id if no pad token) — a
-             deliberate simplification, documented here rather than the paper's
-             literal new-token approach.
+          - k distinct special tokens ``<|predictor_1|>`` .. ``<|predictor_k|>`` are
+            added to the tokenizer via ``add_special_tokens`` (only those not already
+            in the vocab, mirroring finetune.py's ``token not in tokenizer.vocab``);
+          - they are appended to the Text view in DESCENDING slot order
+            ``<|predictor_k|>, ..., <|predictor_1|>`` (finetune.py's ``while to_add``
+            back-append loop), so the last — read — token is always ``<|predictor_1|>``.
+
+        The one mechanical difference from finetune.py: no ``resize_token_embeddings``.
+        Qwen2.5's embedding matrix is padded (config vocab 151936 vs ~151665 tokenizer
+        ids), so the new ids land in ALREADY-ALLOCATED spare rows — resizing would
+        break LoRA adapter shapes and vLLM weight sync, and finetune.py's resize is a
+        no-op whenever the matrix already has the rows. worker.jepa_init asserts the
+        ids are in-bounds. The new tokens never appear in rollout prompts, so vLLM's
+        own tokenizer copy is unaffected.
         """
         tok = self.tokenizer
-        for candidate in getattr(tok, "additional_special_tokens", []) or []:
-            cid = tok.convert_tokens_to_ids(candidate)
-            if cid is not None and cid != tok.unk_token_id:
-                return int(cid)
-        if tok.pad_token_id is not None:
-            return int(tok.pad_token_id)
-        return int(tok.eos_token_id)
+        names = [f"<|predictor_{i}|>" for i in range(1, k + 1)]
+        vocab = tok.get_vocab()
+        new_tokens = [t for t in names if t not in vocab]
+        if new_tokens:
+            tok.add_special_tokens({"additional_special_tokens": new_tokens})
+            logger.info("[jepa] added %d literal predictor special tokens: %s",
+                        len(new_tokens), new_tokens)
+        ids = [int(tok.convert_tokens_to_ids(t)) for t in names]   # slot 1..k
+        assert all(i is not None and i >= 0 for i in ids), f"predictor token ids unresolved: {ids}"
+        return list(reversed(ids))   # append order: <|predictor_k|> .. <|predictor_1|>
 
     # ------------------------------------------- code-view tokenisation -----
     def _tokenize_code_prompts(self, batch: DataProto) -> DataProto:
@@ -187,6 +198,147 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         return code_batch
 
     # ------------------------------------------- dual-view validation -------
+    def _validate(self, merged: bool = False):
+        metrics = super()._validate(merged=merged)
+        if not merged:
+            self._maybe_log_validation_rep_tsne()
+        return metrics
+
+    def _maybe_log_validation_rep_tsne(self) -> None:
+        """Log a t-SNE of one response per problem from the exact val suite."""
+        cfg = self.config.trainer
+        if not bool(cfg.get("rep_tsne_enable", False)):
+            return
+        freq = max(1, int(cfg.get("rep_tsne_freq", cfg.test_freq)))
+        if self.global_steps != 0 and self.global_steps % freq != 0:
+            return
+        raw = getattr(self, "_last_validation_rep_samples", None)
+        if not raw or not raw.get("token_ids"):
+            logger.warning("representation t-SNE skipped: no validation rows")
+            return
+
+        chosen, seen = [], set()
+        for i, uid in enumerate(raw["uids"]):
+            if uid not in seen:
+                seen.add(uid); chosen.append(i)
+        rows = [raw["token_ids"][i] for i in chosen]
+        target_rows = []
+        eos = [] if self.tokenizer.eos_token_id is None else [int(self.tokenizer.eos_token_id)]
+        for i in chosen:
+            answer = self.tokenizer(
+                raw["ground_truths"][i], add_special_tokens=False, return_tensors="pt"
+            )["input_ids"][0].cpu()
+            target_rows.append(torch.cat([
+                raw["prompt_ids"][i].long(), answer.long(), torch.tensor(eos, dtype=torch.long)
+            ]))
+        all_rows = rows + target_rows
+        if len(rows) < 4:
+            return
+        max_len = max(int(row.numel()) for row in all_rows)
+        ids = torch.full((len(all_rows), max_len), int(self.tokenizer.pad_token_id or 0), dtype=torch.long)
+        mask = torch.zeros_like(ids)
+        lengths = torch.tensor([row.numel() for row in all_rows], dtype=torch.long)
+        for i, row in enumerate(all_rows):
+            ids[i, :row.numel()] = row.long(); mask[i, :row.numel()] = 1
+        td = TensorDict({
+            "input_ids": ids, "attention_mask": mask, "lengths": lengths,
+            "micro_bs": torch.full((len(all_rows),), int(cfg.get("rep_tsne_micro_batch_size", 4))),
+        }, batch_size=[len(all_rows)])
+        out = self.actor_rollout_wg.embed_validation_sequences(td)
+        if isinstance(out, list):
+            out = out[0]
+        all_emb = out["embeddings"].detach().cpu().numpy()
+        emb, target_emb = np.split(all_emb, 2)
+
+        import json, os
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+        sources = np.asarray([raw["data_sources"][i] for i in chosen], dtype=object)
+        correct = np.asarray([raw["scores"][i] > 0 for i in chosen], dtype=bool)
+        perplexity = min(float(cfg.get("rep_tsne_perplexity", 30)), max(2.0, (len(rows)-1)/3))
+        proj = TSNE(n_components=2, init="pca", learning_rate="auto",
+                    perplexity=perplexity,
+                    random_state=int(cfg.get("rep_tsne_seed", 14142))).fit_transform(emb)
+        out_dir = os.path.join(str(cfg.default_local_dir), "representation_tsne")
+        os.makedirs(out_dir, exist_ok=True)
+        stem = os.path.join(out_dir, f"step_{int(self.global_steps)}")
+        # Paper-style representation diagnostics. Compare generated-answer
+        # embeddings with answer-conditioned target embeddings for the same prompts.
+        difference = emb - target_emb
+        singular_values = np.linalg.svd(
+            difference - difference.mean(axis=0, keepdims=True), compute_uv=False
+        )
+        sv_mass = singular_values / max(float(singular_values.sum()), 1e-12)
+        effective_rank = float(np.exp(-(sv_mass * np.log(sv_mass + 1e-12)).sum()))
+        cosine = np.sum(emb * target_emb, axis=1) / np.maximum(
+            np.linalg.norm(emb, axis=1) * np.linalg.norm(target_emb, axis=1), 1e-12
+        )
+        split = max(1, len(rows) // 2)
+        x_train, y_train = emb[:split], target_emb[:split]
+        x_test, y_test = emb[split:], target_emb[split:]
+        if len(x_test):
+            gram = x_train @ x_train.T
+            alpha = np.linalg.solve(gram + 1e-3 * np.eye(len(x_train)), y_train)
+            mapped = (x_test @ x_train.T) @ alpha
+            linear_residual = float(
+                np.linalg.norm(mapped - y_test) / max(float(np.linalg.norm(y_test)), 1e-12)
+            )
+        else:
+            linear_residual = float("nan")
+
+        np.savez(stem+".npz", embeddings=emb, target_embeddings=target_emb,
+                 differences=difference, singular_values=singular_values, cosine=cosine,
+                 projection=proj, sources=sources, correct=correct,
+                 uids=np.asarray([raw["uids"][i] for i in chosen], dtype=object))
+        with open(stem+".json", "w") as f:
+            json.dump({"step": int(self.global_steps), "count": len(rows),
+                       "perplexity": perplexity,
+                       "sources": sorted(set(sources.tolist())),
+                       "cosine_mean": float(cosine.mean()),
+                       "cosine_std": float(cosine.std()),
+                       "effective_rank": effective_rank,
+                       "linear_residual": linear_residual,
+                       "top100_sv_mean": float(singular_values[:100].mean())}, f, indent=2)
+        fig, ax = plt.subplots(figsize=(8, 6)); cmap = plt.get_cmap("tab10")
+        for j, source in enumerate(sorted(set(sources.tolist()))):
+            src = sources == source
+            for ok, marker, name in ((True,"o","correct"),(False,"x","incorrect")):
+                sel = src & (correct == ok)
+                if sel.any():
+                    ax.scatter(proj[sel,0], proj[sel,1], color=cmap(j), marker=marker,
+                               alpha=.8, label=f"{source} — {name}")
+        ax.set_title(f"Validation response representations — step {self.global_steps}")
+        ax.set_xticks([]); ax.set_yticks([]); ax.legend(fontsize=7, ncol=2)
+        fig.tight_layout(); png = stem+".png"; fig.savefig(png, dpi=180); plt.close(fig)
+
+        diag_fig, (sv_ax, cos_ax) = plt.subplots(1, 2, figsize=(11, 4))
+        sv_ax.plot(np.arange(1, min(100, len(singular_values)) + 1), singular_values[:100])
+        sv_ax.set_yscale("log")
+        sv_ax.set_title("Difference singular-value spectrum")
+        sv_ax.set_xlabel("Singular-value index"); sv_ax.set_ylabel("Singular value")
+        cos_ax.hist(1.0 - cosine, bins=min(25, max(5, len(cosine) // 4)), alpha=.85)
+        cos_ax.set_title("Generated-to-target cosine distance")
+        cos_ax.set_xlabel("1 - cosine similarity"); cos_ax.set_ylabel("Count")
+        diag_fig.suptitle(f"Validation representation diagnostics — step {self.global_steps}")
+        diag_fig.tight_layout(); diag_png = stem+"_diagnostics.png"
+        diag_fig.savefig(diag_png, dpi=180); plt.close(diag_fig)
+        if "wandb" in list(cfg.logger):
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log({
+                        "val/representation_tsne": wandb.Image(png),
+                        "val/representation_diagnostics": wandb.Image(diag_png),
+                        "val/representation_cosine_mean": float(cosine.mean()),
+                        "val/representation_cosine_std": float(cosine.std()),
+                        "val/representation_effective_rank": effective_rank,
+                        "val/representation_linear_residual": linear_residual,
+                        "val/representation_top100_sv_mean": float(singular_values[:100].mean()),
+                    }, step=self.global_steps)
+            except Exception as exc:
+                logger.warning("W&B t-SNE logging failed: %s", exc)
+        print(f"[representation_tsne] wrote {png} ({len(rows)} benchmark problems)")
+
     def _validate_once(self, merged: bool = False, seed: int | None = None):
         """CoT validation (parent) plus an extra Code-view pass.
 
@@ -459,18 +611,72 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 valid_uids.append(u)
         return cot_by_uid, code_by_uid, valid_uids
 
-    def _tokenize_target(self, problem_text: str, resp_text: str, view: str) -> torch.Tensor:
-        """Tokenize the verified-correct target VIEW [x, y^+] for online z^+ recompute.
+    def _template_suffix_ids(self) -> list:
+        """Token ids of the chat template's constant end-of-message suffix.
 
-        The policy encodes these ids (last-real-token, normalized) at train time — there
-        are no cached latents. Mirrors precompute's _row_messages framing: the code view
-        prepends the code system prompt so the target lives in the same representation
-        space the code-view rollouts are encoded in.
+        Computed once by diffing the rendering of a marker assistant message
+        against the marker's own tokens (Qwen: ["<|im_end|>", "\n"]). Used to
+        replicate the official run.sh ``last_token=-3`` read for Qwen — the
+        embedding is taken at the last CONTENT token, not the constant suffix.
         """
-        cache_key = (problem_text, resp_text, view)
+        cached = getattr(self, "_template_suffix_cache", None)
+        if cached is not None:
+            return cached
+        marker = "XQZV"
+        rendered = self.tokenizer.apply_chat_template(
+            [{"role": "assistant", "content": marker}], tokenize=False, add_generation_prompt=False
+        )
+        tail = rendered.split(marker, 1)[1] if marker in rendered else ""
+        sfx = self.tokenizer(tail, add_special_tokens=False)["input_ids"] if tail else []
+        self._template_suffix_cache = list(sfx)
+        return self._template_suffix_cache
+
+    def _tokenize_target(self, problem_text: str, resp_text: str, view: str) -> torch.Tensor:
+        """Tokenize the verified-correct teacher target view for online z^+ recompute.
+
+        loss_type='llm-jepa' (paper-exact view separation): the official finetune.py
+        builds the target view from ``messages[2:3]`` — the ASSISTANT MESSAGE ALONE,
+        chat-templated separately. The views share NO prompt: Enc(Code) never sees
+        the question, and no system prompt is included. We mirror that exactly:
+        the target is the teacher response rendered as a lone assistant message
+        (whatever the model's chat template emits for it, as in the reference).
+        ``problem_text`` is deliberately ignored (and excluded from the cache key,
+        which also lets identical texts dedup across prompts).
+
+        Legacy tcr modes keep the prior [x, y^+] framing (code system prompt + user
+        message + response) — the policy encodes these ids (last-real-token,
+        normalized) at train time; there are no cached latents.
+        """
+        llm_jepa = self.jepa_cfg.loss_type == "llm-jepa"
+        cache_key = ("" if llm_jepa else problem_text, resp_text, view)
         hit = self._tok_target_cache.get(cache_key)
         if hit is not None:
             return hit
+        if llm_jepa:
+            # finetune.py: assistant_messages = messages[2:3]; apply_chat_template(
+            #     assistant_messages, tokenize=False, add_generation_prompt=False)
+            atext = self.tokenizer.apply_chat_template(
+                [{"role": "assistant", "content": resp_text}],
+                tokenize=False, add_generation_prompt=False,
+            )
+            max_len = int(self.jepa_cfg.target_max_length)
+            if max_len <= 0:
+                max_len = int(self.config.data.max_prompt_length + self.config.data.max_response_length)
+            ids = self.tokenizer(atext, return_tensors="pt",
+                                 truncation=True, max_length=max_len)["input_ids"][0]
+            # Official read index: run.sh sets last_token=-3 for Qwen, i.e. the
+            # embedding is read at the LAST CONTENT TOKEN, skipping the constant
+            # "<|im_end|>\n" template suffix. Reading the constant suffix token
+            # instead makes every target's read nearly identical (anisotropic
+            # last-token states) and inflates cosine similarity from step 0.
+            # The model is causal, so DROPPING the suffix tokens and reading the
+            # (new) last token is bit-identical to their index-offset read.
+            # Conditional on an exact suffix match so truncated rows are untouched.
+            sfx = self._template_suffix_ids()
+            if len(sfx) and ids.shape[0] > len(sfx) and ids[-len(sfx):].tolist() == sfx:
+                ids = ids[: ids.shape[0] - len(sfx)]
+            self._tok_target_cache[cache_key] = ids
+            return ids
         msgs = []
         if view == "code" and self.jepa_cfg.code_system_prompt:
             msgs.append({"role": "system", "content": self.jepa_cfg.code_system_prompt})
@@ -665,6 +871,167 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         jepa_batch.meta_info["n_anchors"] = A_c
         jepa_batch.meta_info["n_anchors_code"] = A_k
         jepa_batch.meta_info["n_self_pairs"] = len(self_pairs)
+        return jepa_batch
+
+    def _build_jepa_batch_llm_jepa(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> DataProto | None:
+        """Build the paper-exact LLM-JEPA batch (loss_type='llm-jepa').
+
+        Anchors are the student's CoT rollouts (the only view generated in this
+        mode). Each anchor is matched to ONE pregenerated big-teacher CoT text and
+        ONE big-teacher Code text (cycled k % n_u, same as the other modes). The
+        teacher target rows are DEDUPLICATED here at the trainer: each distinct
+        (ds_idx, view, text) is tokenized and shipped exactly once, and anchors
+        carry gather indices (tgt_cot_idx / tgt_code_idx) into that unique block.
+        The worker encodes the unique block WITH gradient (no stop-grad — paper
+        fidelity) inside the same GradCache pool as the anchors.
+
+        A prompt without a cached teacher-CoT text contributes no anchors (the CoT
+        arm is mandatory); a missing Code text only masks that anchor's code arm
+        (tgt_code_idx = -1). Returns None if fewer than min_valid_pairs anchors.
+        """
+        assert self.teacher_targets is not None, "CoT teacher target cache not loaded"
+        assert self.code_teacher_targets is not None, "Code teacher target cache not loaded"
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        rows_by_uid: dict = defaultdict(list)
+        idx_by_uid: dict = {}
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v != "cot":
+                continue
+            rows_by_uid[u].append(i)
+            if u not in idx_by_uid:
+                info = extra_infos[i]
+                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
+
+        anchor_set = self.jepa_cfg.jepa_anchor_set
+
+        def _select(idxs):
+            if anchor_set == "correct":
+                sel = [i for i in idxs if rew[i] > 0]
+            elif anchor_set == "wrong":
+                sel = [i for i in idxs if rew[i] <= 0]
+            else:  # "all"
+                sel = list(idxs)
+            return [i for i in sel if int(all_attn_mask[i].sum()) > 0]
+
+        def _match_row(k, n_u):
+            return int(torch.randint(n_u, (1,)).item()) if self.jepa_cfg.tcr_match == "random" else k % n_u
+
+        def _problem(i):
+            info = extra_infos[i]
+            return info["problem"] if isinstance(info, dict) else str(info)
+
+        anchors: list[int] = []
+        pair_idx: list[tuple[int, int]] = []      # (uniq_cot_pos, uniq_code_pos or -1)
+        # Paper-exact view separation: the target view is the teacher response ALONE
+        # (no prompt — see _tokenize_target), so dedup keys on (view, text) only:
+        # identical teacher texts collapse even across different prompts.
+        uniq_pos: dict = {}                       # (view, text) -> pos in uniq block
+        uniq_rows: list[torch.Tensor] = []        # tokenized unique target rows
+
+        def _uniq_target(ds_idx: int, view: str, problem: str, text: str) -> int:
+            key = (view, text)
+            pos = uniq_pos.get(key)
+            if pos is None:
+                pos = len(uniq_rows)
+                uniq_pos[key] = pos
+                uniq_rows.append(self._tokenize_target(problem, text, view))
+            return pos
+
+        n_correct_list = []
+        for u in dict.fromkeys(uids):
+            ds_idx = idx_by_uid.get(u)
+            if ds_idx is None:
+                continue
+            Z_cot = self.teacher_targets.get(ds_idx)
+            if not Z_cot:
+                continue  # CoT teacher view is mandatory for an anchor
+            Z_code = self.code_teacher_targets.get(ds_idx)
+            sel = _select(rows_by_uid.get(u, []))
+            # Paper-parity + speed: the reference trains ONE (Text, Code) pair per
+            # example per step; cap the anchors encoded per prompt accordingly.
+            cap = int(self.jepa_cfg.max_anchors_per_prompt)
+            if cap > 0:
+                sel = sel[:cap]
+            if not sel:
+                continue
+            n_correct_list.append(sum(1 for i in sel if rew[i] > 0))
+            for k, idx in enumerate(sel):
+                problem = _problem(idx)
+                cpos = _uniq_target(ds_idx, "cot", problem, Z_cot[_match_row(k, len(Z_cot))])
+                kpos = (_uniq_target(ds_idx, "code", problem, Z_code[_match_row(k, len(Z_code))])
+                        if Z_code else -1)
+                anchors.append(idx)
+                pair_idx.append((cpos, kpos))
+
+        A = len(anchors)
+        if A < self.jepa_cfg.min_valid_pairs:
+            return None
+
+        # DataProto/TensorDict require ONE uniform leading batch dim, but the anchor
+        # count A and unique-target count U generally differ. Pad both blocks to
+        # R = max(A, U) with zero-LENGTH rows (lengths==0 marks padding; real rows
+        # come first). The worker slices real rows back out before the joint
+        # forward, so padding rows are never tokenized through the model.
+        U = len(uniq_rows)
+        R = max(A, U)
+
+        # Anchor block (student CoT rollouts, real tokens only, right-padded).
+        # Official [PRED] placement: finetune.py appends the predictor tokens INSIDE
+        # the message content, so the template's <|im_end|> comes AFTER them and is
+        # causally invisible to the pred read. Our rollout rows end with the eos
+        # (<|im_end|>); strip it so the worker-appended [PRED] tokens directly follow
+        # the last content token — the exact causal layout of the reference.
+        eos_id = self.tokenizer.eos_token_id
+
+        def _strip_eos(t: torch.Tensor) -> torch.Tensor:
+            return t[:-1] if (eos_id is not None and t.shape[0] > 1 and int(t[-1]) == eos_id) else t
+
+        ids_list = [_strip_eos(all_input_ids[i][all_attn_mask[i].bool()]) for i in anchors]
+        lengths = [int(t.shape[0]) for t in ids_list]
+        max_len = max(lengths)
+        anchor_ids = torch.full((R, max_len), pad_id, dtype=all_input_ids.dtype)
+        anchor_mask = torch.zeros((R, max_len), dtype=torch.long)
+        for r, t in enumerate(ids_list):
+            anchor_ids[r, : t.shape[0]] = t
+            anchor_mask[r, : t.shape[0]] = 1
+
+        # Unique teacher-target block.
+        t_lengths = [int(t.shape[0]) for t in uniq_rows]
+        t_max = max(t_lengths)
+        target_ids = torch.full((R, t_max), pad_id, dtype=all_input_ids.dtype)
+        target_mask = torch.zeros((R, t_max), dtype=torch.long)
+        for r, t in enumerate(uniq_rows):
+            target_ids[r, : t.shape[0]] = t
+            target_mask[r, : t.shape[0]] = 1
+
+        jepa_batch = DataProto.from_single_dict({
+            "anchor_input_ids": anchor_ids,
+            "anchor_attn_mask": anchor_mask,
+            "anchor_lengths": torch.tensor(lengths + [0] * (R - A), dtype=torch.long),
+            "target_input_ids": target_ids,
+            "target_attn_mask": target_mask,
+            "target_lengths": torch.tensor(t_lengths + [0] * (R - U), dtype=torch.long),
+            "tgt_cot_idx": torch.tensor(
+                [c for c, _ in pair_idx] + [-1] * (R - A), dtype=torch.long),
+            "tgt_code_idx": torch.tensor(
+                [k for _, k in pair_idx] + [-1] * (R - A), dtype=torch.long),
+        })
+        jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_list)) if n_correct_list else 0.0
+        jepa_batch.meta_info["n_anchors"] = A
+        jepa_batch.meta_info["n_anchors_code"] = int(sum(1 for _, k in pair_idx if k >= 0))
+        jepa_batch.meta_info["n_unique_targets"] = len(uniq_rows)
+        jepa_batch.meta_info["n_self_pairs"] = 0
         return jepa_batch
 
     # ------------------------------------------- TCR reward shaping (idea #2) -
@@ -877,7 +1244,11 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         signals = []
         if self.jepa_cfg.n_cot > 0:
             signals.append(("cot", "jepa/cos_cot"))
-        if self.jepa_cfg.n_code > 0:
+        # llm-jepa has a code ARM without code ROLLOUTS: the student CoT predicts the
+        # pregenerated teacher Code view, so cos_code is a real signal even at n_code=0.
+        llm_jepa_code_arm = (self.jepa_cfg.loss_type == "llm-jepa"
+                             and self.code_teacher_targets is not None)
+        if self.jepa_cfg.n_code > 0 or llm_jepa_code_arm:
             signals.append(("code", "jepa/cos_code"))
         if self.jepa_cfg.n_cot > 0 and self.jepa_cfg.n_code > 0:
             signals.append(("self", "jepa/cos_self"))
@@ -1294,11 +1665,18 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     metrics["jepa/n_cot"] = float(n_cot)
                     metrics["jepa/n_code"] = float(n_code)
                     with simple_timer("jepa_build_batch", timing_raw):
-                        jepa_batch = self._build_jepa_batch_tcr_dual(
-                            batch=batch,
-                            reward_tensor=reward_tensor,
-                            view_tags=view_tags,
-                        )
+                        if self.jepa_cfg.loss_type == "llm-jepa":
+                            jepa_batch = self._build_jepa_batch_llm_jepa(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
+                        else:
+                            jepa_batch = self._build_jepa_batch_tcr_dual(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
 
                 # ── Step 3: Compute old log-probs & (optional) ref ──────
                 # Actor/FSDP-only (compute_log_prob); does NOT call vLLM. All rollout outputs
@@ -1369,11 +1747,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                             )
                             # Per-arm plateau latches -> worker zeroes the disabled align
                             # term's gradient (preds still feed SIGReg). dual mode only.
-                            if self.jepa_cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot"):
+                            if self.jepa_cfg.loss_type in ("llm-jepa", "jepa-tcr-dual", "jepa-tcr-cot"):
                                 _bs = jepa_td.batch_size[0]
                                 _cot_only = self.jepa_cfg.loss_type == "jepa-tcr-cot"
                                 jepa_td["align_cot_on"] = torch.full((_bs,), float(not self._off_arm["cot"]))
                                 # CoT-only mode has no code / self-consistency arms.
+                                # (llm-jepa DOES have a code arm — the teacher Code view.)
                                 jepa_td["align_code_on"] = torch.full((_bs,), 0.0 if _cot_only else float(not self._off_arm["code"]))
                                 jepa_td["self_on"] = torch.full((_bs,), 0.0 if _cot_only else float(not self._off_arm["self"]))
                             jepa_output = self.actor_rollout_wg.jepa_update(jepa_td)

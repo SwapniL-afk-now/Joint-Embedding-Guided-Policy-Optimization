@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -37,8 +37,8 @@ class JEPARayConfig:
     # full rollout_n-sized Code batch on top of the CoT one, whose reward was
     # used only for JEPA pairing — half the rollout compute never reached the
     # policy gradient). n_cot + n_code must equal rollout_n; see validate().
-    n_cot: int = 4
-    n_code: int = 4
+    n_cot: int = 8
+    n_code: int = 0
     # Also run a Code-view pass during validation and report val-code/* and
     # val-dual/* (per-prompt CoT∪Code union) metrics alongside the existing
     # CoT-only val/* keys. Doubles validation generation cost. The existing
@@ -81,7 +81,20 @@ class JEPARayConfig:
         "Solve the following math problem by writing a complete, executable Python program "
         "that prints the answer. Do not include any natural language explanation outside comments."
     )
-    # JEPA objective. The ray/worker path supports a single value:
+    # JEPA objective. The ray/worker path supports:
+    #   "llm-jepa" (DEFAULT) — the paper-exact LLM-JEPA loss (arXiv:2509.14252,
+    #       official finetune.py), adapted to RL: the student generates CoT rollouts
+    #       only; each rollout's tied-weight-predictor read p = Pred(Enc([x, y_S,
+    #       [PRED]×k])) predicts BOTH pregenerated big-teacher views, y^T_cot and
+    #       y^T_code, with the paper's cosine-distance loss
+    #           L = (1 - cos(p, Enc([x, y^T_cot]))) + (1 - cos(p, Enc([x, y^T_code])))
+    #       flat-averaged over anchors. NO stop-gradient on any branch (both the
+    #       anchor and target encodes are grad-enabled, exactly like the reference
+    #       implementation's concatenated single-model forward), no SIGReg, no
+    #       stratification, no self-consistency arm, no reward shaping (set
+    #       tcr_reward_beta=0). Requires teacher_cache_path AND
+    #       code_teacher_cache_path (verified-correct TEXT caches {idx: [y^+, ...]}).
+    #       See core_algos.llm_jepa_paper_loss.
     #   "jepa-tcr-dual" — Dual-target, self-consistent Teacher-Correct Representation
     #       alignment. SEPARATE CoT and Code student anchors, each with [PRED]; each
     #       view's pred is pulled toward its OWN precomputed teacher-correct target
@@ -94,7 +107,7 @@ class JEPARayConfig:
     #       AND code_teacher_cache_path. See core_algos.llm_jepa_tcr_dual_loss.
     # (The separate JEPAGRPOTrainer entrypoint in trainer.py uses its own EMA
     # "lejepa" loss and does not read this field.)
-    loss_type: str = "jepa-tcr-dual"
+    loss_type: str = "llm-jepa"
     # -- jepa-tcr-dual teacher caches --
     # Path to the offline teacher-target cache produced by
     # examples/jepa_grpo_trainer/precompute_teacher_targets.py: a torch.save dict
@@ -119,6 +132,12 @@ class JEPARayConfig:
     #   "cycle"  — anchor j uses target [j % n_u] (default; deterministic)
     #   "random" — anchor j uses a uniformly random cached target
     tcr_match: str = "cycle"
+    # llm-jepa only: cap on student-CoT anchors used per prompt in the differentiable
+    # JEPA update. The paper trains ONE (Text, Code) pair per example per step, so a
+    # small cap is closer to the reference than encoding all rollout_n rollouts; it is
+    # also the main speed lever of the JEPA backward (anchors dominate GradCache cost:
+    # 2 forwards + 1 backward per anchor row). 0 = unlimited (use every selected anchor).
+    max_anchors_per_prompt: int = 2
     # Which student rollouts become JEPA anchors (jepa-tcr-loss only). All anchors,
     # correct or wrong, use the identical [x, y_S, [PRED]xk] -> sg(z_T^+) format; the
     # [PRED] token predicts the teacher-correct latent from the student's response
@@ -159,9 +178,16 @@ class JEPARayConfig:
     # Number of tied-weight predictor tokens (paper §3.1). k=0 -> Pred(x) = x
     # (identity), so for a real predictive separation set predictor_k > 0.
     predictor_k: int = 0
-    # Token id used for the appended predictor tokens. Resolved programmatically by
-    # ray_trainer.py (which holds the tokenizer) before jepa_init; -1 means unset/unused.
-    predictor_token_id: int = -1
+    # The APPEND SEQUENCE of literal predictor special-token ids, exactly as in the
+    # official finetune.py: the k distinct tokens <|predictor_1|>..<|predictor_k|>
+    # are added to the tokenizer and appended in DESCENDING slot order
+    # [<|predictor_k|>, ..., <|predictor_1|>], so the read (last) token is always
+    # <|predictor_1|>. Resolved programmatically by ray_trainer.py (which holds the
+    # tokenizer) before jepa_init; empty means unset/unused (predictor_k must be 0).
+    # NOTE: no resize_token_embeddings is performed — the new ids must land inside
+    # the model's preallocated padded embedding rows (Qwen2.5: 151936 rows vs
+    # ~151665 tokenizer ids, ~270 spare); worker.jepa_init asserts this bound.
+    predictor_token_ids: list[int] = field(default_factory=list)
     # SIGReg lambda for the jepa-tcr-dual loss: L = (1-λ)·(align_cot + align_code +
     # w·L_self) + λ·SIGReg([pred_cot, pred_code]). (Name retained for config back-compat.)
     triplet_sigreg_lambda: float = 0.05
@@ -183,9 +209,9 @@ class JEPARayConfig:
         """
         if not self.enable:
             return
-        if self.loss_type not in ("jepa-tcr-dual", "jepa-tcr-cot"):
+        if self.loss_type not in ("llm-jepa", "jepa-tcr-dual", "jepa-tcr-cot"):
             raise ValueError(
-                f"jepa.loss_type must be 'jepa-tcr-dual' or 'jepa-tcr-cot'; "
+                f"jepa.loss_type must be 'llm-jepa', 'jepa-tcr-dual' or 'jepa-tcr-cot'; "
                 f"got {self.loss_type!r}"
             )
         if not self.teacher_cache_path:
@@ -197,6 +223,19 @@ class JEPARayConfig:
         # 'jepa-tcr-cot' is the CoT-only mode: no code cache, no code rollouts, no
         # self-consistency arm. The dual machinery degrades to align_cot + SIGReg(pred_cot)
         # when the code arm is empty (see llm_jepa_tcr_dual_loss / n_code=0 handling).
+        # llm-jepa: the student CoT predicts BOTH pregenerated teacher views, so the
+        # code-view TEXT cache is required even though no code rollouts are generated.
+        if self.loss_type == "llm-jepa" and not self.code_teacher_cache_path:
+            raise ValueError(
+                "jepa.loss_type='llm-jepa' requires jepa.code_teacher_cache_path "
+                "(the pregenerated big-teacher Code-view TEXT cache {idx: [y^+,...]}); "
+                "the student's CoT prediction is aligned to BOTH teacher views."
+            )
+        if self.loss_type == "llm-jepa" and self.n_code > 0:
+            raise ValueError(
+                f"jepa.loss_type='llm-jepa': the student generates CoT rollouts only; "
+                f"set n_code=0 (got {self.n_code})."
+            )
         if self.loss_type == "jepa-tcr-dual" and not self.code_teacher_cache_path:
             raise ValueError(
                 "jepa.loss_type='jepa-tcr-dual' requires jepa.code_teacher_cache_path "

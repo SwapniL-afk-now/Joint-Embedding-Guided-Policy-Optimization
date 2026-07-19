@@ -7,26 +7,28 @@ defaults:
 # ── JEPA hyperparameters ────────────────────────────────────────────────────
 jepa:
   enable: true
-  n_cot: 4
-  n_code: 4
+  n_cot: 8
+  n_code: 0
   alpha: 0.1
   alpha_warmup_steps: 0
   ema_decay: 0.99
   max_grad_norm: 0.5
   embed_micro_batch_size: 16
+  target_max_length: 0         # teacher-view truncation; 0 = max_prompt_length + max_response_length
   min_valid_pairs: 2
   n_projections: 1024
   t_min: -5.0
   t_max: 5.0
   epps_pulley_s: 1.0
   code_system_prompt: "You are a Python programming expert. Solve the following math problem by writing a complete, executable Python program that prints the answer."
-  loss_type: jepa-tcr-dual     # only supported ray/worker objective
-  predictor_k: 0
+  loss_type: llm-jepa          # DEFAULT: paper-exact LLM-JEPA (arXiv:2509.14252); also: jepa-tcr-dual | jepa-tcr-cot
+  predictor_k: 4             # literal <|predictor_i|> tokens (paper §3.1, GSM8K-best k=4); trainer adds them to the tokenizer
   triplet_sigreg_lambda: 0.05  # SIGReg lambda for the jepa-tcr-dual loss
   # -- jepa-tcr-dual teacher caches --
   teacher_cache_path: ""       # .pt of {dataset_index: (n_i,d)} teacher-correct targets
   n_targets_per_q: 4           # cap of cached targets used per question
   tcr_match: cycle             # anchor->target pairing: cycle | random
+  max_anchors_per_prompt: 2    # llm-jepa: anchors per prompt in the JEPA backward (0 = all)
   jepa_anchor_set: correct     # anchors: correct | all | wrong (reward-stratified)
   # -- jepa-tcr-dual teacher-alignment reward shaping --
   tcr_reward_beta: 0.5         # advantage-shaping strength (standardized score scale)
