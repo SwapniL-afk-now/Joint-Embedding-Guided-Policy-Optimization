@@ -314,7 +314,15 @@ LOGGER=${LOGGER:-'["console","wandb"]'}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-${MAX_OPTIMIZER_STEPS}}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
 REP_TSNE_ENABLE=${REP_TSNE_ENABLE:-true}
+# "train" = paper-style figure (LLM-JEPA Fig. 4/6) on a TRAIN batch: student CoT
+# predictor reads vs teacher CoT vs teacher Code, plus a second panel adding the
+# student's incorrect rollouts. "val" = the old benchmark-faceted plot, which can
+# only use an answer-conditioned proxy target (validation problems have no teacher
+# views — the caches are keyed to train-parquet indices). "both" runs each.
+REP_TSNE_MODE=${REP_TSNE_MODE:-train}
 REP_TSNE_FREQ=${REP_TSNE_FREQ:-20}
+# Prompts sampled per figure; ALL CoT rollouts of each are plotted (0 = every prompt).
+REP_TSNE_MAX_PROMPTS=${REP_TSNE_MAX_PROMPTS:-32}
 REP_TSNE_SEED=${REP_TSNE_SEED:-14142}
 REP_TSNE_PERPLEXITY=${REP_TSNE_PERPLEXITY:-30}
 REP_TSNE_MICRO_BATCH_SIZE=${REP_TSNE_MICRO_BATCH_SIZE:-4}
@@ -360,7 +368,9 @@ if (( N_COT + N_CODE != ROLLOUT_N )); then
     exit 1
 fi
 
-if [[ "${JEPA_ENABLE}" == "True" ]]; then
+# The representation figure plots the teacher views themselves, so it needs the
+# caches even on the JEPA_ENABLE=False baseline arm of a comparison.
+if [[ "${JEPA_ENABLE}" == "True" || ( "${REP_TSNE_ENABLE}" == "true" && "${REP_TSNE_MODE}" != "val" ) ]]; then
 # llm-jepa requires BOTH teacher caches (CoT + Code); empty entries are skipped
 # only for legacy CoT-only mode (jepa-tcr-cot).
 for c in "${TEACHER_CACHE}" "${CODE_TEACHER_CACHE}"; do
@@ -511,6 +521,8 @@ TRAINER=(
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS}
     trainer.log_val_generations=${LOG_VAL_GENERATIONS}
     +trainer.rep_tsne_enable=${REP_TSNE_ENABLE}
+    +trainer.rep_tsne_mode=${REP_TSNE_MODE}
+    +trainer.rep_tsne_max_prompts=${REP_TSNE_MAX_PROMPTS}
     +trainer.rep_tsne_freq=${REP_TSNE_FREQ}
     +trainer.rep_tsne_seed=${REP_TSNE_SEED}
     +trainer.rep_tsne_perplexity=${REP_TSNE_PERPLEXITY}

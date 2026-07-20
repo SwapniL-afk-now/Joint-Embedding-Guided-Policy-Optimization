@@ -71,8 +71,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # {dataset_index (int): [y^+ str, ...]}, NOT latent vectors. The target
         # representation z^+ is recomputed ONLINE by the current policy at train time
         # (worker.jepa_update), so there are no stale frozen-reference latents.
+        #
+        # Loaded whenever JEPA is enabled OR the representation t-SNE is on: the
+        # diagnostic plots the teacher views themselves, so the BASELINE arm of a
+        # JEPA-vs-baseline comparison (jepa.enable=False) must load them too or its
+        # figure would have nothing to compare the student against.
         self.teacher_targets: dict[int, list[str]] | None = None
-        if self.jepa_cfg.enable:
+        if self.jepa_cfg.enable or self._rep_tsne_enabled:
             raw = torch.load(self.jepa_cfg.teacher_cache_path, map_location="cpu")
             self.teacher_targets = {int(k): list(v) for k, v in raw.items() if v}
 
@@ -91,7 +96,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # CoT-only mode ('jepa-tcr-cot') has no code cache; leave this None so the
         # code arm / reward shaping / self-consistency all self-gate off.
         self.code_teacher_targets: dict[int, list[str]] | None = None
-        if self.jepa_cfg.enable and self.jepa_cfg.code_teacher_cache_path:
+        if (self.jepa_cfg.enable or self._rep_tsne_enabled) and self.jepa_cfg.code_teacher_cache_path:
             raw_code = torch.load(self.jepa_cfg.code_teacher_cache_path, map_location="cpu")
             self.code_teacher_targets = {int(k): list(v) for k, v in raw_code.items() if v}
 
@@ -101,10 +106,18 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # step. Unbounded growth is fine: bounded by the teacher caches' size.
         self._tok_target_cache: dict[tuple[str, str, str], torch.Tensor] = {}
 
+    @property
+    def _rep_tsne_enabled(self) -> bool:
+        return bool(self.config.trainer.get("rep_tsne_enable", False))
+
     # ------------------------------------------------------ worker setup ----
     def init_workers(self):
         super().init_workers()
-        if self.jepa_cfg.enable:
+        # jepa_init is also required with jepa.enable=False when the representation
+        # t-SNE is on: it reads the predictor via score_cot_embeddings, which asserts
+        # the worker has a jepa config. The config's own arms stay off, so this
+        # initialises the read path without adding any loss term.
+        if self.jepa_cfg.enable or self._rep_tsne_enabled:
             import dataclasses
 
             if self.jepa_cfg.predictor_k > 0:
@@ -208,6 +221,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         """Log a t-SNE of one response per problem from the exact val suite."""
         cfg = self.config.trainer
         if not bool(cfg.get("rep_tsne_enable", False)):
+            return
+        # rep_tsne_mode: "train" (default) = the paper-style train-batch figure only
+        # (see _maybe_log_train_rep_tsne); "val"/"both" keep this benchmark-faceted
+        # plot. Validation problems have NO teacher CoT/Code views — the teacher
+        # caches are keyed to train-parquet indices — so this path can only ever
+        # compare against an answer-conditioned proxy target, not a teacher view.
+        if str(cfg.get("rep_tsne_mode", "train")) not in ("val", "both"):
             return
         freq = max(1, int(cfg.get("rep_tsne_freq", cfg.test_freq)))
         if self.global_steps != 0 and self.global_steps % freq != 0:
@@ -338,6 +358,332 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             except Exception as exc:
                 logger.warning("W&B t-SNE logging failed: %s", exc)
         print(f"[representation_tsne] wrote {png} ({len(rows)} benchmark problems)")
+
+    # ------------------------------------ paper-style train representations -
+    def _collect_rep_groups(self, batch, reward_tensor, view_tags):
+        """Gather the three view groups the LLM-JEPA representation figure needs.
+
+        Returns (p, Z, meta) where ``p`` are the student predictor reads
+        ``Pred(Enc([x, y_S, [PRED]xk]))`` for EVERY CoT rollout of the sampled
+        prompts (correct and incorrect alike — the incorrect ones are group 4 of
+        Figure B), ``Z`` are the encoded teacher views ``Enc([y^T])``, and ``meta``
+        carries the per-anchor correctness flag and the gather indices from each
+        anchor into its own teacher CoT / teacher Code row.
+
+        Unlike _build_jepa_batch_llm_jepa this deliberately does NOT apply
+        jepa_anchor_set or max_anchors_per_prompt: the loss trains on a capped,
+        correct-only subset, but the diagnostic must see the full rollout cloud or
+        the clusters it is meant to reveal are the ones it filtered away. Teacher
+        texts are taken at a FIXED index (0) rather than cycled, so the teacher
+        points are the same across steps and the figure is comparable over time.
+        """
+        cfg = self.config.trainer
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+        eos_id = self.tokenizer.eos_token_id
+
+        rows_by_uid: dict = defaultdict(list)
+        idx_by_uid: dict = {}
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v != "cot" or int(all_attn_mask[i].sum()) == 0:
+                continue
+            rows_by_uid[u].append(i)
+            if u not in idx_by_uid:
+                info = extra_infos[i]
+                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
+
+        max_prompts = int(cfg.get("rep_tsne_max_prompts", 32))
+        anchors: list[int] = []
+        pair_idx: list[tuple[int, int]] = []
+        uniq_pos: dict = {}
+        uniq_rows: list[torch.Tensor] = []
+        uniq_view: list[str] = []
+
+        def _uniq_target(view: str, problem: str, text: str) -> int:
+            key = (view, text)
+            pos = uniq_pos.get(key)
+            if pos is None:
+                pos = len(uniq_rows)
+                uniq_pos[key] = pos
+                uniq_rows.append(self._tokenize_target(problem, text, view))
+                uniq_view.append(view)
+            return pos
+
+        n_prompts = 0
+        for u in dict.fromkeys(uids):
+            if max_prompts > 0 and n_prompts >= max_prompts:
+                break
+            ds_idx = idx_by_uid.get(u)
+            if ds_idx is None:
+                continue
+            Z_cot = self.teacher_targets.get(ds_idx) if self.teacher_targets else None
+            if not Z_cot:
+                continue
+            Z_code = self.code_teacher_targets.get(ds_idx) if self.code_teacher_targets else None
+            sel = rows_by_uid.get(u, [])
+            if not sel:
+                continue
+            info = extra_infos[sel[0]]
+            problem = info["problem"] if isinstance(info, dict) else str(info)
+            cpos = _uniq_target("cot", problem, Z_cot[0])
+            kpos = _uniq_target("code", problem, Z_code[0]) if Z_code else -1
+            for idx in sel:
+                anchors.append(idx)
+                pair_idx.append((cpos, kpos))
+            n_prompts += 1
+
+        if len(anchors) < 4 or not uniq_rows:
+            return None
+
+        def _strip_eos(t: torch.Tensor) -> torch.Tensor:
+            return t[:-1] if (eos_id is not None and t.shape[0] > 1 and int(t[-1]) == eos_id) else t
+
+        def _pack(rows: list[torch.Tensor]):
+            lens = [int(t.shape[0]) for t in rows]
+            m = max(lens)
+            ids = torch.full((len(rows), m), pad_id, dtype=all_input_ids.dtype)
+            msk = torch.zeros((len(rows), m), dtype=torch.long)
+            for r, t in enumerate(rows):
+                ids[r, : t.shape[0]] = t
+                msk[r, : t.shape[0]] = 1
+            return ids, msk, torch.tensor(lens, dtype=torch.long)
+
+        a_ids, a_mask, a_len = _pack(
+            [_strip_eos(all_input_ids[i][all_attn_mask[i].bool()]) for i in anchors]
+        )
+        t_ids, t_mask, t_len = _pack(uniq_rows)
+
+        cot_out = self.actor_rollout_wg.score_cot_embeddings(
+            DataProto.from_single_dict({
+                "cot_input_ids": a_ids, "cot_attn_mask": a_mask, "cot_lengths": a_len,
+            }).to_tensordict()
+        )
+        if isinstance(cot_out, list):
+            cot_out = cot_out[0]
+        tgt_out = self.actor_rollout_wg.embed_targets(
+            DataProto.from_single_dict({
+                "target_input_ids": t_ids, "target_attn_mask": t_mask, "target_lengths": t_len,
+            }).to_tensordict()
+        )
+        if isinstance(tgt_out, list):
+            tgt_out = tgt_out[0]
+
+        meta = {
+            "correct": np.asarray([bool(rew[i] > 0) for i in anchors], dtype=bool),
+            "cot_idx": np.asarray([c for c, _ in pair_idx], dtype=np.int64),
+            "code_idx": np.asarray([k for _, k in pair_idx], dtype=np.int64),
+            "uids": np.asarray([str(uids[i]) for i in anchors], dtype=object),
+            "target_view": np.asarray(uniq_view, dtype=object),
+            "n_prompts": n_prompts,
+        }
+        return cot_out["cot_emb"].float().numpy(), tgt_out["target_emb"].float().numpy(), meta
+
+    def _maybe_log_train_rep_tsne(self, batch, reward_tensor, view_tags) -> None:
+        """Paper-style representation figure (LLM-JEPA arXiv:2509.14252, Fig. 4/6).
+
+        The paper plots the two views -- Enc(Text) and Enc(Code) -- in ONE t-SNE and
+        reads off the pair geometry: under NTP fine-tuning the clouds are unstructured,
+        under LLM-JEPA they organise so that paired points sit in a consistent
+        relationship. Fig. 3 (left) is the quantitative form of the same claim: the top
+        singular values of the paired difference collapse by orders of magnitude.
+
+        Adapted to this RL setting, the views are:
+          A. student CoT predictor read  p = Pred(Enc([x, y_S, [PRED]xk]))
+          B. teacher CoT view            Enc([y^T_cot])
+          C. teacher Code view           Enc([y^T_code])
+        and the loss aligns A to B and A to C. Two figures are emitted:
+          fig A  -- correct student anchors + both teacher views (the paper's plot)
+          fig B  -- the same plus INCORRECT student anchors, which the paper has no
+                    analogue for; if the objective is working these should fall off
+                    the teacher manifold that the correct ones sit on.
+        Figure B is fitted separately, because adding points changes a t-SNE embedding
+        and a shared fit would make A incomparable across steps.
+
+        Runs on the TRAIN batch, not validation: the teacher caches are keyed by
+        train-parquet dataset_index, so validation problems have no teacher views at
+        all. This also matches the paper, which visualises its fine-tuning data.
+        """
+        cfg = self.config.trainer
+        if not self._rep_tsne_enabled:
+            return
+        if str(cfg.get("rep_tsne_mode", "train")) not in ("train", "both"):
+            return
+        freq = max(1, int(cfg.get("rep_tsne_freq", cfg.test_freq)))
+        if self.global_steps % freq != 0:
+            return
+        if not self.teacher_targets:
+            logger.warning("train representation t-SNE skipped: no teacher CoT cache")
+            return
+        try:
+            got = self._collect_rep_groups(batch, reward_tensor, view_tags)
+        except Exception as exc:
+            logger.warning("train representation t-SNE skipped: %s", exc)
+            return
+        if got is None:
+            logger.warning("train representation t-SNE skipped: too few anchors")
+            return
+        p, Z, meta = got
+
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+
+        correct = meta["correct"]
+        cot_idx, code_idx = meta["cot_idx"], meta["code_idx"]
+        has_code = code_idx >= 0
+        t_cot = Z[cot_idx]
+        out_dir = os.path.join(str(cfg.default_local_dir), "representation_tsne")
+        os.makedirs(out_dir, exist_ok=True)
+        stem = os.path.join(out_dir, f"train_step_{int(self.global_steps)}")
+
+        # ---- Fig. 3-left analogue: paired-difference spectra, per arm ----
+        def _spectrum(diff: np.ndarray) -> tuple[np.ndarray, float]:
+            if len(diff) < 2:
+                return np.zeros(1), float("nan")
+            sv = np.linalg.svd(diff - diff.mean(axis=0, keepdims=True), compute_uv=False)
+            mass = sv / max(float(sv.sum()), 1e-12)
+            return sv, float(np.exp(-(mass * np.log(mass + 1e-12)).sum()))
+
+        def _cos(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+            return np.sum(a * b, axis=1) / np.maximum(
+                np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1), 1e-12
+            )
+
+        sv_cot, erank_cot = _spectrum(p - t_cot)
+        cos_cot = _cos(p, t_cot)
+        if has_code.any():
+            t_code = Z[np.where(has_code, code_idx, 0)]
+            sv_code, erank_code = _spectrum((p - t_code)[has_code])
+            cos_code = _cos(p, t_code)
+        else:
+            t_code = None
+            sv_code, erank_code = np.zeros(1), float("nan")
+            cos_code = np.zeros(0)
+
+        # ---- the two t-SNE figures ----
+        def _fit(points: np.ndarray) -> np.ndarray:
+            perp = min(float(cfg.get("rep_tsne_perplexity", 30)), max(2.0, (len(points) - 1) / 3))
+            return TSNE(n_components=2, init="pca", learning_rate="auto", perplexity=perp,
+                        random_state=int(cfg.get("rep_tsne_seed", 14142))).fit_transform(points)
+
+        z_cot_rows = np.unique(cot_idx)
+        z_code_rows = np.unique(code_idx[has_code]) if has_code.any() else np.zeros(0, dtype=np.int64)
+
+        def _panel(ax, include_wrong: bool, title: str):
+            sel = np.ones_like(correct) if include_wrong else correct
+            if sel.sum() < 2:
+                return
+            pts = np.concatenate([p[sel], Z[z_cot_rows], Z[z_code_rows]], axis=0)
+            proj = _fit(pts)
+            n_s = int(sel.sum())
+            s_proj = proj[:n_s]
+            cot_proj = proj[n_s: n_s + len(z_cot_rows)]
+            code_proj = proj[n_s + len(z_cot_rows):]
+            # Pair segments: each student anchor to its own teacher views.
+            cot_at = {int(r): k for k, r in enumerate(z_cot_rows)}
+            code_at = {int(r): k for k, r in enumerate(z_code_rows)}
+            for k, a in enumerate(np.where(sel)[0]):
+                tgt = cot_proj[cot_at[int(cot_idx[a])]]
+                ax.plot([s_proj[k, 0], tgt[0]], [s_proj[k, 1], tgt[1]],
+                        color="0.75", lw=.3, zorder=0)
+                if has_code[a] and int(code_idx[a]) in code_at:
+                    tgt = code_proj[code_at[int(code_idx[a])]]
+                    ax.plot([s_proj[k, 0], tgt[0]], [s_proj[k, 1], tgt[1]],
+                            color="0.88", lw=.3, zorder=0)
+            c_sel = correct[sel]
+            ax.scatter(s_proj[c_sel, 0], s_proj[c_sel, 1], c="tab:blue", marker="o",
+                       s=14, alpha=.75, label="student CoT (correct)")
+            if include_wrong and (~c_sel).any():
+                ax.scatter(s_proj[~c_sel, 0], s_proj[~c_sel, 1], c="tab:red", marker="x",
+                           s=18, alpha=.75, label="student CoT (incorrect)")
+            ax.scatter(cot_proj[:, 0], cot_proj[:, 1], c="tab:green", marker="^",
+                       s=44, edgecolors="k", linewidths=.4, label="teacher CoT")
+            if len(code_proj):
+                ax.scatter(code_proj[:, 0], code_proj[:, 1], c="tab:orange", marker="s",
+                           s=44, edgecolors="k", linewidths=.4, label="teacher Code")
+            ax.set_title(title, fontsize=10)
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.legend(fontsize=7, loc="best")
+
+        fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(13, 6))
+        _panel(ax_a, False, "(a) correct student CoT vs teacher CoT / Code")
+        _panel(ax_b, True, "(b) + incorrect student CoT")
+        fig.suptitle(
+            f"Representations — step {self.global_steps} "
+            f"(k={self.jepa_cfg.predictor_k}, jepa={'on' if self.jepa_cfg.enable else 'off'})"
+        )
+        fig.tight_layout()
+        png = stem + ".png"
+        fig.savefig(png, dpi=180)
+        plt.close(fig)
+
+        # ---- diagnostics: spectra + correct/incorrect cosine split ----
+        dfig, (sv_ax, cos_ax) = plt.subplots(1, 2, figsize=(11, 4))
+        sv_ax.plot(np.arange(1, min(100, len(sv_cot)) + 1), sv_cot[:100], label="p - Enc(teacher CoT)")
+        if len(sv_code) > 1:
+            sv_ax.plot(np.arange(1, min(100, len(sv_code)) + 1), sv_code[:100],
+                       label="p - Enc(teacher Code)")
+        sv_ax.set_yscale("log")
+        sv_ax.set_title("Paired-difference singular values (paper Fig. 3 left)")
+        sv_ax.set_xlabel("Singular-value index"); sv_ax.set_ylabel("Singular value")
+        sv_ax.legend(fontsize=8)
+        for flag, name, color in ((True, "correct", "tab:blue"), (False, "incorrect", "tab:red")):
+            vals = 1.0 - cos_cot[correct == flag]
+            if len(vals):
+                cos_ax.hist(vals, bins=min(30, max(5, len(vals) // 4)), alpha=.6,
+                            color=color, label=f"{name} (n={len(vals)})")
+        cos_ax.set_title("Student-to-teacher-CoT cosine distance")
+        cos_ax.set_xlabel("1 - cosine similarity"); cos_ax.set_ylabel("Count")
+        cos_ax.legend(fontsize=8)
+        dfig.suptitle(f"Representation diagnostics — step {self.global_steps}")
+        dfig.tight_layout()
+        dpng = stem + "_diagnostics.png"
+        dfig.savefig(dpng, dpi=180)
+        plt.close(dfig)
+
+        def _m(v):
+            return float(v.mean()) if len(v) else float("nan")
+
+        summary = {
+            "step": int(self.global_steps),
+            "n_anchors": int(len(p)),
+            "n_correct": int(correct.sum()),
+            "n_prompts": int(meta["n_prompts"]),
+            "n_teacher_cot": int(len(z_cot_rows)),
+            "n_teacher_code": int(len(z_code_rows)),
+            "cos_cot_correct": _m(cos_cot[correct]),
+            "cos_cot_wrong": _m(cos_cot[~correct]),
+            "cos_code_correct": _m(cos_code[correct]) if len(cos_code) else float("nan"),
+            "cos_code_wrong": _m(cos_code[~correct]) if len(cos_code) else float("nan"),
+            "effective_rank_cot": erank_cot,
+            "effective_rank_code": erank_code,
+            "top100_sv_mean_cot": float(sv_cot[:100].mean()),
+            "top100_sv_mean_code": float(sv_code[:100].mean()),
+        }
+        np.savez(stem + ".npz", student=p, targets=Z, correct=correct,
+                 cot_idx=cot_idx, code_idx=code_idx, uids=meta["uids"],
+                 target_view=meta["target_view"], sv_cot=sv_cot, sv_code=sv_code,
+                 cos_cot=cos_cot, cos_code=cos_code)
+        with open(stem + ".json", "w") as f:
+            json.dump(summary, f, indent=2)
+
+        if "wandb" in list(cfg.logger):
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    payload = {f"rep/{k}": v for k, v in summary.items() if k != "step"}
+                    payload["rep/tsne"] = wandb.Image(png)
+                    payload["rep/diagnostics"] = wandb.Image(dpng)
+                    wandb.log(payload, step=self.global_steps)
+            except Exception as exc:
+                logger.warning("W&B train t-SNE logging failed: %s", exc)
+        print(f"[representation_tsne] wrote {png} "
+              f"({len(p)} anchors / {meta['n_prompts']} prompts, "
+              f"cos correct={summary['cos_cot_correct']:.3f} wrong={summary['cos_cot_wrong']:.3f})")
 
     def _validate_once(self, merged: bool = False, seed: int | None = None):
         """CoT validation (parent) plus an extra Code-view pass.
@@ -1677,6 +2023,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                                 reward_tensor=reward_tensor,
                                 view_tags=view_tags,
                             )
+
+                # Paper-style representation figure. Placed here, BEFORE the actor
+                # update, so the embeddings come from the same weights that produced
+                # these rollouts; running it after Step 4/5 would mix a policy that
+                # has already moved with rollouts from the policy that preceded it.
+                with simple_timer("rep_tsne", timing_raw):
+                    self._maybe_log_train_rep_tsne(batch, reward_tensor, view_tags)
 
                 # ── Step 3: Compute old log-probs & (optional) ref ──────
                 # Actor/FSDP-only (compute_log_prob); does NOT call vLLM. All rollout outputs
