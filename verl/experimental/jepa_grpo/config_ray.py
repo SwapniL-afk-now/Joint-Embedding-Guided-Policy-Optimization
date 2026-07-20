@@ -188,6 +188,11 @@ class JEPARayConfig:
     # the model's preallocated padded embedding rows (Qwen2.5: 151936 rows vs
     # ~151665 tokenizer ids, ~270 spare); worker.jepa_init asserts this bound.
     predictor_token_ids: list[int] = field(default_factory=list)
+    # llm-jepa-contrastive only: the parallel append sequence for the <bad_pred> read on
+    # WRONG anchors — literal tokens <|bad_predictor_1|>..<|bad_predictor_k|> (same k as
+    # predictor_k), resolved by ray_trainer.py alongside predictor_token_ids. Empty unless
+    # loss_type='llm-jepa-contrastive'.
+    bad_predictor_token_ids: list[int] = field(default_factory=list)
     # SIGReg lambda for the jepa-tcr-dual loss: L = (1-λ)·(align_cot + align_code +
     # w·L_self) + λ·SIGReg([pred_cot, pred_code]). (Name retained for config back-compat.)
     triplet_sigreg_lambda: float = 0.05
@@ -209,10 +214,10 @@ class JEPARayConfig:
         """
         if not self.enable:
             return
-        if self.loss_type not in ("llm-jepa", "jepa-tcr-dual", "jepa-tcr-cot"):
+        if self.loss_type not in ("llm-jepa", "llm-jepa-contrastive", "jepa-tcr-dual", "jepa-tcr-cot"):
             raise ValueError(
-                f"jepa.loss_type must be 'llm-jepa', 'jepa-tcr-dual' or 'jepa-tcr-cot'; "
-                f"got {self.loss_type!r}"
+                f"jepa.loss_type must be 'llm-jepa', 'llm-jepa-contrastive', 'jepa-tcr-dual' "
+                f"or 'jepa-tcr-cot'; got {self.loss_type!r}"
             )
         if not self.teacher_cache_path:
             raise ValueError(
@@ -225,16 +230,24 @@ class JEPARayConfig:
         # when the code arm is empty (see llm_jepa_tcr_dual_loss / n_code=0 handling).
         # llm-jepa: the student CoT predicts BOTH pregenerated teacher views, so the
         # code-view TEXT cache is required even though no code rollouts are generated.
-        if self.loss_type == "llm-jepa" and not self.code_teacher_cache_path:
+        # llm-jepa-contrastive shares llm-jepa's data contract (student CoT predicts BOTH
+        # teacher views for its correct anchors); it additionally uses wrong rollouts, which
+        # need no extra cache. Both require the code-view cache, n_code=0, and predictor_k>0.
+        if self.loss_type in ("llm-jepa", "llm-jepa-contrastive") and not self.code_teacher_cache_path:
             raise ValueError(
-                "jepa.loss_type='llm-jepa' requires jepa.code_teacher_cache_path "
+                f"jepa.loss_type={self.loss_type!r} requires jepa.code_teacher_cache_path "
                 "(the pregenerated big-teacher Code-view TEXT cache {idx: [y^+,...]}); "
                 "the student's CoT prediction is aligned to BOTH teacher views."
             )
-        if self.loss_type == "llm-jepa" and self.n_code > 0:
+        if self.loss_type in ("llm-jepa", "llm-jepa-contrastive") and self.n_code > 0:
             raise ValueError(
-                f"jepa.loss_type='llm-jepa': the student generates CoT rollouts only; "
+                f"jepa.loss_type={self.loss_type!r}: the student generates CoT rollouts only; "
                 f"set n_code=0 (got {self.n_code})."
+            )
+        if self.loss_type == "llm-jepa-contrastive" and self.predictor_k <= 0:
+            raise ValueError(
+                "jepa.loss_type='llm-jepa-contrastive' needs the <good_pred>/<bad_pred> reads; "
+                f"set predictor_k > 0 (got {self.predictor_k})."
             )
         if self.loss_type == "jepa-tcr-dual" and not self.code_teacher_cache_path:
             raise ValueError(

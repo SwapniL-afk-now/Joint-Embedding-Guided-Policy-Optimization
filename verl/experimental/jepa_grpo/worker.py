@@ -35,6 +35,7 @@ from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
 from verl.experimental.jepa_grpo.core_algos import (
+    llm_jepa_contrastive_loss,
     llm_jepa_paper_loss,
     llm_jepa_tcr_dual_loss,
 )
@@ -356,14 +357,30 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         # [<|predictor_K|>, ..., <|predictor_1|>] (official finetune.py order); a
         # row with pk <= K takes the LAST pk entries so the read token is always
         # <|predictor_1|>.
+        # predictor_token_ids may be ONE shared append sequence (list[int], the common
+        # case) OR a PER-ROW list of sequences (list[list[int]]) so a single joint forward
+        # can mix different predictor vocabularies — e.g. llm-jepa-contrastive appends
+        # <|predictor_i|> on good rows and <|bad_predictor_i|> on wrong rows. Row b always
+        # takes the LAST pk entries of its sequence (read token = slot 1).
         pred_seq = None
+        per_row_seqs = None
         if any(pk > 0 for pk in predictor_ks):
             assert predictor_token_ids, "rows with predictor_k > 0 need predictor_token_ids"
-            assert max(predictor_ks) <= len(predictor_token_ids), (
-                f"predictor_k {max(predictor_ks)} exceeds the {len(predictor_token_ids)} "
-                "resolved predictor tokens"
-            )
-            pred_seq = torch.tensor(list(predictor_token_ids), dtype=input_ids.dtype, device=device)
+            if isinstance(predictor_token_ids[0], (list, tuple)):
+                assert len(predictor_token_ids) == N, "per-row predictor_token_ids must match batch size"
+                per_row_seqs = [
+                    torch.tensor(list(s), dtype=input_ids.dtype, device=device) if s else None
+                    for s in predictor_token_ids
+                ]
+                for b, pk in enumerate(predictor_ks):
+                    assert pk <= 0 or (per_row_seqs[b] is not None and pk <= per_row_seqs[b].shape[0]), (
+                        f"row {b}: predictor_k {pk} exceeds its resolved predictor tokens")
+            else:
+                assert max(predictor_ks) <= len(predictor_token_ids), (
+                    f"predictor_k {max(predictor_ks)} exceeds the {len(predictor_token_ids)} "
+                    "resolved predictor tokens"
+                )
+                pred_seq = torch.tensor(list(predictor_token_ids), dtype=input_ids.dtype, device=device)
         packed_ids = torch.zeros(N, max_rlen, dtype=input_ids.dtype, device=device)
         packed_attn = torch.zeros(N, max_rlen, dtype=torch.long, device=device)
         for b, rlen in enumerate(rlens):
@@ -373,7 +390,8 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 packed_ids[b, :rlen] = real_toks
                 packed_attn[b, :rlen] = 1
                 if pk > 0:
-                    packed_ids[b, rlen:rlen + pk] = pred_seq[-pk:]
+                    seq = per_row_seqs[b] if per_row_seqs is not None else pred_seq
+                    packed_ids[b, rlen:rlen + pk] = seq[-pk:]
                     packed_attn[b, rlen:rlen + pk] = 1
 
         # Monotonically increasing position_ids for ALL positions (including padding).
@@ -622,6 +640,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         micro_bs: int,
         alpha: float,
         also_boundary: bool = False,
+        predictor_token_ids: "list | None" = None,
     ) -> dict:
         """Embed the joint (N, L) batch, compute a loss over it, and run backward
         — splitting the forward+backward into micro-batches of size `micro_bs`
@@ -670,6 +689,11 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         N = ids.shape[0]
         cfg = self.jepa_cfg
+        # One shared append sequence (list[int]) or a per-row list of sequences
+        # (list[list[int]]); the per-row form must ride the length-sort permutation
+        # in lockstep with pk_s so each chunk still gets its own rows' tokens.
+        ptids = cfg.predictor_token_ids if predictor_token_ids is None else predictor_token_ids
+        per_row_pt = bool(ptids) and isinstance(ptids[0], (list, tuple))
 
         def _run_loss(emb, boundary):
             return loss_fn(emb, boundary) if also_boundary else loss_fn(emb)
@@ -678,14 +702,14 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             if also_boundary:
                 joint_emb, boundary, logits_anchor = self._extract_embeddings(
                     ids, mask, lengths, use_ema=False, requires_grad=True,
-                    predictor_k=predictor_k, predictor_token_ids=cfg.predictor_token_ids,
+                    predictor_k=predictor_k, predictor_token_ids=ptids,
                     also_boundary=True,
                 )
                 boundary = boundary.detach()
             else:
                 joint_emb, logits_anchor = self._extract_embeddings(
                     ids, mask, lengths, use_ema=False, requires_grad=True,
-                    predictor_k=predictor_k, predictor_token_ids=cfg.predictor_token_ids,
+                    predictor_k=predictor_k, predictor_token_ids=ptids,
                 )
                 boundary = None
             loss, metrics = _run_loss(joint_emb, boundary)
@@ -702,6 +726,10 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         order_list = order.tolist()
         ids_s, mask_s, len_s = ids[order], mask[order], lengths[order]
         pk_s = [predictor_k[i] for i in order_list]
+        pt_s = [ptids[i] for i in order_list] if per_row_pt else None
+
+        def _pt(start, end):
+            return pt_s[start:end] if per_row_pt else ptids
 
         bounds = [(s, min(s + micro_bs, N)) for s in range(0, N, micro_bs)]
 
@@ -718,14 +746,14 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 if also_boundary:
                     chunk_emb, chunk_bnd, _ = self._extract_embeddings(
                         ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=False, requires_grad=False,
-                        predictor_k=pk_s[start:end], predictor_token_ids=cfg.predictor_token_ids,
+                        predictor_k=pk_s[start:end], predictor_token_ids=_pt(start, end),
                         also_boundary=True,
                     )
                     boundary_chunks.append(chunk_bnd)
                 else:
                     chunk_emb, _ = self._extract_embeddings(
                         ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=False, requires_grad=False,
-                        predictor_k=pk_s[start:end], predictor_token_ids=cfg.predictor_token_ids,
+                        predictor_k=pk_s[start:end], predictor_token_ids=_pt(start, end),
                     )
                 cached.append(chunk_emb.clone().requires_grad_(True))
 
@@ -746,7 +774,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         for (start, end), cached_chunk in zip(bounds, cached):
             chunk_emb_live, chunk_logits_anchor = self._extract_embeddings(
                 ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=False, requires_grad=True,
-                predictor_k=pk_s[start:end], predictor_token_ids=cfg.predictor_token_ids,
+                predictor_k=pk_s[start:end], predictor_token_ids=_pt(start, end),
             )
             torch.autograd.backward(
                 [chunk_emb_live, chunk_logits_anchor],
@@ -783,9 +811,10 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
-        assert self.jepa_cfg.loss_type in ("llm-jepa", "jepa-tcr-dual", "jepa-tcr-cot"), (
-            f"worker.jepa_update only supports loss_type 'llm-jepa', 'jepa-tcr-dual' or "
-            f"'jepa-tcr-cot', got {self.jepa_cfg.loss_type!r}"
+        assert self.jepa_cfg.loss_type in (
+            "llm-jepa", "llm-jepa-contrastive", "jepa-tcr-dual", "jepa-tcr-cot"), (
+            f"worker.jepa_update only supports loss_type 'llm-jepa', 'llm-jepa-contrastive', "
+            f"'jepa-tcr-dual' or 'jepa-tcr-cot', got {self.jepa_cfg.loss_type!r}"
         )
         if self.jepa_cfg.predictor_k > 0:
             assert len(self.jepa_cfg.predictor_token_ids) == self.jepa_cfg.predictor_k, (
@@ -916,6 +945,80 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 jepa_metrics = self._embed_chunked_with_backward(
                     joint_ids, joint_mask, joint_lengths, joint_predictor_k,
                     _loss_fn, micro_bs, alpha,
+                )
+            elif cfg.loss_type == "llm-jepa-contrastive":
+                # Three-arm loss over student CoT rollouts (see
+                # core_algos.llm_jepa_contrastive_loss and
+                # ray_trainer._build_jepa_batch_llm_jepa_contrastive). One joint block:
+                # good anchors (<|predictor_i|>) | bad anchors (<|bad_predictor_i|>) |
+                # unique teacher targets | per-prompt wrong targets — real rows first,
+                # padding (lengths==0) sliced off.
+                anchor_lengths_all = data["anchor_lengths"].long()
+                target_lengths_all = data["target_lengths"].long()
+                N = int((anchor_lengths_all > 0).sum().item())
+                U = int((target_lengths_all > 0).sum().item())
+                is_bad = data["anchor_is_bad"].long()[:N]
+                is_wrong = data["target_is_wrong"].long()[:U]
+                Ng = int((is_bad == 0).sum().item())
+                Nb = N - Ng
+                Ut = int((is_wrong == 0).sum().item())
+
+                anchor_ids = data["anchor_input_ids"][:N]
+                anchor_mask = data["anchor_attn_mask"][:N]
+                anchor_lengths = anchor_lengths_all[:N]
+                target_ids = data["target_input_ids"][:U]
+                target_mask = data["target_attn_mask"][:U]
+                target_lengths = target_lengths_all[:U]
+
+                # Gather indices: first Ng anchor rows are good, next Nb are bad.
+                tgt_cot_idx = data["tgt_cot_idx"].long()[:Ng]
+                tgt_code_idx = data["tgt_code_idx"].long()[:Ng]
+                bad_tgt_idx = data["bad_tgt_idx"].long()[Ng:N]
+                good_group_id = data["anchor_group_id"].long()[:Ng]
+                bad_group_id = data["anchor_group_id"].long()[Ng:N]
+                cg_all = data["contrast_good_idx"].long()
+                Nc = int((cg_all >= 0).sum().item())
+                contrast_good_idx = cg_all[:Nc]
+                contrast_bad_idx = data["contrast_bad_idx"].long()[:Nc]
+                contrast_group_id = data["contrast_group_id"].long()[:Nc]
+
+                joint_ids, joint_mask = self._pad_concat_batch(
+                    anchor_ids, anchor_mask, target_ids, target_mask
+                )
+                joint_lengths = torch.cat([anchor_lengths, target_lengths])
+                joint_predictor_k = [cfg.predictor_k] * N + [0] * U
+                good_seq = list(cfg.predictor_token_ids)
+                bad_seq = list(cfg.bad_predictor_token_ids)
+                # Per-row append vocab: good anchors -> good tokens, bad -> bad tokens,
+                # targets -> none (k=0). Rides the GradCache length-sort permutation.
+                joint_pt = [good_seq] * Ng + [bad_seq] * Nb + [[]] * U
+
+                def _loss_fn(joint_emb, _Ng=Ng, _Nb=Nb, _Ut=Ut, _Nc=Nc,
+                             _cot=tgt_cot_idx, _code=tgt_code_idx, _bt=bad_tgt_idx,
+                             _gg=good_group_id, _bg=bad_group_id,
+                             _cgi=contrast_good_idx, _cbi=contrast_bad_idx, _cg=contrast_group_id):
+                    dev = joint_emb.device
+                    good_pred = joint_emb[:_Ng]
+                    bad_pred = joint_emb[_Ng:_Ng + _Nb]
+                    tgt = joint_emb[_Ng + _Nb:]        # U target rows: teacher [:Ut], wrong [Ut:]
+                    teacher = tgt[:_Ut]
+                    wrong = tgt[_Ut:]
+                    z_cot = teacher[_cot.to(dev)]
+                    has_code = (_code >= 0).to(dev)
+                    z_code = teacher[_code.clamp(min=0).to(dev)]
+                    bad_target = wrong[_bt.to(dev)] if _Nb > 0 else bad_pred
+                    c_good = good_pred[_cgi.to(dev)] if _Nc > 0 else good_pred[:0]
+                    c_bad = bad_pred[_cbi.to(dev)] if _Nc > 0 else bad_pred[:0]
+                    return llm_jepa_contrastive_loss(
+                        good_pred=good_pred, target_cot=z_cot, target_code=z_code,
+                        has_code=has_code, good_group_id=_gg.to(dev),
+                        bad_pred=bad_pred, bad_target=bad_target, bad_group_id=_bg.to(dev),
+                        contrast_good=c_good, contrast_bad=c_bad, contrast_group_id=_cg.to(dev),
+                    )
+
+                jepa_metrics = self._embed_chunked_with_backward(
+                    joint_ids, joint_mask, joint_lengths, joint_predictor_k,
+                    _loss_fn, micro_bs, alpha, predictor_token_ids=joint_pt,
                 )
             elif cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot"):
                 # Dual-target self-consistent TCR ('jepa-tcr-cot' is the same path with

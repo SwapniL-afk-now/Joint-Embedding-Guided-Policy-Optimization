@@ -221,6 +221,11 @@ TARGET_MAX_LENGTH=${TARGET_MAX_LENGTH:-4096}
 MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
 # Default loss mode: paper-exact LLM-JEPA (student CoT predicts BOTH pregenerated
 # teacher views; cosine distance; no stop-grad; no SIGReg).
+#   JEPA_LOSS_TYPE=llm-jepa-contrastive  adds two arms that also use the student's WRONG
+#   rollouts: (B) align a prompt's wrong rollouts to one chosen wrong response via a
+#   <|bad_predictor_i|> read, and (C) push the <good_pred>/<bad_pred> reads apart for
+#   prompts with both. Requires LLM_JEPA_PREDICTOR_K>0 (needs the pred reads). Enable with:
+#     JEPA_LOSS_TYPE=llm-jepa-contrastive LLM_JEPA_PREDICTOR_K=2 ./drgrpo_jepo_qwen25_math_1.5b_long_context.sh
 JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-llm-jepa}
 # The paper has NO reward shaping — β=0 also skips the whole per-step forward-only
 # shaping/embedding pass (score_cot_embeddings + embed_targets RPCs), which was the

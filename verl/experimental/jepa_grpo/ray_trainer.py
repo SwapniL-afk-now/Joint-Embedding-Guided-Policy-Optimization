@@ -124,20 +124,29 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 self.jepa_cfg.predictor_token_ids = self._resolve_predictor_token_ids(
                     self.jepa_cfg.predictor_k
                 )
+                # llm-jepa-contrastive reads WRONG anchors through a separate
+                # <|bad_predictor_i|> sequence so good/bad reads are distinguishable.
+                if self.jepa_cfg.loss_type == "llm-jepa-contrastive":
+                    self.jepa_cfg.bad_predictor_token_ids = self._resolve_predictor_token_ids(
+                        self.jepa_cfg.predictor_k, prefix="bad_predictor"
+                    )
 
             cfg_dict = dataclasses.asdict(self.jepa_cfg)
             self.actor_rollout_wg.jepa_init(cfg_dict)
 
-    def _resolve_predictor_token_ids(self, k: int) -> list[int]:
+    def _resolve_predictor_token_ids(self, k: int, prefix: str = "predictor") -> list[int]:
         """Add the paper's LITERAL predictor special tokens and return the append
         sequence — exactly the official finetune.py mechanics:
 
-          - k distinct special tokens ``<|predictor_1|>`` .. ``<|predictor_k|>`` are
+          - k distinct special tokens ``<|{prefix}_1|>`` .. ``<|{prefix}_k|>`` are
             added to the tokenizer via ``add_special_tokens`` (only those not already
             in the vocab, mirroring finetune.py's ``token not in tokenizer.vocab``);
           - they are appended to the Text view in DESCENDING slot order
-            ``<|predictor_k|>, ..., <|predictor_1|>`` (finetune.py's ``while to_add``
-            back-append loop), so the last — read — token is always ``<|predictor_1|>``.
+            ``<|{prefix}_k|>, ..., <|{prefix}_1|>`` (finetune.py's ``while to_add``
+            back-append loop), so the last — read — token is always ``<|{prefix}_1|>``.
+
+        ``prefix`` defaults to ``predictor`` (the good/teacher read); llm-jepa-contrastive
+        also resolves ``bad_predictor`` for the wrong-anchor <bad_pred> read.
 
         The one mechanical difference from finetune.py: no ``resize_token_embeddings``.
         Qwen2.5's embedding matrix is padded (config vocab 151936 vs ~151665 tokenizer
@@ -148,7 +157,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         own tokenizer copy is unaffected.
         """
         tok = self.tokenizer
-        names = [f"<|predictor_{i}|>" for i in range(1, k + 1)]
+        names = [f"<|{prefix}_{i}|>" for i in range(1, k + 1)]
         vocab = tok.get_vocab()
         new_tokens = [t for t in names if t not in vocab]
         if new_tokens:
@@ -1380,6 +1389,178 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         jepa_batch.meta_info["n_self_pairs"] = 0
         return jepa_batch
 
+    def _build_jepa_batch_llm_jepa_contrastive(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> DataProto | None:
+        """Build the llm-jepa-contrastive batch (loss_type='llm-jepa-contrastive').
+
+        Three arms, self-gating per prompt (see core_algos.llm_jepa_contrastive_loss):
+          A  correct CoT anchors -> pregenerated teacher CoT + Code (arm A, as llm-jepa),
+             read via <|predictor_i|>.
+          B  a prompt's wrong CoT rollouts: the FIRST becomes a plain-read target, the rest
+             become anchors read via <|bad_predictor_i|> and pulled toward it (no stop-grad).
+          C  for prompts with both, every (good anchor, bad anchor) pair contributes a
+             (1+cos)/2 contrastive push between their reads.
+
+        Ships ONE anchor block (good rows first, then bad rows; `anchor_is_bad` splits) and
+        ONE target block (unique teacher rows first, then per-prompt wrong-target rows;
+        `target_is_wrong` splits), plus per-anchor gather indices, per-anchor/pair prompt
+        `group_id`s (for the per-prompt collapse), and the contrast pair index lists. Both
+        blocks are padded to R = max(N_anchor, U_target) with zero-length rows.
+        Returns None if fewer than min_valid_pairs good anchors.
+        """
+        assert self.teacher_targets is not None, "CoT teacher target cache not loaded"
+        assert self.code_teacher_targets is not None, "Code teacher target cache not loaded"
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+        eos_id = self.tokenizer.eos_token_id
+        cap = int(self.jepa_cfg.max_anchors_per_prompt)
+
+        rows_by_uid: dict = defaultdict(list)
+        idx_by_uid: dict = {}
+        prob_by_uid: dict = {}
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v != "cot":
+                continue
+            rows_by_uid[u].append(i)
+            if u not in idx_by_uid:
+                info = extra_infos[i]
+                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
+                prob_by_uid[u] = info["problem"] if isinstance(info, dict) else str(info)
+
+        def _strip_eos(t: torch.Tensor) -> torch.Tensor:
+            return t[:-1] if (eos_id is not None and t.shape[0] > 1 and int(t[-1]) == eos_id) else t
+
+        def _rollout_ids(i: int) -> torch.Tensor:
+            return _strip_eos(all_input_ids[i][all_attn_mask[i].bool()])
+
+        def _match_row(k, n_u):
+            return int(torch.randint(n_u, (1,)).item()) if self.jepa_cfg.tcr_match == "random" else k % n_u
+
+        # Unique teacher-target rows (view, text) dedup — identical to _build_jepa_batch_llm_jepa.
+        uniq_pos: dict = {}
+        uniq_rows: list[torch.Tensor] = []
+
+        def _uniq_target(view: str, problem: str, text: str) -> int:
+            key = (view, text)
+            pos = uniq_pos.get(key)
+            if pos is None:
+                pos = len(uniq_rows)
+                uniq_pos[key] = pos
+                uniq_rows.append(self._tokenize_target(problem, text, view))
+            return pos
+
+        good_rows: list[torch.Tensor] = []      # student CoT correct rollouts (anchors)
+        good_gather: list[tuple[int, int]] = []  # (teacher cot pos, teacher code pos or -1)
+        good_group: list[int] = []
+        bad_rows: list[torch.Tensor] = []        # student CoT wrong rollouts (anchors)
+        bad_gather: list[int] = []               # index into wrong-target block
+        bad_group: list[int] = []
+        wrong_rows: list[torch.Tensor] = []      # per-prompt chosen wrong target (plain read)
+        contrast_pairs: list[tuple[int, int, int]] = []  # (good pos, bad pos, group)
+
+        pid = 0
+        for u in dict.fromkeys(uids):
+            rows = [i for i in rows_by_uid.get(u, []) if int(all_attn_mask[i].sum()) > 0]
+            correct = [i for i in rows if rew[i] > 0]
+            wrong = [i for i in rows if rew[i] <= 0]
+            ds_idx = idx_by_uid.get(u)
+            problem = prob_by_uid.get(u, "")
+
+            good_local: list[int] = []
+            # Arm A: correct anchors -> teacher CoT (+ Code) — needs the CoT cache.
+            Z_cot = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
+            if Z_cot and correct:
+                Z_code = self.code_teacher_targets.get(ds_idx)
+                sel = correct[:cap] if cap > 0 else correct
+                for k, idx in enumerate(sel):
+                    cpos = _uniq_target("cot", problem, Z_cot[_match_row(k, len(Z_cot))])
+                    kpos = (_uniq_target("code", problem, Z_code[_match_row(k, len(Z_code))])
+                            if Z_code else -1)
+                    good_local.append(len(good_rows))
+                    good_rows.append(_rollout_ids(idx))
+                    good_gather.append((cpos, kpos))
+                    good_group.append(pid)
+
+            bad_local: list[int] = []
+            # Arm B: >=2 wrong rollouts — first is the plain-read target, rest are anchors.
+            if len(wrong) >= 2:
+                wpos = len(wrong_rows)
+                wrong_rows.append(_rollout_ids(wrong[0]))
+                rest = wrong[1:]
+                rest = rest[:cap] if cap > 0 else rest
+                for idx in rest:
+                    bad_local.append(len(bad_rows))
+                    bad_rows.append(_rollout_ids(idx))
+                    bad_gather.append(wpos)
+                    bad_group.append(pid)
+
+            # Arm C: contrast every good x bad read for prompts with both.
+            for gp in good_local:
+                for bp in bad_local:
+                    contrast_pairs.append((gp, bp, pid))
+
+            if good_local or bad_local:
+                pid += 1
+
+        Ng, Nb = len(good_rows), len(bad_rows)
+        if Ng < self.jepa_cfg.min_valid_pairs:
+            return None
+        Ut, Uw = len(uniq_rows), len(wrong_rows)
+        N, U = Ng + Nb, Ut + Uw
+        R = max(N, U)
+        Nc = len(contrast_pairs)
+
+        def _pack(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+            lengths = [int(t.shape[0]) for t in rows]
+            width = max(lengths) if rows else 1
+            ids = torch.full((R, width), pad_id, dtype=all_input_ids.dtype)
+            mask = torch.zeros((R, width), dtype=torch.long)
+            for r, t in enumerate(rows):
+                ids[r, : t.shape[0]] = t
+                mask[r, : t.shape[0]] = 1
+            return ids, mask, lengths
+
+        anchor_ids, anchor_mask, anchor_len = _pack(good_rows + bad_rows)
+        target_ids, target_mask, target_len = _pack(uniq_rows + wrong_rows)
+
+        def _padL(vals: list[int], n_real: int) -> torch.Tensor:
+            return torch.tensor(vals + [-1] * (R - n_real), dtype=torch.long)
+
+        jepa_batch = DataProto.from_single_dict({
+            "anchor_input_ids": anchor_ids,
+            "anchor_attn_mask": anchor_mask,
+            "anchor_lengths": torch.tensor(anchor_len + [0] * (R - N), dtype=torch.long),
+            "anchor_is_bad": torch.tensor([0] * Ng + [1] * Nb + [-1] * (R - N), dtype=torch.long),
+            "anchor_group_id": _padL(good_group + bad_group, N),
+            "target_input_ids": target_ids,
+            "target_attn_mask": target_mask,
+            "target_lengths": torch.tensor(target_len + [0] * (R - U), dtype=torch.long),
+            "target_is_wrong": torch.tensor([0] * Ut + [1] * Uw + [-1] * (R - U), dtype=torch.long),
+            # good-anchor gather (aligned to the first Ng anchor rows; -1 on bad/pad rows)
+            "tgt_cot_idx": _padL([c for c, _ in good_gather] + [-1] * Nb, N),
+            "tgt_code_idx": _padL([k for _, k in good_gather] + [-1] * Nb, N),
+            # bad-anchor gather into the wrong-target block (-1 on good/pad rows)
+            "bad_tgt_idx": _padL([-1] * Ng + bad_gather, N),
+            # contrast pair index lists (into the good / bad blocks) + group id
+            "contrast_good_idx": _padL([g for g, _, _ in contrast_pairs], Nc),
+            "contrast_bad_idx": _padL([b for _, b, _ in contrast_pairs], Nc),
+            "contrast_group_id": _padL([g for _, _, g in contrast_pairs], Nc),
+        })
+        jepa_batch.meta_info["n_anchors"] = Ng
+        jepa_batch.meta_info["n_bad_anchors"] = Nb
+        jepa_batch.meta_info["n_contrast_pairs"] = Nc
+        jepa_batch.meta_info["n_unique_targets"] = Ut
+        jepa_batch.meta_info["n_wrong_targets"] = Uw
+        return jepa_batch
+
     # ------------------------------------------- TCR reward shaping (idea #2) -
     @staticmethod
     def _stratified_shaping(
@@ -2013,6 +2194,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     with simple_timer("jepa_build_batch", timing_raw):
                         if self.jepa_cfg.loss_type == "llm-jepa":
                             jepa_batch = self._build_jepa_batch_llm_jepa(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
+                        elif self.jepa_cfg.loss_type == "llm-jepa-contrastive":
+                            jepa_batch = self._build_jepa_batch_llm_jepa_contrastive(
                                 batch=batch,
                                 reward_tensor=reward_tensor,
                                 view_tags=view_tags,

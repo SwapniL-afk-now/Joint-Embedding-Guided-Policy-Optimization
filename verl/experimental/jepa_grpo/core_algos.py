@@ -465,3 +465,174 @@ def llm_jepa_tcr_dual_loss(
         "jepa/arm_self_on": float(self_on),
     }
     return loss, metrics
+
+
+# ---------------------------------------------------------------------------
+# LLM-JEPA contrastive loss (loss_type='llm-jepa-contrastive')
+# ---------------------------------------------------------------------------
+
+def _prompt_mean(vals: torch.Tensor, group_id: torch.Tensor) -> torch.Tensor:
+    """Collapse a per-distance vector to ONE scalar per group (prompt).
+
+    Returns a (n_groups_present,) vector of per-group means — the per-prompt unit
+    used by the contrastive loss's pooled average. Empty input -> empty vector.
+    Differentiable (index_add_ + divide).
+    """
+    if vals.numel() == 0:
+        return vals.new_zeros((0,))
+    gid = group_id.to(device=vals.device, dtype=torch.long)
+    G = int(gid.max().item()) + 1
+    ssum = torch.zeros(G, device=vals.device, dtype=vals.dtype).index_add_(0, gid, vals)
+    cnt = torch.zeros(G, device=vals.device, dtype=vals.dtype).index_add_(
+        0, gid, torch.ones_like(vals))
+    present = cnt > 0
+    return ssum[present] / cnt[present]
+
+
+def llm_jepa_contrastive_loss(
+    good_pred: torch.Tensor,        # (Ng, d) correct-anchor <good_pred> reads, L2-normalized
+    target_cot: torch.Tensor,       # (Ng, d) teacher CoT view per good anchor, L2-norm, NOT detached
+    target_code: torch.Tensor,      # (Ng, d) teacher Code view per good anchor, L2-norm, NOT detached
+    has_code: torch.Tensor,         # (Ng,) bool — good anchors with a code target
+    good_group_id: torch.Tensor,    # (Ng,) long — prompt id per good anchor
+    bad_pred: torch.Tensor,         # (Nb, d) wrong-anchor <bad_pred> reads, L2-normalized
+    bad_target: torch.Tensor,       # (Nb, d) wrong target per bad anchor (no stop-grad), L2-norm
+    bad_group_id: torch.Tensor,     # (Nb,) long — prompt id per bad anchor
+    contrast_good: torch.Tensor,    # (Nc, d) good_pred read per contrast pair (gathered)
+    contrast_bad: torch.Tensor,     # (Nc, d) bad_pred read per contrast pair (gathered)
+    contrast_group_id: torch.Tensor,  # (Nc,) long — prompt id per contrast pair
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Three-arm LLM-JEPA loss that also uses the student's WRONG rollouts.
+
+    Arms (each an unmodified cosine metric, all in [0,1]):
+      A  align_cot / align_code : correct anchor <good_pred> pulled toward the teacher
+                                  CoT / Code views (paper loss, no stop-grad).
+      B  bad_align              : wrong anchor <bad_pred> pulled toward ONE wrong response
+                                  chosen as target (no stop-grad); (1 - cos), CoT-only.
+      C  contrastive            : (1 + cos(good_pred, bad_pred)) / 2 — pushes the good/bad
+                                  reads apart on prompts that have both.
+
+    Averaging (imbalance fix): each arm is first collapsed to ONE scalar PER PROMPT
+    (mean over that prompt's anchors/pairs), then EVERY per-prompt unit from all arms is
+    pooled into a single mean:  L = mean(concat(a_cot, a_code, b, c)).  So an arm covering
+    more prompts weighs proportionally more, no arm dominates by raw rollout count, and the
+    total stays in [0,1]. Arms with no data this step contribute no units.
+    """
+    dev, dtype = good_pred.device, good_pred.dtype
+    hc = has_code.to(device=dev, dtype=torch.bool)
+
+    # Per-distance cosine terms (embeddings arrive unit-norm -> dot == cosine).
+    cos_cot = (good_pred * target_cot).sum(dim=-1) if good_pred.numel() else good_pred.new_zeros((0,))
+    a_cot_d = 1.0 - cos_cot
+    cos_code = (good_pred[hc] * target_code[hc]).sum(dim=-1)
+    a_code_d = 1.0 - cos_code
+    cos_bad = (bad_pred * bad_target).sum(dim=-1) if bad_pred.numel() else bad_pred.new_zeros((0,))
+    b_d = 1.0 - cos_bad
+    cos_ctr = (contrast_good * contrast_bad).sum(dim=-1) if contrast_good.numel() else good_pred.new_zeros((0,))
+    c_d = (1.0 + cos_ctr) / 2.0
+
+    # Collapse each arm to one unit per prompt, then pool all units into one mean.
+    a_cot = _prompt_mean(a_cot_d, good_group_id)
+    a_code = _prompt_mean(a_code_d, good_group_id[hc])
+    b = _prompt_mean(b_d, bad_group_id)
+    c = _prompt_mean(c_d, contrast_group_id)
+
+    parts = [v for v in (a_cot, a_code, b, c) if v.numel() > 0]
+    loss = torch.cat(parts).mean() if parts else good_pred.sum() * 0.0
+
+    def _m(t):
+        return float(t.detach().mean().cpu()) if t.numel() else 0.0
+
+    metrics = {
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
+        "jepa/tcr_loss": float(loss.detach().cpu()),  # alias: wandb key parity
+        "jepa/align_cot": _m(a_cot),
+        "jepa/align_code": _m(a_code),
+        "jepa/bad_align": _m(b),
+        "jepa/contrastive": _m(c),
+        "jepa/cos_cot": _m(cos_cot),
+        "jepa/cos_code": _m(cos_code),
+        "jepa/cos_bad": _m(cos_bad),
+        "jepa/cos_contrast": _m(cos_ctr),
+        "jepa/n_anchors_cot": int(good_pred.shape[0]),
+        "jepa/n_anchors_code": int(hc.sum().item()),
+        "jepa/n_bad_anchors": int(bad_pred.shape[0]),
+        "jepa/n_contrast_pairs": int(contrast_good.shape[0]),
+        "jepa/n_prompts_cot": int(a_cot.numel()),
+        "jepa/n_prompts_code": int(a_code.numel()),
+        "jepa/n_prompts_bad": int(b.numel()),
+        "jepa/n_prompts_contrast": int(c.numel()),
+        "jepa/pool_size": int(sum(v.numel() for v in parts)),
+        # Constant-zero keys kept for wandb panel parity with prior jepa runs.
+        "jepa/self_consist_loss": 0.0,
+        "jepa/tcr_sigreg_loss": 0.0,
+        "jepa/cos_self": 0.0,
+        "jepa/n_self_pairs": 0,
+        "jepa/tcr_lambda": 0.0,
+    }
+    return loss, metrics
+
+
+if __name__ == "__main__":
+    # Self-check for llm_jepa_contrastive_loss: gating, [0,1] bounds, per-prompt
+    # collapse (anchor count must not change a prompt's unit weight), and arm-A
+    # equivalence with the paper loss on a good-only, one-anchor-per-prompt batch.
+    torch.manual_seed(0)
+    d = 16
+
+    def _unit(n):
+        return F.normalize(torch.randn(n, d), dim=-1)
+
+    empty = torch.zeros(0, d)
+    empty_g = torch.zeros(0, dtype=torch.long)
+
+    # (1) good-only, one anchor per prompt == paper loss (align_cot + align_code averaged
+    #     as two pooled units per prompt). Compare per-arm means to the paper fn.
+    gp, tc, tk = _unit(4), _unit(4), _unit(4)
+    hcode = torch.ones(4, dtype=torch.bool)
+    gg = torch.arange(4)
+    loss, m = llm_jepa_contrastive_loss(
+        gp, tc, tk, hcode, gg, empty, empty, empty_g, empty, empty, empty_g)
+    paper_loss, pm = llm_jepa_paper_loss(gp, tc, tk, hcode)
+    # paper = align_cot + align_code (sum); contrastive pools the two as separate units
+    # -> mean of the two, i.e. paper/2. Check the per-arm means match the paper's arms.
+    assert abs(m["jepa/align_cot"] - pm["jepa/align_cot"]) < 1e-5, (m["jepa/align_cot"], pm["jepa/align_cot"])
+    assert abs(m["jepa/align_code"] - pm["jepa/align_code"]) < 1e-5
+    assert abs(float(loss) - (pm["jepa/align_cot"] + pm["jepa/align_code"]) / 2.0) < 1e-5
+    assert 0.0 <= float(loss) <= 2.0  # cosine distance 1-cos in [0,2]; contrast (1+cos)/2 in [0,1]
+    assert m["jepa/n_bad_anchors"] == 0 and m["jepa/n_contrast_pairs"] == 0
+
+    # (2) per-prompt collapse: duplicating one prompt's good anchors must NOT change loss.
+    gp2 = torch.cat([gp, gp[:1]], 0); tc2 = torch.cat([tc, tc[:1]], 0)
+    tk2 = torch.cat([tk, tk[:1]], 0); hc2 = torch.cat([hcode, hcode[:1]], 0)
+    gg2 = torch.cat([gg, gg[:1]], 0)  # extra anchor shares prompt 0
+    loss2, _ = llm_jepa_contrastive_loss(
+        gp2, tc2, tk2, hc2, gg2, empty, empty, empty_g, empty, empty, empty_g)
+    assert abs(float(loss) - float(loss2)) < 1e-5, (float(loss), float(loss2))
+
+    # (3) all-wrong: only bad arm fires, still in [0,1], good/contrast absent.
+    bp, bt, bgid = _unit(3), _unit(3), torch.tensor([0, 0, 1])
+    lb, mb = llm_jepa_contrastive_loss(
+        empty, empty, empty, torch.zeros(0, dtype=torch.bool), empty_g,
+        bp, bt, bgid, empty, empty, empty_g)
+    assert 0.0 <= float(lb) <= 2.0
+    assert mb["jepa/n_prompts_bad"] == 2 and mb["jepa/n_prompts_cot"] == 0
+
+    # (4) contrastive: identical good/bad reads -> cos=1 -> c=1; opposite -> c=0.
+    g = _unit(2)
+    lc_same, mc = llm_jepa_contrastive_loss(
+        g, _unit(2), _unit(2), torch.ones(2, dtype=torch.bool), torch.tensor([0, 1]),
+        empty, empty, empty_g, g, g, torch.tensor([0, 1]))
+    assert abs(mc["jepa/contrastive"] - 1.0) < 1e-5
+    lc_opp, mc2 = llm_jepa_contrastive_loss(
+        g, _unit(2), _unit(2), torch.ones(2, dtype=torch.bool), torch.tensor([0, 1]),
+        empty, empty, empty_g, g, -g, torch.tensor([0, 1]))
+    assert abs(mc2["jepa/contrastive"] - 0.0) < 1e-5
+
+    # (5) gradient flows to both branches (no stop-grad).
+    gp.requires_grad_(True); tc.requires_grad_(True)
+    lg, _ = llm_jepa_contrastive_loss(gp, tc, tk, hcode, gg, empty, empty, empty_g, empty, empty, empty_g)
+    lg.backward()
+    assert gp.grad is not None and tc.grad is not None and tc.grad.abs().sum() > 0
+
+    print("llm_jepa_contrastive_loss self-check passed")
