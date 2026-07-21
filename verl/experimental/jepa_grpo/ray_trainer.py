@@ -1795,6 +1795,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         cfg = self.jepa_cfg
         if not cfg.enable or not cfg.auto_off_enable:
             return
+        # llm-jepa-contrastive must never be auto-disabled: this plateau latch watches
+        # only the cot/code ALIGNMENT cosines and is blind to the contrastive + SIGReg
+        # arms, so it wrongly euthanizes JEPA the moment alignment plateaus (~step 87 in
+        # the smoke run) even though the contrastive/anti-collapse signal is still active.
+        if cfg.loss_type == "llm-jepa-contrastive":
+            metrics["jepa/signal_off"] = 0.0
+            return
         metrics["jepa/signal_off"] = float(self._jepa_signal_off)
         if self._jepa_signal_off:
             return
@@ -2254,13 +2261,16 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 self._log_gpu_mem("after_old_log_prob")
 
                 # ── Step 4: GRPO actor update ────────────────────────────
-                # Defer the optimizer step whenever a JEPA update will follow this step,
-                # so the two gradients (policy + auxiliary) combine into ONE optimizer
-                # step instead of two independent full-strength steps on the same LoRA
-                # weights (see worker.jepa_update, which issues the single combined step).
+                # The actor takes its OWN complete optimizer step here (policy grad
+                # applied + FSDP grad finalize). The JEPA update (Step 5) then takes a
+                # SECOND, separate step for the auxiliary grad. Two sequential steps —
+                # NOT a fused single step: the earlier "defer the policy step and fuse
+                # it into jepa_update" scheme silently DROPPED the policy gradient,
+                # because FSDP stashes a deferred (un-stepped) grad in its sharded
+                # internal buffer and never materialises it onto .grad for jepa_update
+                # to add to. θ → θ−lr·g_policy → θ−lr·α·g_JEPA; at this lr the two-step
+                # update is indistinguishable from the summed-loss single step.
                 with simple_timer("update_actor", timing_raw):
-                    if jepa_batch is not None:
-                        batch.meta_info["defer_optimizer_step"] = True
                     actor_output = self._update_actor(batch)
                     actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_metrics)

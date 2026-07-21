@@ -501,8 +501,13 @@ def llm_jepa_contrastive_loss(
     contrast_good: torch.Tensor,    # (Nc, d) good_pred read per contrast pair (gathered)
     contrast_bad: torch.Tensor,     # (Nc, d) bad_pred read per contrast pair (gathered)
     contrast_group_id: torch.Tensor,  # (Nc,) long — prompt id per contrast pair
+    sig_pool: "torch.Tensor | None" = None,  # (Npool, d) L2-normalized reads for anti-collapse
+    sigreg_lambda: float = 0.0,     # SIGReg vs arms convex mix; 0 => SIGReg off (back-compat)
+    sig_M: int = 1024, sig_n_freq: int = 17,
+    sig_t_min: float = -5.0, sig_t_max: float = 5.0, sig_s: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Three-arm LLM-JEPA loss that also uses the student's WRONG rollouts.
+    """Three-arm LLM-JEPA loss that also uses the student's WRONG rollouts, plus a
+    SIGReg anti-collapse term.
 
     Arms (each an unmodified cosine metric, all in [0,1]):
       A  align_cot / align_code : correct anchor <good_pred> pulled toward the teacher
@@ -514,9 +519,17 @@ def llm_jepa_contrastive_loss(
 
     Averaging (imbalance fix): each arm is first collapsed to ONE scalar PER PROMPT
     (mean over that prompt's anchors/pairs), then EVERY per-prompt unit from all arms is
-    pooled into a single mean:  L = mean(concat(a_cot, a_code, b, c)).  So an arm covering
+    pooled into a single mean:  arms = mean(concat(a_cot, a_code, b, c)).  So an arm covering
     more prompts weighs proportionally more, no arm dominates by raw rollout count, and the
-    total stays in [0,1]. Arms with no data this step contribute no units.
+    arms term stays in [0,1]. Arms with no data this step contribute no units.
+
+    Anti-collapse (SIGReg): the official LLM-JEPA is SUPERVISED — its LM loss grounds the
+    reads so they cannot collapse. Under RL we have no such anchor, so the cosine-alignment
+    arms drive every read into one anisotropic cone (all cosines -> ~0.9, contrastive fails).
+    LeJEPA's SIGReg is the designed fix for this "no supervised anchor" regime: it tests the
+    pooled reads against an isotropic Gaussian and its gradient spreads them out. Combined
+    convex:  L = (1 - lambda)*arms + lambda*SIGReg(sig_pool).  Pass sig_pool = all unique
+    reads (good_pred + bad_pred + teacher + wrong). sigreg_lambda=0 disables it.
     """
     dev, dtype = good_pred.device, good_pred.dtype
     hc = has_code.to(device=dev, dtype=torch.bool)
@@ -538,7 +551,17 @@ def llm_jepa_contrastive_loss(
     c = _prompt_mean(c_d, contrast_group_id)
 
     parts = [v for v in (a_cot, a_code, b, c) if v.numel() > 0]
-    loss = torch.cat(parts).mean() if parts else good_pred.sum() * 0.0
+    arms = torch.cat(parts).mean() if parts else good_pred.sum() * 0.0
+
+    # SIGReg anti-collapse on the pooled reads (convex mix with the arms term).
+    lam = float(sigreg_lambda)
+    if sig_pool is not None and sig_pool.numel() and lam > 0.0:
+        sig = sigreg_loss(sig_pool, M=sig_M, n_freq=sig_n_freq,
+                          t_min=sig_t_min, t_max=sig_t_max, s=sig_s)
+        loss = (1.0 - lam) * arms + lam * sig
+    else:
+        sig = arms.new_zeros(())
+        loss = arms
 
     def _m(t):
         return float(t.detach().mean().cpu()) if t.numel() else 0.0
@@ -546,6 +569,10 @@ def llm_jepa_contrastive_loss(
     metrics = {
         "jepa/llm_jepa_loss": float(loss.detach().cpu()),
         "jepa/tcr_loss": float(loss.detach().cpu()),  # alias: wandb key parity
+        "jepa/arms_loss": float(arms.detach().cpu()),
+        "jepa/sigreg_loss": float(sig.detach().cpu()),
+        "jepa/sigreg_lambda": lam,
+        "jepa/sig_pool_size": int(sig_pool.shape[0]) if sig_pool is not None else 0,
         "jepa/align_cot": _m(a_cot),
         "jepa/align_code": _m(a_code),
         "jepa/bad_align": _m(b),
@@ -634,5 +661,29 @@ if __name__ == "__main__":
     lg, _ = llm_jepa_contrastive_loss(gp, tc, tk, hcode, gg, empty, empty, empty_g, empty, empty, empty_g)
     lg.backward()
     assert gp.grad is not None and tc.grad is not None and tc.grad.abs().sum() > 0
+
+    # (6) SIGReg anti-collapse: a COLLAPSED (coned) pool must score HIGHER sigreg than a
+    #     SPREAD (isotropic) pool, the convex mix must land between arms and sig, and the
+    #     sig gradient must reach the pool reads (this is what breaks the cone in training).
+    torch.manual_seed(1)
+    dd = 64
+    spread = F.normalize(torch.randn(96, dd), dim=-1)                     # isotropic
+    cone = F.normalize(F.normalize(torch.randn(dd), dim=0) * 6 + torch.randn(96, dd) * 0.3, dim=-1)  # tight cone
+    gp6, tc6, tk6 = F.normalize(torch.randn(4, dd), dim=-1), F.normalize(torch.randn(4, dd), dim=-1), F.normalize(torch.randn(4, dd), dim=-1)
+    hc6, gg6 = torch.ones(4, dtype=torch.bool), torch.arange(4)
+    e6, eg6 = torch.zeros(0, dd), torch.zeros(0, dtype=torch.long)
+    _, ms = llm_jepa_contrastive_loss(gp6, tc6, tk6, hc6, gg6, e6, e6, eg6, e6, e6, eg6,
+                                      sig_pool=spread, sigreg_lambda=0.1)
+    _, mc6 = llm_jepa_contrastive_loss(gp6, tc6, tk6, hc6, gg6, e6, e6, eg6, e6, e6, eg6,
+                                       sig_pool=cone, sigreg_lambda=0.1)
+    assert mc6["jepa/sigreg_loss"] > ms["jepa/sigreg_loss"], (mc6["jepa/sigreg_loss"], ms["jepa/sigreg_loss"])
+    # convex mix: loss between arms and sig when lambda in (0,1)
+    assert min(mc6["jepa/arms_loss"], mc6["jepa/sigreg_loss"]) - 1e-6 <= mc6["jepa/llm_jepa_loss"] <= max(mc6["jepa/arms_loss"], mc6["jepa/sigreg_loss"]) + 1e-6
+    # sig gradient reaches the pool
+    pool_g = F.normalize(torch.randn(96, dd), dim=-1).requires_grad_(True)
+    lsig, _ = llm_jepa_contrastive_loss(gp6, tc6, tk6, hc6, gg6, e6, e6, eg6, e6, e6, eg6,
+                                        sig_pool=pool_g, sigreg_lambda=1.0)
+    lsig.backward()
+    assert pool_g.grad is not None and pool_g.grad.abs().sum() > 0
 
     print("llm_jepa_contrastive_loss self-check passed")
