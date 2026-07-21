@@ -406,3 +406,71 @@ def test_autooff_ignores_zero_metric_steps():
     for _ in range(10):
         _step(f, 0.0)             # no anchors -> ignored, stall must not advance
     assert f._align_stall["global"] == 0 and not f._jepa_signal_off
+
+
+# --------------------------------------------------------------------- infoNCE builder
+
+
+def _fake_self_infonce(teacher_texts, min_valid_pairs=1):
+    return types.SimpleNamespace(
+        teacher_targets=teacher_texts,   # TEXT cache {ds_idx: [t+, ...]}
+        tokenizer=types.SimpleNamespace(pad_token_id=0, eos_token_id=None),
+        jepa_cfg=types.SimpleNamespace(min_valid_pairs=min_valid_pairs),
+        _tokenize_target=lambda problem, text, view: torch.tensor([7, 8, 9]),
+    )
+
+
+def _fake_batch_cot(n_rollouts=4, n_prompts=3, prompt_len=3):
+    rows = n_rollouts * n_prompts
+    ids = torch.arange(1, rows * prompt_len + 1).reshape(rows, prompt_len)
+    mask = torch.ones(rows, prompt_len, dtype=torch.long)
+    uids, extra = [], []
+    for p in range(n_prompts):
+        for _ in range(n_rollouts):
+            uids.append(f"p{p}"); extra.append({"index": p, "problem": f"q{p}"})
+    batch = types.SimpleNamespace(
+        batch={"input_ids": ids, "attention_mask": mask},
+        non_tensor_batch={"uid": np.array(uids, dtype=object),
+                          "extra_info": np.array(extra, dtype=object)},
+    )
+    return batch, np.array(["cot"] * rows, dtype=object)
+
+
+def test_infonce_builder_mixed_prompts_only_one_pair_each():
+    # prompt0 mixed (2 correct / 2 wrong), prompt1 all-correct, prompt2 all-wrong
+    # -> min(c, w) = 2 disjoint (y+, y-, t+) triples, all from prompt0.
+    batch, view = _fake_batch_cot(n_rollouts=4, n_prompts=3)
+    fake = _fake_self_infonce({0: ["t0"], 1: ["t1"], 2: ["t2"]})
+    reward = torch.tensor([1, 1, 0, 0,  1, 1, 1, 1,  0, 0, 0, 0],
+                          dtype=torch.float32).reshape(-1, 1)
+    out = JEPARayPPOTrainer._build_jepa_batch_llm_jepa_infonce(fake, batch, reward, view)
+    assert out is not None and out.meta_info["n_anchors"] == 2
+    assert out.meta_info["n_mixed_prompts"] == 1
+    assert out.meta_info["pairs_per_prompt"] == 2.0
+    lens = out.batch["anchor_lengths"]
+    assert int((lens > 0).sum()) == 4            # 2 pos rows + 2 neg rows
+    correct_rows = {tuple(batch.batch["input_ids"][i].tolist()) for i in (0, 1)}
+    wrong_rows = {tuple(batch.batch["input_ids"][i].tolist()) for i in (2, 3)}
+    pos = [tuple(out.batch["anchor_input_ids"][r][: lens[r]].tolist()) for r in (0, 1)]
+    neg = [tuple(out.batch["anchor_input_ids"][r][: lens[r]].tolist()) for r in (2, 3)]
+    # disjoint pairs: both correct rollouts used as pos, both wrong as neg
+    assert set(pos) == correct_rows and set(neg) == wrong_rows
+    # one unique teacher row shared by both pairs
+    assert out.meta_info["n_unique_targets"] == 1
+    assert out.batch["tgt_cot_idx"][:2].tolist() == [0, 0]
+
+
+def test_infonce_builder_returns_none_without_enough_mixed_prompts():
+    batch, view = _fake_batch_cot(n_rollouts=4, n_prompts=2)
+    fake = _fake_self_infonce({0: ["t0"], 1: ["t1"]}, min_valid_pairs=1)
+    reward = torch.tensor([1, 1, 1, 1,  0, 0, 0, 0], dtype=torch.float32).reshape(-1, 1)
+    assert JEPARayPPOTrainer._build_jepa_batch_llm_jepa_infonce(fake, batch, reward, view) is None
+
+
+def test_infonce_loss_prefers_separated_reads():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_infonce_loss
+    z = _unit(4, 1)
+    l_sep, m = llm_jepa_infonce_loss(z, _unit(4, 2), z, tau=0.1)      # p+ == z+
+    l_col, _ = llm_jepa_infonce_loss(z, z, z, tau=0.1)                # p- == p+
+    assert float(l_sep) < float(l_col)                                # cos(p+,p-) up -> loss up
+    assert m["jepa/infonce_acc"] == 1.0 and m["jepa/n_anchors_cot"] == 4

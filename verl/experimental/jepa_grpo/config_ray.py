@@ -105,9 +105,22 @@ class JEPARayConfig:
     #       a per-view β·ŝ teacher-alignment term into token_level_rewards before the
     #       GRPO advantage (set tcr_reward_beta=0 to disable). Requires teacher_cache_path
     #       AND code_teacher_cache_path. See core_algos.llm_jepa_tcr_dual_loss.
+    #   "llm-jepa-infoNCE" — single discriminative InfoNCE objective over MIXED-reward
+    #       prompts only. Per prompt: one uniformly sampled correct rollout y+, one
+    #       uniformly sampled wrong rollout y-, one verified teacher solution t+.
+    #       Both rollouts read through the SAME [PRED] token (no <good>/<bad> label
+    #       leakage); p+ / p- are grad-enabled, z+ = sg(f_EMA([x, t+])) is the EMA
+    #       teacher encode (stop-grad). L = -log softmax over {cos(p+,z+), cos(p+,p-)}
+    #       at temperature infonce_tau — alignment and separation in one normalized
+    #       competition, no arm weighting. All-wrong prompts contribute no JEPA
+    #       gradient (data-selection rule, not loss weighting). Requires
+    #       teacher_cache_path, predictor_k>0, n_code=0; no code cache needed.
+    #       See core_algos.llm_jepa_infonce_loss.
     # (The separate JEPAGRPOTrainer entrypoint in trainer.py uses its own EMA
     # "lejepa" loss and does not read this field.)
     loss_type: str = "llm-jepa"
+    # llm-jepa-infoNCE only: softmax temperature τ.
+    infonce_tau: float = 0.1
     # -- jepa-tcr-dual teacher caches --
     # Path to the offline teacher-target cache produced by
     # examples/jepa_grpo_trainer/precompute_teacher_targets.py: a torch.save dict
@@ -214,10 +227,12 @@ class JEPARayConfig:
         """
         if not self.enable:
             return
-        if self.loss_type not in ("llm-jepa", "llm-jepa-contrastive", "jepa-tcr-dual", "jepa-tcr-cot"):
+        if self.loss_type not in (
+            "llm-jepa", "llm-jepa-contrastive", "llm-jepa-infoNCE", "jepa-tcr-dual", "jepa-tcr-cot"
+        ):
             raise ValueError(
-                f"jepa.loss_type must be 'llm-jepa', 'llm-jepa-contrastive', 'jepa-tcr-dual' "
-                f"or 'jepa-tcr-cot'; got {self.loss_type!r}"
+                f"jepa.loss_type must be 'llm-jepa', 'llm-jepa-contrastive', 'llm-jepa-infoNCE', "
+                f"'jepa-tcr-dual' or 'jepa-tcr-cot'; got {self.loss_type!r}"
             )
         if not self.teacher_cache_path:
             raise ValueError(
@@ -249,6 +264,21 @@ class JEPARayConfig:
                 "jepa.loss_type='llm-jepa-contrastive' needs the <good_pred>/<bad_pred> reads; "
                 f"set predictor_k > 0 (got {self.predictor_k})."
             )
+        # llm-jepa-infoNCE: CoT rollouts + CoT teacher cache only; positives read via
+        # <|predictor_i|>, negatives via <|bad_predictor_i|> (resolved in ray_trainer).
+        # No code cache requirement (single teacher target per prompt).
+        if self.loss_type == "llm-jepa-infoNCE":
+            if self.predictor_k <= 0:
+                raise ValueError(
+                    "jepa.loss_type='llm-jepa-infoNCE' needs the shared [PRED] read; "
+                    f"set predictor_k > 0 (got {self.predictor_k})."
+                )
+            if self.n_code > 0:
+                raise ValueError(
+                    f"jepa.loss_type='llm-jepa-infoNCE' is CoT-only; set n_code=0 (got {self.n_code})."
+                )
+            if self.infonce_tau <= 0:
+                raise ValueError(f"jepa.infonce_tau must be > 0; got {self.infonce_tau}")
         if self.loss_type == "jepa-tcr-dual" and not self.code_teacher_cache_path:
             raise ValueError(
                 "jepa.loss_type='jepa-tcr-dual' requires jepa.code_teacher_cache_path "

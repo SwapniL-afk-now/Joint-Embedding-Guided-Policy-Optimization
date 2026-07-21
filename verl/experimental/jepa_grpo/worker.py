@@ -36,6 +36,7 @@ from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
 from verl.experimental.jepa_grpo.core_algos import (
     llm_jepa_contrastive_loss,
+    llm_jepa_infonce_loss,
     llm_jepa_paper_loss,
     llm_jepa_tcr_dual_loss,
 )
@@ -125,7 +126,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         self._predictor_hook_active = False
         if self.jepa_cfg.predictor_k > 0:
             pred_ids = list(self.jepa_cfg.predictor_token_ids)
-            if self.jepa_cfg.loss_type == "llm-jepa-contrastive":
+            if self.jepa_cfg.loss_type in ("llm-jepa-contrastive", "llm-jepa-infoNCE"):
                 pred_ids = pred_ids + list(self.jepa_cfg.bad_predictor_token_ids)
             pred_ids = list(dict.fromkeys(int(i) for i in pred_ids))  # unique, ordered
             self._pred_id_to_row = {tid: r for r, tid in enumerate(pred_ids)}
@@ -897,9 +898,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
         assert self.jepa_cfg.loss_type in (
-            "llm-jepa", "llm-jepa-contrastive", "jepa-tcr-dual", "jepa-tcr-cot"), (
+            "llm-jepa", "llm-jepa-contrastive", "llm-jepa-infoNCE", "jepa-tcr-dual", "jepa-tcr-cot"), (
             f"worker.jepa_update only supports loss_type 'llm-jepa', 'llm-jepa-contrastive', "
-            f"'jepa-tcr-dual' or 'jepa-tcr-cot', got {self.jepa_cfg.loss_type!r}"
+            f"'llm-jepa-infoNCE', 'jepa-tcr-dual' or 'jepa-tcr-cot', got {self.jepa_cfg.loss_type!r}"
         )
         if self.jepa_cfg.predictor_k > 0:
             assert len(self.jepa_cfg.predictor_token_ids) == self.jepa_cfg.predictor_k, (
@@ -1110,6 +1111,56 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
 
                 jepa_metrics = self._embed_chunked_with_backward(
                     joint_ids, joint_mask, joint_lengths, joint_predictor_k,
+                    _loss_fn, micro_bs, alpha, predictor_token_ids=joint_pt,
+                )
+            elif cfg.loss_type == "llm-jepa-infoNCE":
+                # Single discriminative InfoNCE over mixed prompts (see
+                # core_algos.llm_jepa_infonce_loss and
+                # ray_trainer._build_jepa_batch_llm_jepa_infonce). Anchor block =
+                # M positive rollouts (read via <|predictor_i|>) then their M
+                # negatives (read via <|bad_predictor_i|>); grad flows to p+
+                # and p-. Teacher z+ = sg(f_EMA([x, t+])) — encoded here with the
+                # EMA weights under no_grad, plain last-real-token read (k=0),
+                # matching the sg(f_EMA) contract of the loss.
+                anchor_lengths_all = data["anchor_lengths"].long()
+                target_lengths_all = data["target_lengths"].long()
+                N = int((anchor_lengths_all > 0).sum().item())
+                U = int((target_lengths_all > 0).sum().item())
+                M = N // 2
+                assert N == 2 * M, f"infoNCE anchor block must be 2M rows, got {N}"
+                anchor_ids = data["anchor_input_ids"][:N]
+                anchor_mask = data["anchor_attn_mask"][:N]
+                anchor_lengths = anchor_lengths_all[:N]
+                tgt_idx = data["tgt_cot_idx"].long()[:M]
+                tgt_code_idx = data["tgt_code_idx"].long()[:M]
+                has_code = tgt_code_idx >= 0
+
+                with torch.no_grad():
+                    uniq_z = self._embed_chunked_no_grad(
+                        data["target_input_ids"][:U], data["target_attn_mask"][:U],
+                        target_lengths_all[:U], use_ema=True, micro_bs=micro_bs,
+                        predictor_k=0,
+                    )
+                    teacher_z = uniq_z[tgt_idx.to(uniq_z.device)]  # (M, d), detached
+                    teacher_zc = uniq_z[tgt_code_idx.clamp(min=0).to(uniq_z.device)]  # (M, d); rows w/o code masked by has_code
+
+                joint_predictor_k = [cfg.predictor_k] * N
+                good_seq = list(cfg.predictor_token_ids)
+                bad_seq = list(cfg.bad_predictor_token_ids)
+                joint_pt = [good_seq] * M + [bad_seq] * M
+
+                def _loss_fn(joint_emb, _M=M, _z=teacher_z, _zc=teacher_zc, _hc=has_code):
+                    return llm_jepa_infonce_loss(
+                        pred_pos=joint_emb[:_M],
+                        pred_neg=joint_emb[_M:],
+                        teacher=_z.to(device=joint_emb.device, dtype=joint_emb.dtype),
+                        teacher_code=_zc.to(device=joint_emb.device, dtype=joint_emb.dtype),
+                        has_code=_hc,
+                        tau=cfg.infonce_tau,
+                    )
+
+                jepa_metrics = self._embed_chunked_with_backward(
+                    anchor_ids, anchor_mask, anchor_lengths, joint_predictor_k,
                     _loss_fn, micro_bs, alpha, predictor_token_ids=joint_pt,
                 )
             elif cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot"):

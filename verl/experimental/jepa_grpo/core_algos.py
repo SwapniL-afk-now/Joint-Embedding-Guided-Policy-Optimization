@@ -600,6 +600,100 @@ def llm_jepa_contrastive_loss(
     return loss, metrics
 
 
+# ---------------------------------------------------------------------------
+# LLM-JEPA InfoNCE loss (loss_type='llm-jepa-infoNCE')
+# ---------------------------------------------------------------------------
+
+def llm_jepa_infonce_loss(
+    pred_pos: torch.Tensor,   # (M, d) p+ = f(x, y+, [PRED]) — correct-rollout reads, L2-normalized
+    pred_neg: torch.Tensor,   # (M, d) p- = f(x, y-, [PRED]) — wrong-rollout reads, L2-normalized
+    teacher: torch.Tensor,    # (M, d) z+_cot = sg(f_EMA(x, t+_cot)) — EMA teacher CoT reads, L2-norm, DETACHED
+    teacher_code: torch.Tensor | None = None,  # (M, d) z+_code = sg(f_EMA(x, t+_code)), DETACHED
+    has_code: torch.Tensor | None = None,      # (M,) bool — rows with a code teacher view
+    tau: float = 0.1,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Teacher-anchored discriminative InfoNCE over mixed-reward prompts.
+
+    Per pair and per available teacher view v ∈ {cot, code}:
+
+        L_iv = -log( exp(cos(p+,z_v)/τ) / (exp(cos(p+,z_v)/τ) + exp(cos(p-,z_v)/τ)) )
+
+    i.e. "which read-out matches the teacher?" — BOTH the attraction (p+ → z_v)
+    and the repulsion (p- ← z_v) are measured against the same FIXED stop-grad
+    anchor, so the repulsion direction is stable across steps (no moving-target
+    cancellation as with cos(p+, p-)). The final loss is the mean over all
+    (pair, view) terms present; rows without a code view contribute only cot.
+
+    All embeddings are re-centered by the (detached) shared batch mean and
+    re-normalized before the cosines: raw same-model reads share a large
+    anisotropic component (cos≈0.96 between arbitrary reads before any
+    training), and centering removes it so the logits measure content, not the
+    common style direction — the model can no longer satisfy the softmax with a
+    tiny relative margin riding on a saturated base similarity.
+
+    Gradient reaches BOTH p+ and p-; the teacher views are stop-grad/EMA by
+    contract — callers MUST pass detached z tensors, otherwise the model lowers
+    the loss by dragging the teacher along with the correct rollout.
+    """
+    device, dtype = pred_pos.device, pred_pos.dtype
+    M = pred_pos.shape[0]
+    empty_metrics = {
+        "jepa/llm_jepa_loss": 0.0, "jepa/tcr_loss": 0.0, "jepa/infonce_loss": 0.0,
+        "jepa/cos_cot": 0.0, "jepa/cos_code": 0.0, "jepa/cos_neg": 0.0,
+        "jepa/margin": 0.0, "jepa/infonce_acc": 0.0, "jepa/infonce_tau": float(tau),
+        "jepa/n_anchors_cot": 0, "jepa/n_anchors_code": 0, "jepa/pool_size": 0,
+    }
+    if M == 0:
+        return torch.zeros((), device=device, dtype=dtype), empty_metrics
+
+    if has_code is None or teacher_code is None:
+        has_code = torch.zeros(M, dtype=torch.bool, device=device)
+    else:
+        has_code = has_code.to(device=device, dtype=torch.bool)
+
+    # Center by the shared batch mean (detached: centering must not become a
+    # gradient path into the teacher), then re-normalize to the unit sphere.
+    views = [pred_pos, pred_neg, teacher] + ([teacher_code[has_code]] if has_code.any() else [])
+    mu = torch.cat(views, dim=0).mean(dim=0, keepdim=True).detach()
+    pred_pos = F.normalize(pred_pos - mu, dim=-1)
+    pred_neg = F.normalize(pred_neg - mu, dim=-1)
+    teacher = F.normalize(teacher - mu, dim=-1)
+
+    sim_pos = (pred_pos * teacher).sum(dim=-1)    # (M,) cos(p+, z_cot)
+    sim_neg = (pred_neg * teacher).sum(dim=-1)    # (M,) cos(p-, z_cot)
+    sp_terms, sn_terms = [sim_pos], [sim_neg]
+    cos_code = 0.0
+    n_code = int(has_code.sum().item())
+    if n_code > 0:
+        z_code = F.normalize(teacher_code[has_code] - mu, dim=-1)
+        sp_c = (pred_pos[has_code] * z_code).sum(dim=-1)
+        sn_c = (pred_neg[has_code] * z_code).sum(dim=-1)
+        sp_terms.append(sp_c)
+        sn_terms.append(sn_c)
+        cos_code = float(sp_c.detach().mean().cpu())
+
+    sp = torch.cat(sp_terms)   # (M + n_code,)
+    sn = torch.cat(sn_terms)
+    logits = torch.stack([sp, sn], dim=-1) / tau
+    loss = F.cross_entropy(logits, torch.zeros(sp.shape[0], dtype=torch.long, device=device))
+
+    metrics = {
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
+        "jepa/tcr_loss": float(loss.detach().cpu()),  # alias: wandb key parity
+        "jepa/infonce_loss": float(loss.detach().cpu()),
+        "jepa/cos_cot": float(sim_pos.detach().mean().cpu()),
+        "jepa/cos_code": cos_code,
+        "jepa/cos_neg": float(sn.detach().mean().cpu()),
+        "jepa/margin": float((sp - sn).detach().mean().cpu()),
+        "jepa/infonce_acc": float((sp > sn).float().mean().cpu()),
+        "jepa/infonce_tau": float(tau),
+        "jepa/n_anchors_cot": int(M),
+        "jepa/n_anchors_code": n_code,
+        "jepa/pool_size": int(2 * M),
+    }
+    return loss, metrics
+
+
 if __name__ == "__main__":
     # Self-check for llm_jepa_contrastive_loss: gating, [0,1] bounds, per-prompt
     # collapse (anchor count must not change a prompt's unit weight), and arm-A
@@ -687,3 +781,34 @@ if __name__ == "__main__":
     assert pool_g.grad is not None and pool_g.grad.abs().sum() > 0
 
     print("llm_jepa_contrastive_loss self-check passed")
+
+    # Self-check for llm_jepa_infonce_loss (teacher-anchored + centered): p+ near
+    # z / p- far -> low loss, swapped -> high loss; p- ON the teacher -> higher
+    # loss than p- random; the code view adds terms; grad reaches p+ and p- but
+    # NEVER the teacher; empty input gates to 0.
+    z = _unit(4)
+    pp = z.clone()                                     # p+ == z+ (cos=1 survives shared centering)
+    pn = F.normalize(torch.randn(4, d), dim=-1)
+    l_good, mi = llm_jepa_infonce_loss(pp, pn, z, tau=0.1)
+    l_bad, _ = llm_jepa_infonce_loss(pn, pp, z, tau=0.1)  # p+ random, p- == z+
+    assert float(l_good) < float(l_bad)
+    assert abs(mi["jepa/cos_cot"] - 1.0) < 1e-5 and mi["jepa/infonce_acc"] == 1.0
+    # monotone in the negative: same p+/z+, p- sitting on the teacher -> higher loss
+    l_close, _ = llm_jepa_infonce_loss(pp, z.clone(), z, tau=0.1)   # p- == z+
+    assert float(l_close) > float(l_good)
+    # code view: extra (pair, view) terms flow into the same softmax
+    zc = _unit(4)
+    hc = torch.tensor([True, True, False, False])
+    l_dual, md = llm_jepa_infonce_loss(pp, pn, z, teacher_code=zc, has_code=hc, tau=0.1)
+    assert md["jepa/n_anchors_code"] == 2 and md["jepa/n_anchors_cot"] == 4
+    pp_g = pp.clone().requires_grad_(True)
+    pn_g = pn.clone().requires_grad_(True)
+    z_g = z.clone().requires_grad_(True)
+    li, _ = llm_jepa_infonce_loss(pp_g, pn_g, z_g.detach(), tau=0.1)
+    li.backward()
+    assert pp_g.grad is not None and pp_g.grad.abs().sum() > 0
+    assert pn_g.grad is not None and pn_g.grad.abs().sum() > 0
+    assert z_g.grad is None
+    l0, m0 = llm_jepa_infonce_loss(empty, empty, empty)
+    assert float(l0) == 0.0 and m0["jepa/n_anchors_cot"] == 0
+    print("llm_jepa_infonce_loss self-check passed")

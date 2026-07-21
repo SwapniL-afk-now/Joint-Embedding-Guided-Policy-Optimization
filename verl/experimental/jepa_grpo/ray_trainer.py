@@ -124,9 +124,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 self.jepa_cfg.predictor_token_ids = self._resolve_predictor_token_ids(
                     self.jepa_cfg.predictor_k
                 )
-                # llm-jepa-contrastive reads WRONG anchors through a separate
-                # <|bad_predictor_i|> sequence so good/bad reads are distinguishable.
-                if self.jepa_cfg.loss_type == "llm-jepa-contrastive":
+                # llm-jepa-contrastive and llm-jepa-infoNCE read WRONG anchors through a
+                # separate <|bad_predictor_i|> sequence so good/bad reads are distinguishable.
+                if self.jepa_cfg.loss_type in ("llm-jepa-contrastive", "llm-jepa-infoNCE"):
                     self.jepa_cfg.bad_predictor_token_ids = self._resolve_predictor_token_ids(
                         self.jepa_cfg.predictor_k, prefix="bad_predictor"
                     )
@@ -1561,6 +1561,139 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         jepa_batch.meta_info["n_wrong_targets"] = Uw
         return jepa_batch
 
+    def _build_jepa_batch_llm_jepa_infonce(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> DataProto | None:
+        """Build the llm-jepa-infoNCE batch (loss_type='llm-jepa-infoNCE').
+
+        Data-selection rule (not loss weighting): only MIXED prompts — those with at
+        least one correct AND one wrong CoT rollout — contribute. Each mixed prompt
+        ships min(n_correct, n_wrong) disjoint (y+, y-) pairs (uniform random
+        matching), all sharing one uniformly sampled verified teacher CoT solution
+        t+_cot and, when the code teacher cache has one, one uniformly sampled
+        teacher Code solution t+_code (second anchored view in the loss). All-good
+        and all-wrong prompts ship nothing (they still feed GRPO).
+
+        Ships ONE anchor block of 2M rows — the M positive rollouts first (read via
+        <|predictor_i|>), then their M negatives (read via <|bad_predictor_i|>) — and
+        ONE target block
+        of deduplicated teacher rows (CoT and Code mixed) with per-pair gather
+        indices (tgt_cot_idx, tgt_code_idx; -1 = no code view). The worker encodes
+        targets with the EMA encoder under no_grad (z+ = sg(f_EMA)).
+        Returns None if fewer than min_valid_pairs mixed prompts.
+        """
+        assert self.teacher_targets is not None, "CoT teacher target cache not loaded"
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+        eos_id = self.tokenizer.eos_token_id
+
+        rows_by_uid: dict = defaultdict(list)
+        idx_by_uid: dict = {}
+        prob_by_uid: dict = {}
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v != "cot":
+                continue
+            rows_by_uid[u].append(i)
+            if u not in idx_by_uid:
+                info = extra_infos[i]
+                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
+                prob_by_uid[u] = info["problem"] if isinstance(info, dict) else str(info)
+
+        def _strip_eos(t: torch.Tensor) -> torch.Tensor:
+            return t[:-1] if (eos_id is not None and t.shape[0] > 1 and int(t[-1]) == eos_id) else t
+
+        def _rollout_ids(i: int) -> torch.Tensor:
+            return _strip_eos(all_input_ids[i][all_attn_mask[i].bool()])
+
+        def _pick(idxs: list) -> int:
+            return idxs[int(torch.randint(len(idxs), (1,)).item())]
+
+        # Unique teacher-target rows, (view, text) dedup — as in the sibling builders.
+        uniq_pos: dict = {}
+        uniq_rows: list[torch.Tensor] = []
+        pos_rows: list[torch.Tensor] = []   # y+ per mixed prompt
+        neg_rows: list[torch.Tensor] = []   # y- per mixed prompt
+        tgt_idx: list[int] = []             # teacher CoT row per pair
+        tgt_code: list[int] = []            # teacher Code row per pair (-1 = none)
+        n_mixed_prompts = 0
+
+        def _uniq(view: str, problem: str, text: str) -> int:
+            key = (view, text)
+            pos = uniq_pos.get(key)
+            if pos is None:
+                pos = len(uniq_rows)
+                uniq_pos[key] = pos
+                uniq_rows.append(self._tokenize_target(problem, text, view))
+            return pos
+
+        for u in dict.fromkeys(uids):
+            rows = [i for i in rows_by_uid.get(u, []) if int(all_attn_mask[i].sum()) > 0]
+            correct = [i for i in rows if rew[i] > 0]
+            wrong = [i for i in rows if rew[i] <= 0]
+            if not correct or not wrong:
+                continue  # mixed prompts only
+            ds_idx = idx_by_uid.get(u)
+            Z_cot = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
+            if not Z_cot:
+                continue
+            problem = prob_by_uid.get(u, "")
+            pos = _uniq("cot", problem, Z_cot[_pick(range(len(Z_cot)))])
+            code_targets = getattr(self, "code_teacher_targets", None)
+            Z_code = code_targets.get(ds_idx) if code_targets else None
+            cpos = _uniq("code", problem, Z_code[_pick(range(len(Z_code)))]) if Z_code else -1
+            k = min(len(correct), len(wrong))
+            cperm = [correct[j] for j in torch.randperm(len(correct)).tolist()[:k]]
+            wperm = [wrong[j] for j in torch.randperm(len(wrong)).tolist()[:k]]
+            for ci, wi in zip(cperm, wperm):
+                pos_rows.append(_rollout_ids(ci))
+                neg_rows.append(_rollout_ids(wi))
+                tgt_idx.append(pos)
+                tgt_code.append(cpos)
+            n_mixed_prompts += 1
+
+        M = len(pos_rows)
+        if M < self.jepa_cfg.min_valid_pairs:
+            return None
+        U = len(uniq_rows)
+        N = 2 * M
+        R = max(N, U)
+
+        def _pack(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+            lengths = [int(t.shape[0]) for t in rows]
+            width = max(lengths) if rows else 1
+            ids = torch.full((R, width), pad_id, dtype=all_input_ids.dtype)
+            mask = torch.zeros((R, width), dtype=torch.long)
+            for r, t in enumerate(rows):
+                ids[r, : t.shape[0]] = t
+                mask[r, : t.shape[0]] = 1
+            return ids, mask, lengths
+
+        anchor_ids, anchor_mask, anchor_len = _pack(pos_rows + neg_rows)
+        target_ids, target_mask, target_len = _pack(uniq_rows)
+
+        jepa_batch = DataProto.from_single_dict({
+            "anchor_input_ids": anchor_ids,
+            "anchor_attn_mask": anchor_mask,
+            "anchor_lengths": torch.tensor(anchor_len + [0] * (R - N), dtype=torch.long),
+            "target_input_ids": target_ids,
+            "target_attn_mask": target_mask,
+            "target_lengths": torch.tensor(target_len + [0] * (R - U), dtype=torch.long),
+            "tgt_cot_idx": torch.tensor(tgt_idx + [-1] * (R - M), dtype=torch.long),
+            "tgt_code_idx": torch.tensor(tgt_code + [-1] * (R - M), dtype=torch.long),
+        })
+        jepa_batch.meta_info["n_anchors"] = M
+        jepa_batch.meta_info["n_unique_targets"] = U
+        jepa_batch.meta_info["n_mixed_prompts"] = n_mixed_prompts
+        jepa_batch.meta_info["pairs_per_prompt"] = M / max(n_mixed_prompts, 1)
+        return jepa_batch
+
     # ------------------------------------------- TCR reward shaping (idea #2) -
     @staticmethod
     def _stratified_shaping(
@@ -1799,7 +1932,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # only the cot/code ALIGNMENT cosines and is blind to the contrastive + SIGReg
         # arms, so it wrongly euthanizes JEPA the moment alignment plateaus (~step 87 in
         # the smoke run) even though the contrastive/anti-collapse signal is still active.
-        if cfg.loss_type == "llm-jepa-contrastive":
+        # llm-jepa-infoNCE likewise: cos_cot plateauing says nothing about the
+        # separation half of the softmax competition.
+        if cfg.loss_type in ("llm-jepa-contrastive", "llm-jepa-infoNCE"):
             metrics["jepa/signal_off"] = 0.0
             return
         metrics["jepa/signal_off"] = float(self._jepa_signal_off)
@@ -2211,6 +2346,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                                 reward_tensor=reward_tensor,
                                 view_tags=view_tags,
                             )
+                        elif self.jepa_cfg.loss_type == "llm-jepa-infoNCE":
+                            jepa_batch = self._build_jepa_batch_llm_jepa_infonce(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
                         else:
                             jepa_batch = self._build_jepa_batch_tcr_dual(
                                 batch=batch,
@@ -2315,6 +2456,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                                         metrics[k] = float(v.item())
                             if "n_correct_cot_mean" in jepa_batch.meta_info:
                                 metrics["jepa/n_correct_cot_mean"] = jepa_batch.meta_info["n_correct_cot_mean"]
+                            if "n_mixed_prompts" in jepa_batch.meta_info:
+                                metrics["jepa/n_mixed_prompts"] = float(jepa_batch.meta_info["n_mixed_prompts"])
+                                metrics["jepa/pairs_per_prompt"] = float(jepa_batch.meta_info["pairs_per_prompt"])
                     else:
                         metrics["jepa/skipped"] = 1.0
                         metrics["jepa/n_valid_pairs"] = 0.0
