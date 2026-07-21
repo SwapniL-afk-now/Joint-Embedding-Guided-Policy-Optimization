@@ -215,7 +215,11 @@ JEPA_ENABLE=${JEPA_ENABLE:-True}
 # α·‖∂L_JEPA‖ is a real fraction of ‖g_policy‖. α=0.05 → JEPA grad ≈0.4·policy: JEPA
 # meaningfully shapes the representation while RL still leads. (parity ≈0.13; α=1e-3,
 # the old default, made JEPA ~0.8% of the step — effectively off.)
-ALPHA=${ALPHA:-0.05}
+# Raised 0.05 -> 0.2: live metrics showed jepa/grad_norm ~0.003 vs actor/grad_norm
+# ~0.02 (JEPA only ~15% of the step), so the reads were driven by the RL update, not
+# JEPA — all read cosines rose together instead of the contrastive arm separating
+# good/bad. 0.2 gives JEPA a real grip (~0.6x the policy grad) while RL still leads.
+ALPHA=${ALPHA:-0.2}
 EMA_DECAY=${EMA_DECAY:-0.99}
 # GradCache micro-batch (rows per chunked forward). With targets capped at the
 # native 4096 context there is no 32k-padding blowup, so batching 8 rows per
@@ -277,6 +281,12 @@ JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
 # no resize is needed). Paper sweeps k∈{0..4}; GSM8K best k=4 (with λ=0.5) — default.
 LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-4}
 JEPA_MAX_GRAD_NORM=${JEPA_MAX_GRAD_NORM:-0.5}
+# Predictor-token embedding lr. At the old 1e-5 the deltas were FROZEN: pred_embed_norm
+# was flat at 0.854 across steps (a ~0.2 grad cancelled by wd=0.01), so good/bad tokens
+# had no DOF to make good/bad reads differ. 1e-3 (~100x) unfreezes them; the 0.4 per-row
+# cap + wd stay as guards. Read via os.environ in worker.jepa_init (forwarded to Ray
+# workers by constants_ppo.get_ppo_ray_runtime_env).
+export PREDICTOR_EMBED_LR=${PREDICTOR_EMBED_LR:-1e-3}
 # The paper has no α warmup; keep the loss weight constant from step 1.
 ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-0}
 

@@ -97,8 +97,12 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
-    # Ray workers don't inherit the driver's os.environ; pass these explicitly
-    for key in ("WANDB_API_KEY", "HF_TOKEN", "LD_PRELOAD"):
+    # Ray workers don't inherit the driver's os.environ; pass these explicitly.
+    # The PREDICTOR_EMBED_* knobs are read via os.environ in jepa worker init, so
+    # they must be forwarded or the worker silently falls back to its defaults.
+    for key in ("WANDB_API_KEY", "HF_TOKEN", "LD_PRELOAD",
+                "PREDICTOR_EMBED_LR", "PREDICTOR_EMBED_WD",
+                "PREDICTOR_EMBED_GRAD_CLIP", "PREDICTOR_EMBED_MAX_NORM"):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

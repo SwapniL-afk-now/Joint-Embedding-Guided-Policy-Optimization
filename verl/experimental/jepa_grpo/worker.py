@@ -1254,6 +1254,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             pred_gn_clip = 0.0   # grad norm actually applied (post-clip)
             pred_pn = 0.0        # delta param norm after step + max-norm cap
             pred_max_row = 0.0   # largest per-row delta norm after cap
+            pred_step = 0.0      # ||Δθ|| actually APPLIED to the deltas this step
             if self.predictor_optim is not None and self.predictor_delta.grad is not None:
                 dp_size = engine.get_data_parallel_size()
                 if dp_size > 1 and torch.distributed.is_initialized():
@@ -1266,6 +1267,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 pred_gn_clip = float(torch.nn.utils.clip_grad_norm_(
                     [self.predictor_delta], max_norm=self._pred_grad_clip).cpu())
                 pred_gn_clip = min(pred_gn_clip, self._pred_grad_clip)
+                _prev_delta = self.predictor_delta.data.clone()  # for ||Δθ|| applied
                 self.predictor_optim.step()   # AdamW: also applies weight decay
                 # Safety 2: hard per-ROW L2 cap so no predictor embedding drifts
                 # out-of-distribution (renormalize rows whose norm exceeds the cap).
@@ -1275,6 +1277,8 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                     self.predictor_delta.data.mul_(scale)
                     pred_pn = float(self.predictor_delta.data.norm().cpu())
                     pred_max_row = float(self.predictor_delta.data.norm(dim=-1).max().cpu())
+                    # Applied movement this step (post-cap): frozen deltas -> ~0.
+                    pred_step = float((self.predictor_delta.data - _prev_delta).norm().cpu())
             self._sync_ema()
             aggressive_empty_cache(force_sync=True)
             _total_loss_value = jepa_metrics.get("jepa/llm_jepa_loss", 0.0)
@@ -1287,6 +1291,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 "jepa/pred_embed_grad_norm_clipped": torch.tensor(float(pred_gn_clip)),
                 "jepa/pred_embed_norm": torch.tensor(float(pred_pn)),
                 "jepa/pred_embed_max_row_norm": torch.tensor(float(pred_max_row)),
+                "jepa/pred_embed_step_norm": torch.tensor(float(pred_step)),
             }
             out.update({k: torch.tensor(float(v)) for k, v in jepa_metrics.items()})
             return TensorDict(out, batch_size=[])
