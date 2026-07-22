@@ -281,12 +281,9 @@ JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
 # no resize is needed). Paper sweeps k∈{0..4}; GSM8K best k=4 (with λ=0.5) — default.
 LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-4}
 JEPA_MAX_GRAD_NORM=${JEPA_MAX_GRAD_NORM:-0.5}
-# Predictor-token embedding lr. At the old 1e-5 the deltas were FROZEN: pred_embed_norm
-# was flat at 0.854 across steps (a ~0.2 grad cancelled by wd=0.01), so good/bad tokens
-# had no DOF to make good/bad reads differ. 1e-3 (~100x) unfreezes them; the 0.4 per-row
-# cap + wd stay as guards. Read via os.environ in worker.jepa_init (forwarded to Ray
-# workers by constants_ppo.get_ppo_ray_runtime_env).
-export PREDICTOR_EMBED_LR=${PREDICTOR_EMBED_LR:-1e-3}
+# Predictor-token embeddings are now trained as a normal param group on the actor's
+# own optimizer (worker.jepa_init) — same lr/schedule as every other trainable
+# parameter, no separate PREDICTOR_EMBED_LR/WD/clip/cap.
 # The paper has no α warmup; keep the loss weight constant from step 1.
 ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-0}
 

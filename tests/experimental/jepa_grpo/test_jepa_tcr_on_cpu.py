@@ -458,6 +458,7 @@ def test_infonce_builder_mixed_prompts_only_one_pair_each():
     # one unique teacher row shared by both pairs
     assert out.meta_info["n_unique_targets"] == 1
     assert out.batch["tgt_cot_idx"][:2].tolist() == [0, 0]
+    assert out.batch["pair_group_id"][:2].tolist() == [0, 0]
 
 
 def test_infonce_builder_returns_none_without_enough_mixed_prompts():
@@ -474,3 +475,145 @@ def test_infonce_loss_prefers_separated_reads():
     l_col, _ = llm_jepa_infonce_loss(z, z, z, tau=0.1)                # p- == p+
     assert float(l_sep) < float(l_col)                                # cos(p+,p-) up -> loss up
     assert m["jepa/infonce_acc"] == 1.0 and m["jepa/n_anchors_cot"] == 4
+
+
+# --------------------------------------------------------------------- explicit geometry
+
+
+def test_geometry_loss_prefers_requested_layout():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_geometry_loss
+
+    teacher = _unit(4, 1)
+    correct = teacher.clone()
+    wrong_far = -teacher
+    wrong_close = teacher.clone()
+    groups = torch.arange(4)
+    good, metrics = llm_jepa_geometry_loss(
+        correct, wrong_far, teacher, groups, sigreg_lambda=0.0
+    )
+    bad, _ = llm_jepa_geometry_loss(
+        correct, wrong_close, teacher, groups, sigreg_lambda=0.0
+    )
+    assert float(good) < float(bad)
+    assert metrics["jepa/cos_correct_teacher"] > 0.99
+    assert metrics["jepa/margin_teacher"] > 1.9
+    assert metrics["jepa/margin_correct"] > 1.9
+
+
+def test_geometry_attraction_moves_correct_and_teacher():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_geometry_loss
+
+    correct = _unit(3, 1).clone().requires_grad_(True)
+    teacher = _unit(3, 2).clone().requires_grad_(True)
+    wrong = _unit(3, 3).clone().requires_grad_(True)
+    loss, _ = llm_jepa_geometry_loss(
+        correct, wrong, teacher, torch.arange(3),
+        align_weight=1.0, wrong_teacher_weight=0.0,
+        wrong_correct_weight=0.0, sigreg_lambda=0.0,
+    )
+    loss.backward()
+    assert correct.grad is not None and correct.grad.abs().sum() > 0
+    assert teacher.grad is not None and teacher.grad.abs().sum() > 0
+    assert wrong.grad is None or wrong.grad.abs().sum() == 0
+
+
+def test_geometry_repulsion_moves_only_wrong():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_geometry_loss
+
+    correct = _unit(3, 1).clone().requires_grad_(True)
+    teacher = _unit(3, 2).clone().requires_grad_(True)
+    wrong = _unit(3, 3).clone().requires_grad_(True)
+    loss, _ = llm_jepa_geometry_loss(
+        correct, wrong, teacher, torch.arange(3),
+        align_weight=0.0, wrong_teacher_weight=1.0,
+        wrong_correct_weight=1.0, sigreg_lambda=0.0,
+    )
+    loss.backward()
+    assert wrong.grad is not None and wrong.grad.abs().sum() > 0
+    assert correct.grad is None or correct.grad.abs().sum() == 0
+    assert teacher.grad is None or teacher.grad.abs().sum() == 0
+
+
+def test_geometry_prompt_averaging_ignores_duplicate_pair_count():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_geometry_loss
+
+    correct = _unit(2, 1)
+    wrong = _unit(2, 2)
+    teacher = _unit(2, 3)
+    groups = torch.tensor([0, 1])
+    base, _ = llm_jepa_geometry_loss(
+        correct, wrong, teacher, groups, sigreg_lambda=0.0
+    )
+    # Duplicate prompt zero's complete pair: its per-prompt mean is unchanged.
+    dup, _ = llm_jepa_geometry_loss(
+        torch.cat([correct, correct[:1]]),
+        torch.cat([wrong, wrong[:1]]),
+        torch.cat([teacher, teacher[:1]]),
+        torch.tensor([0, 1, 0]),
+        sigreg_lambda=0.0,
+    )
+    assert torch.allclose(base, dup, atol=1e-6)
+
+
+def test_effective_rank_detects_collapsed_pool():
+    from verl.experimental.jepa_grpo.core_algos import representation_effective_rank
+
+    spread = _unit(32, 1)
+    collapsed = F.normalize(spread[:1].repeat(32, 1) + 1e-4 * _unit(32, 2), dim=-1)
+    _, spread_norm = representation_effective_rank(spread)
+    _, collapsed_norm = representation_effective_rank(collapsed)
+    assert spread_norm > collapsed_norm
+    assert collapsed_norm < 0.15
+
+
+def test_geometry_config_requires_k0_and_valid_collapse_guard():
+    cfg = JEPARayConfig.from_config({
+        "enable": True, "loss_type": "llm-jepa-geometry",
+        "teacher_cache_path": "/x", "n_cot": 8, "n_code": 0,
+        "predictor_k": 0,
+    })
+    cfg.validate(rollout_n=8)
+    cfg.predictor_k = 1
+    with pytest.raises(ValueError, match="predictor_k=0"):
+        cfg.validate(rollout_n=8)
+
+
+def test_collapse_patience_latches_geometry_auxiliary_only():
+    fake = types.SimpleNamespace(
+        jepa_cfg=types.SimpleNamespace(
+            enable=True, loss_type="llm-jepa-geometry",
+            collapse_guard_enable=True, collapse_warmup_steps=0,
+            collapse_effective_rank_min=0.003,
+            collapse_rank_fraction_of_best=0.5, collapse_patience=3,
+        ),
+        global_steps=10,
+        _collapse_stall=0,
+        _collapse_latched=False,
+        _collapse_best_rank=0.2,
+        _jepa_signal_off=False,
+    )
+    for expected in (1, 2, 3):
+        metrics = {"jepa/effective_rank_norm": 0.05}
+        JEPARayPPOTrainer._maybe_guard_representation_collapse(fake, metrics)
+        assert fake._collapse_stall == expected
+    assert fake._collapse_latched and fake._jepa_signal_off
+
+
+def test_collapse_patience_resets_on_healthy_representation():
+    fake = types.SimpleNamespace(
+        jepa_cfg=types.SimpleNamespace(
+            enable=True, loss_type="llm-jepa-geometry",
+            collapse_guard_enable=True, collapse_warmup_steps=0,
+            collapse_effective_rank_min=0.003,
+            collapse_rank_fraction_of_best=0.5, collapse_patience=3,
+        ),
+        global_steps=10,
+        _collapse_stall=2,
+        _collapse_latched=False,
+        _collapse_best_rank=0.2,
+        _jepa_signal_off=False,
+    )
+    JEPARayPPOTrainer._maybe_guard_representation_collapse(
+        fake, {"jepa/effective_rank_norm": 0.5}
+    )
+    assert fake._collapse_stall == 0 and not fake._jepa_signal_off

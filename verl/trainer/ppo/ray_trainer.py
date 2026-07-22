@@ -804,9 +804,15 @@ class RayPPOTrainer:
         if not seeds:
             return self._validate_once()
         per_seed_metrics = {}
+        seed_occurrences: dict[int, int] = {}
         for seed in seeds:
+            # A repeated seed (validating the same seed multiple times) would otherwise
+            # collide on this dict key; label repeats so each run's metrics survive.
+            occurrence = seed_occurrences.get(seed, 0)
+            seed_occurrences[seed] = occurrence + 1
+            label = seed if occurrence == 0 else f"{seed}_rep{occurrence}"
             print(f"validation seed={seed} start", flush=True)
-            per_seed_metrics[seed] = self._validate_once(seed=seed)
+            per_seed_metrics[label] = self._validate_once(seed=seed)
             print(f"validation seed={seed} end", flush=True)
         metrics = self._aggregate_seeded_validation_metrics(per_seed_metrics)
         metrics["validation/seed_count"] = len(seeds)

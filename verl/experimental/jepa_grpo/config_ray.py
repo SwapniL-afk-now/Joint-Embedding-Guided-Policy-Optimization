@@ -116,11 +116,31 @@ class JEPARayConfig:
     #       gradient (data-selection rule, not loss weighting). Requires
     #       teacher_cache_path, predictor_k>0, n_code=0; no code cache needed.
     #       See core_algos.llm_jepa_infonce_loss.
+    #   "llm-jepa-geometry" — explicit uncentered geometry over mixed prompts:
+    #       correct and teacher move jointly closer; wrong moves away from detached
+    #       teacher/correct repulsion references. Prompt averaging plus SIGReg prevent
+    #       count bias and collapse. Requires predictor_k=0 (no label-token shortcut).
+    #       See core_algos.llm_jepa_geometry_loss.
     # (The separate JEPAGRPOTrainer entrypoint in trainer.py uses its own EMA
     # "lejepa" loss and does not read this field.)
     loss_type: str = "llm-jepa"
     # llm-jepa-infoNCE only: softmax temperature τ.
     infonce_tau: float = 0.1
+    # llm-jepa-geometry parameters.
+    geometry_tau: float = 0.1
+    geometry_margin: float = 0.1
+    geometry_align_weight: float = 1.0
+    geometry_wrong_teacher_weight: float = 1.0
+    geometry_wrong_correct_weight: float = 1.0
+    # SIGReg continuously resists collapse. This circuit breaker additionally
+    # latches JEPA off (GRPO continues) when normalized effective rank stays below
+    # both a calibrated floor and a fraction of its best observed value for
+    # collapse_patience consecutive representation updates.
+    collapse_guard_enable: bool = True
+    collapse_effective_rank_min: float = 0.003
+    collapse_rank_fraction_of_best: float = 0.5
+    collapse_patience: int = 5
+    collapse_warmup_steps: int = 20
     # -- jepa-tcr-dual teacher caches --
     # Path to the offline teacher-target cache produced by
     # examples/jepa_grpo_trainer/precompute_teacher_targets.py: a torch.save dict
@@ -228,11 +248,12 @@ class JEPARayConfig:
         if not self.enable:
             return
         if self.loss_type not in (
-            "llm-jepa", "llm-jepa-contrastive", "llm-jepa-infoNCE", "jepa-tcr-dual", "jepa-tcr-cot"
+            "llm-jepa", "llm-jepa-contrastive", "llm-jepa-infoNCE", "llm-jepa-geometry",
+            "jepa-tcr-dual", "jepa-tcr-cot"
         ):
             raise ValueError(
                 f"jepa.loss_type must be 'llm-jepa', 'llm-jepa-contrastive', 'llm-jepa-infoNCE', "
-                f"'jepa-tcr-dual' or 'jepa-tcr-cot'; got {self.loss_type!r}"
+                f"'llm-jepa-geometry', 'jepa-tcr-dual' or 'jepa-tcr-cot'; got {self.loss_type!r}"
             )
         if not self.teacher_cache_path:
             raise ValueError(
@@ -264,14 +285,17 @@ class JEPARayConfig:
                 "jepa.loss_type='llm-jepa-contrastive' needs the <good_pred>/<bad_pred> reads; "
                 f"set predictor_k > 0 (got {self.predictor_k})."
             )
-        # llm-jepa-infoNCE: CoT rollouts + CoT teacher cache only; positives read via
-        # <|predictor_i|>, negatives via <|bad_predictor_i|> (resolved in ray_trainer).
-        # No code cache requirement (single teacher target per prompt).
+        # llm-jepa-infoNCE: CoT rollouts + CoT teacher cache only. With predictor_k > 0
+        # positives read via <|predictor_i|>, negatives via <|bad_predictor_i|> (resolved
+        # in ray_trainer). predictor_k=0 is the paper's IDENTITY predictor Pred(x)=x: no
+        # appended token, every read is the last CONTENT token of the sequence; p+/p- are
+        # then discriminated purely by which rollout (correct vs wrong) is encoded, not by
+        # a predictor-token type. No code cache requirement (single teacher target per prompt).
         if self.loss_type == "llm-jepa-infoNCE":
-            if self.predictor_k <= 0:
+            if self.predictor_k < 0:
                 raise ValueError(
-                    "jepa.loss_type='llm-jepa-infoNCE' needs the shared [PRED] read; "
-                    f"set predictor_k > 0 (got {self.predictor_k})."
+                    "jepa.loss_type='llm-jepa-infoNCE': predictor_k must be >= 0 "
+                    f"(0 = identity predictor / last-content-token read); got {self.predictor_k}."
                 )
             if self.n_code > 0:
                 raise ValueError(
@@ -279,6 +303,31 @@ class JEPARayConfig:
                 )
             if self.infonce_tau <= 0:
                 raise ValueError(f"jepa.infonce_tau must be > 0; got {self.infonce_tau}")
+        if self.loss_type == "llm-jepa-geometry":
+            if self.predictor_k != 0:
+                raise ValueError(
+                    "jepa.loss_type='llm-jepa-geometry' requires predictor_k=0 "
+                    "to prevent predictor-token label shortcuts."
+                )
+            if self.n_code > 0:
+                raise ValueError(
+                    f"jepa.loss_type='llm-jepa-geometry' uses CoT student rollouts only; "
+                    f"set n_code=0 (got {self.n_code})."
+                )
+            if self.geometry_tau <= 0:
+                raise ValueError(f"jepa.geometry_tau must be > 0; got {self.geometry_tau}")
+            if self.geometry_margin < 0:
+                raise ValueError(f"jepa.geometry_margin must be >= 0; got {self.geometry_margin}")
+            weights = (self.geometry_align_weight, self.geometry_wrong_teacher_weight,
+                       self.geometry_wrong_correct_weight)
+            if any(w < 0 for w in weights) or sum(weights) == 0:
+                raise ValueError("jepa geometry weights must be nonnegative and not all zero")
+        if not 0.0 <= self.collapse_effective_rank_min <= 1.0:
+            raise ValueError("jepa.collapse_effective_rank_min must be in [0,1]")
+        if not 0.0 < self.collapse_rank_fraction_of_best <= 1.0:
+            raise ValueError("jepa.collapse_rank_fraction_of_best must be in (0,1]")
+        if self.collapse_patience <= 0 or self.collapse_warmup_steps < 0:
+            raise ValueError("jepa collapse patience must be >0 and warmup must be >=0")
         if self.loss_type == "jepa-tcr-dual" and not self.code_teacher_cache_path:
             raise ValueError(
                 "jepa.loss_type='jepa-tcr-dual' requires jepa.code_teacher_cache_path "

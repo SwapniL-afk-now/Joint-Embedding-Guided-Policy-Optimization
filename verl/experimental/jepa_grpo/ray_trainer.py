@@ -90,6 +90,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         self._off_arm: dict[str, bool] = {k: False for k in ("cot", "code", "self", "shaping", "global")}
         self._align_best: dict[str, float] = {k: float("-inf") for k in self._off_arm}
         self._align_stall: dict[str, int] = {k: 0 for k in self._off_arm}
+        self._collapse_stall = 0
+        self._collapse_latched = False
+        self._collapse_best_rank = 0.0
 
         # A SECOND cache of Code-view verified-correct texts (coder-model solutions),
         # same {index: [y^+ str, ...]} format. Encoded online at train time too.
@@ -603,6 +606,24 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     ax.plot([s_proj[k, 0], tgt[0]], [s_proj[k, 1], tgt[1]],
                             color="0.88", lw=.3, zorder=0)
             c_sel = correct[sel]
+            # Density contour per class UNDER the scatter: makes cluster tightening
+            # ("correct sharpens") vs dispersal ("wrong suppressed") visible in the
+            # snapshot itself, not just inferable from separate mean-cosine numbers.
+            def _density_contour(xy: np.ndarray, color: str):
+                if len(xy) < 8:
+                    return
+                counts, xe, ye = np.histogram2d(xy[:, 0], xy[:, 1], bins=18)
+                # cheap 3x3 box-blur (no scipy dependency) so contours aren't jagged.
+                padded = np.pad(counts, 1, mode="edge")
+                smooth = sum(padded[i:i + counts.shape[0], j:j + counts.shape[1]]
+                             for i in range(3) for j in range(3)) / 9.0
+                if smooth.max() <= 0:
+                    return
+                xc = 0.5 * (xe[:-1] + xe[1:]); yc = 0.5 * (ye[:-1] + ye[1:])
+                ax.contour(xc, yc, smooth.T, levels=4, colors=color, alpha=.35, linewidths=.8)
+            _density_contour(s_proj[c_sel], "tab:blue")
+            if include_wrong and (~c_sel).any():
+                _density_contour(s_proj[~c_sel], "tab:red")
             ax.scatter(s_proj[c_sel, 0], s_proj[c_sel, 1], c="tab:blue", marker="o",
                        s=14, alpha=.75, label="student CoT (correct)")
             if include_wrong and (~c_sel).any():
@@ -630,7 +651,10 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         plt.close(fig)
 
         # ---- diagnostics: spectra + correct/incorrect cosine split ----
-        dfig, (sv_ax, cos_ax) = plt.subplots(1, 2, figsize=(11, 4))
+        n_cos_panels = 2 if len(cos_code) else 1
+        dfig, axes = plt.subplots(1, 1 + n_cos_panels, figsize=(5.5 * (1 + n_cos_panels), 4))
+        sv_ax = axes[0]
+        cos_axes = axes[1:] if n_cos_panels > 1 else [axes[1]]
         sv_ax.plot(np.arange(1, min(100, len(sv_cot)) + 1), sv_cot[:100], label="p - Enc(teacher CoT)")
         if len(sv_code) > 1:
             sv_ax.plot(np.arange(1, min(100, len(sv_code)) + 1), sv_code[:100],
@@ -639,14 +663,30 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         sv_ax.set_title("Paired-difference singular values (paper Fig. 3 left)")
         sv_ax.set_xlabel("Singular-value index"); sv_ax.set_ylabel("Singular value")
         sv_ax.legend(fontsize=8)
-        for flag, name, color in ((True, "correct", "tab:blue"), (False, "incorrect", "tab:red")):
-            vals = 1.0 - cos_cot[correct == flag]
-            if len(vals):
-                cos_ax.hist(vals, bins=min(30, max(5, len(vals) // 4)), alpha=.6,
-                            color=color, label=f"{name} (n={len(vals)})")
-        cos_ax.set_title("Student-to-teacher-CoT cosine distance")
-        cos_ax.set_xlabel("1 - cosine similarity"); cos_ax.set_ylabel("Count")
-        cos_ax.legend(fontsize=8)
+
+        def _cos_hist_panel(ax, cos_vals: np.ndarray, title: str):
+            # Raw histogram (paper-legible counts) + a lightweight smoothed density
+            # line on top, so "correct sharpens / wrong gets suppressed" reads
+            # directly off the shape: correct should narrow and shift toward 1,
+            # wrong should stay flat/shift toward 0 as training progresses.
+            for flag, name, color in ((True, "correct", "tab:blue"), (False, "incorrect", "tab:red")):
+                vals = cos_vals[correct == flag]
+                if not len(vals):
+                    continue
+                counts, edges = np.histogram(vals, bins=min(24, max(5, len(vals) // 4)),
+                                              range=(-1.0, 1.0))
+                ax.hist(vals, bins=edges, alpha=.45, color=color, label=f"{name} (n={len(vals)})")
+                centers = 0.5 * (edges[:-1] + edges[1:])
+                if counts.sum() > 0:
+                    smoothed = np.convolve(counts, np.ones(3) / 3.0, mode="same")
+                    ax.plot(centers, smoothed, color=color, lw=1.6)
+            ax.set_title(title, fontsize=9)
+            ax.set_xlabel("cosine similarity"); ax.set_ylabel("Count")
+            ax.legend(fontsize=7)
+
+        _cos_hist_panel(cos_axes[0], cos_cot, "Student CoT vs teacher CoT")
+        if len(cos_code):
+            _cos_hist_panel(cos_axes[1], cos_code, "Student CoT vs teacher Code")
         dfig.suptitle(f"Representation diagnostics — step {self.global_steps}")
         dfig.tight_layout()
         dpng = stem + "_diagnostics.png"
@@ -655,6 +695,45 @@ class JEPARayPPOTrainer(RayPPOTrainer):
 
         def _m(v):
             return float(v.mean()) if len(v) else float("nan")
+
+        def _intra_cos(vecs: np.ndarray) -> float:
+            # Mean pairwise cosine WITHIN a class (not vs. teacher) — rising for
+            # "correct" means those reads are literally clustering tighter
+            # ("sharpening"); flat/falling for "wrong" means they stay dispersed
+            # ("suppression": no confident shared direction).
+            if len(vecs) < 2:
+                return float("nan")
+            unit = vecs / np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-12)
+            sim = unit @ unit.T
+            off_diag = sim[~np.eye(len(vecs), dtype=bool)]
+            return float(off_diag.mean())
+
+        sep_margin_cot = _m(cos_cot[correct]) - _m(cos_cot[~correct])
+        sep_margin_code = (
+            (_m(cos_code[correct]) - _m(cos_code[~correct])) if len(cos_code) else float("nan")
+        )
+        intra_cos_correct = _intra_cos(p[correct])
+        intra_cos_wrong = _intra_cos(p[~correct])
+
+        # Quantitative separability: does a simple classifier (or an unsupervised
+        # cluster-quality score) increasingly tell correct/wrong reads apart from
+        # their raw embeddings alone? Both -> 1.0 as training sharpens/suppresses.
+        silhouette_cw = float("nan")
+        auroc_cw = float("nan")
+        if correct.any() and (~correct).any() and len(p) >= 4:
+            try:
+                from sklearn.metrics import silhouette_score
+                silhouette_cw = float(silhouette_score(p, correct.astype(int)))
+            except Exception as exc:
+                logger.warning("rep silhouette_score failed: %s", exc)
+            try:
+                from sklearn.linear_model import LogisticRegression
+                from sklearn.metrics import roc_auc_score
+                clf = LogisticRegression(max_iter=200).fit(p, correct.astype(int))
+                scores = clf.decision_function(p)
+                auroc_cw = float(roc_auc_score(correct.astype(int), scores))
+            except Exception as exc:
+                logger.warning("rep auroc_cw failed: %s", exc)
 
         summary = {
             "step": int(self.global_steps),
@@ -671,6 +750,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             "effective_rank_code": erank_code,
             "top100_sv_mean_cot": float(sv_cot[:100].mean()),
             "top100_sv_mean_code": float(sv_code[:100].mean()),
+            "sep_margin_cot": sep_margin_cot,
+            "sep_margin_code": sep_margin_code,
+            "intra_cos_correct": intra_cos_correct,
+            "intra_cos_wrong": intra_cos_wrong,
+            "silhouette_cw": silhouette_cw,
+            "auroc_cw": auroc_cw,
         }
         np.savez(stem + ".npz", student=p, targets=Z, correct=correct,
                  cot_idx=cot_idx, code_idx=code_idx, uids=meta["uids"],
@@ -1622,6 +1707,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         neg_rows: list[torch.Tensor] = []   # y- per mixed prompt
         tgt_idx: list[int] = []             # teacher CoT row per pair
         tgt_code: list[int] = []            # teacher Code row per pair (-1 = none)
+        pair_group: list[int] = []         # compact mixed-prompt id per pair
         n_mixed_prompts = 0
 
         def _uniq(view: str, problem: str, text: str) -> int:
@@ -1656,6 +1742,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 neg_rows.append(_rollout_ids(wi))
                 tgt_idx.append(pos)
                 tgt_code.append(cpos)
+                pair_group.append(n_mixed_prompts)
             n_mixed_prompts += 1
 
         M = len(pos_rows)
@@ -1687,6 +1774,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             "target_lengths": torch.tensor(target_len + [0] * (R - U), dtype=torch.long),
             "tgt_cot_idx": torch.tensor(tgt_idx + [-1] * (R - M), dtype=torch.long),
             "tgt_code_idx": torch.tensor(tgt_code + [-1] * (R - M), dtype=torch.long),
+            "pair_group_id": torch.tensor(pair_group + [-1] * (R - M), dtype=torch.long),
         })
         jepa_batch.meta_info["n_anchors"] = M
         jepa_batch.meta_info["n_unique_targets"] = U
@@ -1981,6 +2069,45 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             self._jepa_signal_off = True
         metrics["jepa/signal_off"] = float(self._jepa_signal_off)
 
+    def _maybe_guard_representation_collapse(self, metrics: dict) -> None:
+        """Stop the geometry auxiliary after sustained low representation rank.
+
+        SIGReg continuously pushes against collapse. This is the last-resort circuit
+        breaker: after warmup, only consecutive unhealthy representation batches
+        advance the counter; a healthy batch resets it. Once patience is exhausted,
+        JEPA is latched off while the ordinary GRPO policy update continues.
+        """
+        cfg = self.jepa_cfg
+        metrics["jepa/collapse_stall"] = float(self._collapse_stall)
+        metrics["jepa/collapse_latched"] = float(self._collapse_latched)
+        if (not cfg.enable or cfg.loss_type != "llm-jepa-geometry"
+                or not cfg.collapse_guard_enable or self._collapse_latched):
+            return
+        value = metrics.get("jepa/effective_rank_norm")
+        if value is None or self.global_steps < cfg.collapse_warmup_steps:
+            return
+        value = float(value)
+        self._collapse_best_rank = max(self._collapse_best_rank, value)
+        relative_floor = self._collapse_best_rank * cfg.collapse_rank_fraction_of_best
+        threshold = max(cfg.collapse_effective_rank_min, relative_floor)
+        unhealthy = value < threshold
+        self._collapse_stall = self._collapse_stall + 1 if unhealthy else 0
+        if self._collapse_stall >= cfg.collapse_patience:
+            self._collapse_latched = True
+            self._jepa_signal_off = True
+            logger.warning(
+                "[jepa] representation collapse guard fired: normalized effective "
+                "rank %.4f stayed below %.4f (best %.4f) for %d updates; "
+                "disabling JEPA while GRPO continues",
+                value, threshold, self._collapse_best_rank, self._collapse_stall,
+            )
+        metrics["jepa/collapse_best_rank"] = self._collapse_best_rank
+        metrics["jepa/collapse_threshold"] = threshold
+        metrics["jepa/collapse_unhealthy"] = float(unhealthy)
+        metrics["jepa/collapse_stall"] = float(self._collapse_stall)
+        metrics["jepa/collapse_latched"] = float(self._collapse_latched)
+        metrics["jepa/signal_off"] = float(self._jepa_signal_off)
+
     # --------------------------------------- latch state checkpointing -------
     # The plateau latches live on the trainer object; without persisting them a
     # resume silently re-enables JEPA until it re-plateaus (warmup + patience).
@@ -1995,6 +2122,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             # -inf is not valid JSON; store None for "no best yet"
             "align_best": {k: (None if v == float("-inf") else v) for k, v in self._align_best.items()},
             "align_stall": self._align_stall,
+            "collapse_stall": self._collapse_stall,
+            "collapse_latched": self._collapse_latched,
+            "collapse_best_rank": self._collapse_best_rank,
         }
         try:
             with open(os.path.join(step_folder, self._LATCH_FILE), "w") as f:
@@ -2016,6 +2146,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 self._align_best.update(
                     {k: (float("-inf") if v is None else float(v)) for k, v in state["align_best"].items()}
                 )
+                self._collapse_stall = int(state.get("collapse_stall", 0))
+                self._collapse_latched = bool(state.get("collapse_latched", False))
+                self._collapse_best_rank = float(state.get("collapse_best_rank", 0.0))
                 self._align_stall.update({k: int(v) for k, v in state["align_stall"].items()})
                 logger.info(
                     "[jepa] restored latch state from %s (signal_off=%s, off_arm=%s)",
@@ -2346,7 +2479,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                                 reward_tensor=reward_tensor,
                                 view_tags=view_tags,
                             )
-                        elif self.jepa_cfg.loss_type == "llm-jepa-infoNCE":
+                        elif self.jepa_cfg.loss_type in ("llm-jepa-infoNCE", "llm-jepa-geometry"):
                             jepa_batch = self._build_jepa_batch_llm_jepa_infonce(
                                 batch=batch,
                                 reward_tensor=reward_tensor,
@@ -2415,6 +2548,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     actor_output = self._update_actor(batch)
                     actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_metrics)
+                    # Live policy-step grad-norm, handed to jepa_update for the
+                    # ratio-matched clip (JEPA_CLIP_RATIO). 0.0 if unavailable.
+                    _actor_gn = float(actor_metrics.get("actor/grad_norm", 0.0) or 0.0)
 
                 # ── Step 5: JEPA (if enabled) ────────────────────────────
                 # The code-framed rollouts already live in `batch` (tagged
@@ -2435,6 +2571,10 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                             # assigned tensors to share the leading batch_size shape).
                             jepa_td["global_step"] = torch.full(
                                 (jepa_td.batch_size[0],), float(self.global_steps)
+                            )
+                            # Broadcast the policy-step grad-norm for the ratio-matched clip.
+                            jepa_td["actor_grad_norm"] = torch.full(
+                                (jepa_td.batch_size[0],), _actor_gn
                             )
                             # Per-arm plateau latches -> worker zeroes the disabled align
                             # term's gradient (preds still feed SIGReg). dual mode only.
@@ -2501,6 +2641,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 # teacher-alignment metric this step has plateaued. Evaluated AFTER the
                 # step's shaping/jepa metrics are in `metrics`; latches for all later steps.
                 self._maybe_disable_jepa_signal(metrics)
+                self._maybe_guard_representation_collapse(metrics)
 
                 # ── Validation ───────────────────────────────────────────
                 is_last_step = self.global_steps >= self.total_training_steps
