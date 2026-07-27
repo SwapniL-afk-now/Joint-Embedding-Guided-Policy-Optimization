@@ -99,7 +99,7 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   jepa.enable=True \
   jepa.n_cot=8 \
   jepa.n_code=0 \
-  jepa.alpha=0.05 \
+  jepa.alpha=0.01 \
   jepa.ema_decay=0.99 \
   jepa.embed_micro_batch_size=8 \
   jepa.target_max_length=4096 \
@@ -127,8 +127,8 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   trainer.critic_warmup=0 \
   trainer.logger=["console","wandb"] \
   trainer.project_name=grpo-qwen-3b \
-  trainer.experiment_name=hgrpo-a05-mathl35-Qwen2.5-Math-1.5B-20260727 \
-  trainer.default_local_dir=checkpoints/grpo-qwen-3b/hgrpo-a05-mathl35-Qwen2.5-Math-1.5B-20260727 \
+  trainer.experiment_name=hgrpo-a01-mathl35-Qwen2.5-Math-1.5B-20260727 \
+  trainer.default_local_dir=checkpoints/grpo-qwen-3b/hgrpo-a01-mathl35-Qwen2.5-Math-1.5B-20260727 \
   trainer.resume_mode=disable \
   trainer.n_gpus_per_node=2 \
   trainer.nnodes=1 \

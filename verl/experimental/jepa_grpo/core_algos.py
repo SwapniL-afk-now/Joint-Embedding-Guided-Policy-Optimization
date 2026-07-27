@@ -1125,11 +1125,21 @@ def hgrpo_loss(
     col = rank_in_group + 1                           # column 0 is the teacher
     Gmax = int(counts.max().item()) + 1
 
+    # The virtual teacher member exists ONLY in all-wrong groups. A constant s=1
+    # column in EVERY group breaks the shift invariance this objective is built on:
+    # q can then grow the teacher's mass by pushing every student score down — a
+    # common-mode escape the optimizer takes immediately (run io1aoneh: q_teacher
+    # rose 0.162->0.257 while cos_cot and cos_neg collapsed 0.56->-0.02 in lockstep
+    # and val fell ~7pp by step 120). Mixed groups use a students-only softmax,
+    # which is exactly invariant to s -> s + gamma; all-wrong groups keep the
+    # teacher as the one positive member that makes them trainable.
+    has_pos = torch.zeros(P, dtype=torch.bool, device=device)
+    has_pos = has_pos.index_put((gid[c > 0.5],), torch.ones((int((c > 0.5).sum()),), dtype=torch.bool, device=device))
     s_mat = torch.full((P, Gmax), float("-inf"), device=device, dtype=dtype)
-    s_mat[:, 0] = 1.0                                 # a_i . a_i = 1, a constant
+    s_mat[~has_pos, 0] = 1.0                          # a_i . a_i = 1, a constant
     s_mat = s_mat.index_put((gid, col), s)            # out-of-place: differentiable
     c_mat = torch.zeros((P, Gmax), device=device, dtype=dtype)
-    c_mat[:, 0] = 1.0
+    c_mat[~has_pos, 0] = 1.0
     c_mat = c_mat.index_put((gid, col), c)
     slot = torch.zeros((P, Gmax), dtype=torch.bool, device=device).index_put(
         (gid, col), torch.ones(M, dtype=torch.bool, device=device))
@@ -1178,7 +1188,7 @@ def hgrpo_loss(
         "jepa/margin": margin,
         "jepa/violation": violation,
         "jepa/hgrpo_q_correct": q_correct,
-        "jepa/hgrpo_q_teacher": float(q_old[:, 0].mean().cpu()),
+        "jepa/hgrpo_q_teacher": float(q_old[~has_pos, 0].mean().cpu()) if bool((~has_pos).any()) else 0.0,
         "jepa/n_allwrong_groups": n_allwrong,
         "jepa/effective_rank": erank,
         "jepa/effective_rank_norm": erank_norm,

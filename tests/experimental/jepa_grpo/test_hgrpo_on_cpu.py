@@ -238,3 +238,40 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
     print("ok")
+
+
+def test_teacher_member_absent_from_mixed_groups():
+    """Regression for run io1aoneh: a constant s=1 teacher column in MIXED groups broke
+    shift invariance — the optimizer pushed every student score down to grow the
+    teacher's softmax mass (q_teacher 0.162->0.257, cos_cot/cos_neg collapsing in
+    lockstep). Mixed groups must be a students-only softmax: exactly shift-invariant,
+    zero teacher mass; the teacher member survives only in all-wrong groups."""
+    torch.manual_seed(3)
+    d = 8
+    student = torch.nn.functional.normalize(torch.randn(4, d), dim=-1).requires_grad_(True)
+    teacher = torch.nn.functional.normalize(torch.randn(1, d), dim=-1)
+    label = torch.tensor([1.0, 0.0, 1.0, 0.0])          # one mixed group
+    gid = torch.zeros(4, dtype=torch.long)
+
+    loss, m = hgrpo_loss(student, label, teacher, gid)
+    assert m["jepa/hgrpo_q_teacher"] == 0.0             # no teacher slot in a mixed group
+
+    # exact common-mode invariance at the score level: dL/ds_j = -q_j A_j, and for a
+    # students-only softmax sum_j q_j A_j = 0 exactly — a uniform shift of every score
+    # is not a direction in the objective. Recompute q and A the way the loss does.
+    a = torch.nn.functional.normalize(teacher, dim=-1)[0]
+    sc = (torch.nn.functional.normalize(student.detach(), dim=-1) * a).sum(-1)
+    q = torch.softmax(sc, dim=0)
+    cbar = (q * label).sum()
+    sigma = (q * (label - cbar).pow(2)).sum().sqrt()
+    A = (label - cbar) / (sigma + 1e-6)
+    assert abs(float((q * A).sum())) < 1e-5
+    loss.backward()                                     # gradient flows to students
+    assert float(student.grad.abs().sum()) > 0.0
+
+    # all-wrong group still gets the teacher member (and hence a training signal)
+    student3 = torch.nn.functional.normalize(torch.randn(3, d), dim=-1).requires_grad_(True)
+    loss3, m3 = hgrpo_loss(student3, torch.zeros(3), teacher, torch.zeros(3, dtype=torch.long))
+    assert m3["jepa/hgrpo_q_teacher"] > 0.0
+    loss3.backward()
+    assert float(student3.grad.abs().sum()) > 0.0
