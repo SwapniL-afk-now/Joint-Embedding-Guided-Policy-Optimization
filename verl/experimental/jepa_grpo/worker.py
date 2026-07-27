@@ -728,6 +728,29 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         aggressive_empty_cache(force_sync=True)
         return TensorDict({"target_emb": emb.float().cpu()}, batch_size=[])
 
+    def _fsdp_no_sync(self):
+        """FSDP no_sync() when available, else a null context (e.g. single GPU)."""
+        from contextlib import nullcontext
+        m = getattr(self.actor.engine, "module", None)
+        return m.no_sync() if hasattr(m, "no_sync") else nullcontext()
+
+    def _sync_grads_across_dp(self):
+        """Explicitly average model .grad across DP ranks (no-op on 1 GPU).
+
+        Replaces FSDP's per-backward reduce for the JEPA backwards, which corrupts a
+        fused caller's resident policy gradient (see _embed_chunked_with_backward).
+        Also covers the deferred policy grad itself, which arrives here unsynced.
+        """
+        engine = self.actor.engine
+        dp = engine.get_data_parallel_size()
+        if dp <= 1 or not torch.distributed.is_initialized():
+            return
+        pg = engine.get_data_parallel_group()
+        for p_ in engine.module.parameters():
+            if p_.grad is not None:
+                torch.distributed.all_reduce(p_.grad, group=pg)
+                p_.grad.div_(dp)
+
     def _embed_chunked_with_backward(
         self,
         ids: torch.Tensor,
@@ -785,6 +808,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         Returns the metrics dict from `loss_fn`; backward is a side effect, the
         caller must still call `engine.optimizer_step()` afterward.
         """
+
         N = ids.shape[0]
         cfg = self.jepa_cfg
         # One shared append sequence (list[int]) or a per-row list of sequences
@@ -811,7 +835,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 )
                 boundary = None
             loss, metrics = _run_loss(joint_emb, boundary)
-            (alpha * loss + logits_anchor).backward()
+            with self._fsdp_no_sync():
+                (alpha * loss + logits_anchor).backward()
+            self._sync_grads_across_dp()
             return metrics
 
         # Sort rows by length so each chunk is padded to its own max length,
@@ -869,15 +895,26 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         # Pass 3: re-forward each (sorted) chunk live and backprop the cached
         # gradient through it into the model parameters, one chunk's
         # activations at a time.
+        # EVERY chunk backward runs under FSDP no_sync(): letting FSDP's own reduce
+        # fire per backward predivides the ENTIRE accumulated .grad (including a fused
+        # caller's deferred policy gradient) by 1/world_size per chunk — at ~38 chunks
+        # x 2 ranks that is 2^-38, and the policy update silently vanished on every
+        # multi-GPU fused step (single-GPU runs unaffected: divide factor 1). Even a
+        # single final synced backward halved the resident grad without restoring it,
+        # so FSDP is kept out of gradient comms here entirely; _sync_grads_across_dp
+        # below does the one explicit cross-rank average instead (same pattern this
+        # file already uses for predictor_delta).
         for (start, end), cached_chunk in zip(bounds, cached):
-            chunk_emb_live, chunk_logits_anchor = self._extract_embeddings(
-                ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=False, requires_grad=True,
-                predictor_k=pk_s[start:end], predictor_token_ids=_pt(start, end),
-            )
-            torch.autograd.backward(
-                [chunk_emb_live, chunk_logits_anchor],
-                [cached_chunk.grad, torch.ones((), device=chunk_logits_anchor.device, dtype=chunk_logits_anchor.dtype)],
-            )
+            with self._fsdp_no_sync():
+                chunk_emb_live, chunk_logits_anchor = self._extract_embeddings(
+                    ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=False, requires_grad=True,
+                    predictor_k=pk_s[start:end], predictor_token_ids=_pt(start, end),
+                )
+                torch.autograd.backward(
+                    [chunk_emb_live, chunk_logits_anchor],
+                    [cached_chunk.grad, torch.ones((), device=chunk_logits_anchor.device, dtype=chunk_logits_anchor.dtype)],
+                )
+        self._sync_grads_across_dp()
 
         return metrics
 
