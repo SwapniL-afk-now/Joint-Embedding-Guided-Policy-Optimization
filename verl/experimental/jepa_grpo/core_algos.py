@@ -1082,12 +1082,24 @@ def hgrpo_loss(
     contribution and the shared m/v buffers would be updated alternately by two
     differently scaled gradients.
 
-    THE VIRTUAL TEACHER MEMBER. Column 0 of every group is the anchor itself: s_i0 = 1
-    (constant, no gradient) with c_i0 = 1. It costs nothing (no extra forward — the anchor
-    is already encoded) and it is what makes ALL-WRONG groups trainable: with students-only
-    labels all equal, sigma = 0 and every A vanishes, whereas the teacher member gives the
-    wrong rollouts a negative advantage and pushes their scores down. All-correct groups
-    still yield A == 0 and are dropped by the batch builder rather than wasting a forward.
+    ONLY MIXED GROUPS TRAIN. A group needs both a correct and a wrong rollout to say
+    anything: with labels all equal sigma = 0 and every A vanishes. All-correct AND
+    all-wrong groups are therefore dropped by the batch builder rather than wasting a
+    forward, and the softmax here is over STUDENTS ONLY.
+
+    THERE IS NO VIRTUAL TEACHER MEMBER, AND THERE MUST NOT BE. Earlier revisions added
+    the anchor itself as a constant column (s_i0 = 1, c_i0 = 1) to make all-wrong groups
+    trainable. A constant column destroys the shift invariance above: s_i0 carries no
+    gradient, so the ONLY way to raise the teacher's mass is to push every student score
+    down together — precisely the common mode this objective exists to exclude, and
+    unbounded, since in an all-wrong group every student carries A < 0 and nothing pulls
+    back. Measured directly: an all-wrong group moves every student score by -0.12 in
+    lockstep, a mixed group by -0.0025 (zero-sum). It leaks through the shared encoder to
+    every rollout. Seen twice: run io1aoneh with the column in EVERY group (q_teacher
+    0.162->0.257, cos_cot/cos_neg 0.56->-0.02, val -7pp by step 120), then run d512pwma
+    with it restricted to all-wrong groups only — the same collapse a third the speed
+    (q_teacher 0.166->0.21, cos_cot/cos_neg 0.57->0.22 by step 124). Restricting the
+    column moves the escape; only removing it closes it.
 
     No temperature: q = exp(s)/sum exp(s) as specified, so the only coefficient this
     objective adds to L_GRPO is the jepa.alpha that scales it.
@@ -1098,7 +1110,7 @@ def hgrpo_loss(
         "jepa/llm_jepa_loss": 0.0, "jepa/tcr_loss": 0.0, "jepa/hgrpo_loss": 0.0,
         "jepa/cos_cot": 0.0, "jepa/cos_neg": 0.0, "jepa/margin": 0.0,
         "jepa/violation": 0.0, "jepa/hgrpo_q_correct": 0.0,
-        "jepa/hgrpo_q_teacher": 0.0, "jepa/n_allwrong_groups": 0,
+        "jepa/n_allwrong_groups": 0,
         "jepa/effective_rank": 0.0, "jepa/effective_rank_norm": 0.0,
         "jepa/n_anchors_cot": 0, "jepa/n_anchors_code": 0, "jepa/pool_size": 0,
     }
@@ -1113,34 +1125,25 @@ def hgrpo_loss(
     a = F.normalize(teacher, dim=-1).detach()      # a_i = sg(f_theta(y^T)) — mandatory
     s = (student * a[gid]).sum(dim=-1)             # (M,)
 
-    # Scatter the ragged groups into a padded (P, Gmax) matrix. Column 0 is the virtual
-    # teacher member (s=1, c=1); students occupy columns 1.. in arrival order. Absent
-    # slots carry -inf so softmax assigns them exactly zero mass and they drop out of
-    # every q-weighted statistic with no manual renormalisation.
+    # Scatter the ragged groups into a padded (P, Gmax) matrix of STUDENTS ONLY, in
+    # arrival order. Absent slots carry -inf so softmax assigns them exactly zero mass
+    # and they drop out of every q-weighted statistic with no manual renormalisation.
     counts = torch.bincount(gid, minlength=P)
     offsets = counts.cumsum(0) - counts               # first slot of each group
     rank_in_group = torch.empty(M, dtype=torch.long, device=device)
     order = torch.argsort(gid, stable=True)
     rank_in_group[order] = torch.arange(M, device=device) - offsets[gid[order]]
-    col = rank_in_group + 1                           # column 0 is the teacher
-    Gmax = int(counts.max().item()) + 1
+    col = rank_in_group
+    Gmax = int(counts.max().item())
 
-    # The virtual teacher member exists ONLY in all-wrong groups. A constant s=1
-    # column in EVERY group breaks the shift invariance this objective is built on:
-    # q can then grow the teacher's mass by pushing every student score down — a
-    # common-mode escape the optimizer takes immediately (run io1aoneh: q_teacher
-    # rose 0.162->0.257 while cos_cot and cos_neg collapsed 0.56->-0.02 in lockstep
-    # and val fell ~7pp by step 120). Mixed groups use a students-only softmax,
-    # which is exactly invariant to s -> s + gamma; all-wrong groups keep the
-    # teacher as the one positive member that makes them trainable.
-    has_pos = torch.zeros(P, dtype=torch.bool, device=device)
-    has_pos = has_pos.index_put((gid[c > 0.5],), torch.ones((int((c > 0.5).sum()),), dtype=torch.bool, device=device))
     s_mat = torch.full((P, Gmax), float("-inf"), device=device, dtype=dtype)
-    s_mat[~has_pos, 0] = 1.0                          # a_i . a_i = 1, a constant
     s_mat = s_mat.index_put((gid, col), s)            # out-of-place: differentiable
     c_mat = torch.zeros((P, Gmax), device=device, dtype=dtype)
-    c_mat[~has_pos, 0] = 1.0
     c_mat = c_mat.index_put((gid, col), c)
+    # An empty group would be an all -inf row, whose softmax is NaN and would poison
+    # every parameter through the sum below. The builder never emits one; this makes
+    # that a local, visible failure rather than a silent one.
+    assert bool((counts > 0).all()), "hgrpo_loss: group with no rollouts"
     slot = torch.zeros((P, Gmax), dtype=torch.bool, device=device).index_put(
         (gid, col), torch.ones(M, dtype=torch.bool, device=device))
 
@@ -1188,7 +1191,6 @@ def hgrpo_loss(
         "jepa/margin": margin,
         "jepa/violation": violation,
         "jepa/hgrpo_q_correct": q_correct,
-        "jepa/hgrpo_q_teacher": float(q_old[~has_pos, 0].mean().cpu()) if bool((~has_pos).any()) else 0.0,
         "jepa/n_allwrong_groups": n_allwrong,
         "jepa/effective_rank": erank,
         "jepa/effective_rank_norm": erank_norm,

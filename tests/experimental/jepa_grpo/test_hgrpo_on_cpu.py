@@ -103,24 +103,29 @@ def test_gradient_step_strictly_increases_the_correct_wrong_gap():
     assert all(b > a for a, b in zip(gaps, gaps[1:])), f"gap must rise monotonically: {gaps}"
 
 
-def test_all_wrong_group_is_trainable_only_because_of_the_teacher_member():
-    """Spec section 10: with c == 0 everywhere, students-only advantages all vanish."""
+def test_all_wrong_group_is_inert_and_must_not_be_rescued():
+    """An all-wrong group carries no discriminative signal and must contribute NOTHING.
+
+    Rescuing it with a constant teacher column (s=1, no gradient) makes the only
+    available descent direction "push every student score down together" — the exact
+    common mode this objective exists to exclude, and unbounded, since every student
+    carries A < 0 and nothing pulls back. It leaks through the shared encoder to every
+    rollout: measured -0.12 mean score drift per step here vs -0.0025 for a mixed group.
+    Cost two runs (io1aoneh, d512pwma) before it was removed.
+    """
     student, _, teacher, gid = _group(0, 6, seed=3)
     label = torch.zeros(6)
     x = student.detach().clone().requires_grad_(True)
-    loss, metrics = hgrpo_loss(x, label, teacher, gid)
+    loss, _ = hgrpo_loss(x, label, teacher, gid)
     (grad,) = torch.autograd.grad(loss, x)
-    assert grad.abs().sum() > 1e-6, "the virtual teacher member must supply signal"
-    assert metrics["jepa/n_allwrong_groups"] == 1
+    assert grad.abs().sum() == 0.0, "an all-wrong group must produce no gradient"
 
-    # Every wrong score must be pushed DOWN.
+    # ...and specifically no common-mode drift: scores must not move at all.
     s_before = _scores(x.detach(), teacher, gid)
     s_after = _scores(x.detach() - 10.0 * grad, teacher, gid)
-    assert (s_after < s_before).all(), f"{s_before} -> {s_after}"
+    assert torch.allclose(s_before, s_after), f"{s_before} -> {s_after}"
 
-    # Without the teacher member the group is label-degenerate: sigma = 0 => A == 0.
-    # Simulate by giving the group a second, identical all-wrong prompt's statistics:
-    # a uniform label vector yields zero advantage for every student either way.
+    # The reason it is inert: uniform labels => sigma = 0 => every advantage vanishes.
     q = torch.softmax(_scores(x.detach(), teacher, gid), dim=0)
     cbar = (q * label).sum()
     assert float(((label - cbar) ** 2 * q).sum()) == 0.0
@@ -140,8 +145,9 @@ def test_multi_prompt_ragged_groups_and_all_correct_degeneracy():
     """Ragged group sizes must scatter correctly; an all-correct group contributes 0."""
     d = 16
     g = torch.Generator().manual_seed(5)
-    # prompt 0: 3 rollouts (2 correct), prompt 1: 5 rollouts (0 correct),
-    # prompt 2: 2 rollouts (2 correct -> degenerate with the teacher member)
+    # prompt 0: 3 rollouts (2 correct), prompt 1: 5 rollouts (0 correct -> inert),
+    # prompt 2: 2 rollouts (2 correct -> inert). The builder drops 1 and 2; the loss
+    # must stay finite and give them zero gradient if they reach it anyway.
     sizes, labels = [3, 5, 2], [[1.0, 1.0, 0.0], [0.0] * 5, [1.0, 1.0]]
     student = torch.randn(sum(sizes), d, generator=g, requires_grad=True)
     teacher = torch.randn(3, d, generator=g)
@@ -192,19 +198,23 @@ def _fake_batch(rewards_per_prompt, prompt_len=3):
     return batch, reward, np.array(["cot"] * rows, dtype=object)
 
 
-def test_builder_keeps_all_wrong_groups_and_drops_all_correct_ones():
-    # p0 mixed (2/2), p1 all-wrong, p2 all-correct (dropped), p3 mixed (1/3)
+def test_builder_drops_every_non_mixed_group():
+    """Only mixed groups carry signal. All-correct AND all-wrong are dropped before the
+    forward — the all-wrong ones because rescuing them costs a common-mode collapse
+    (see test_all_wrong_group_is_inert_and_must_not_be_rescued), and dropping them here
+    saves the forward pass entirely."""
+    # p0 mixed (2/2), p1 all-wrong (dropped), p2 all-correct (dropped), p3 mixed (1/3)
     batch, reward, view = _fake_batch([[1, 1, 0, 0], [0, 0, 0, 0], [1, 1, 1, 1], [1, 0, 0, 0]])
     fake = _fake_trainer({0: ["t0"], 1: ["t1"], 2: ["t2"], 3: ["t3"]})
     out = JEPARayPPOTrainer._build_jepa_batch_hgrpo(fake, batch, reward, view)
 
     assert out is not None
-    assert out.meta_info["n_groups"] == 3, "the all-correct prompt must be dropped"
-    assert out.meta_info["n_allwrong_groups"] == 1, "the all-wrong prompt must be KEPT"
-    assert out.meta_info["n_anchors"] == 12       # 3 surviving prompts x 4 rollouts
-    assert out.meta_info["n_unique_targets"] == 3  # one anchor per surviving prompt
-    assert out.batch["student_label"][:12].tolist() == [1, 1, 0, 0] + [0] * 4 + [1, 0, 0, 0]
-    assert out.batch["student_group_id"][:12].tolist() == [0] * 4 + [1] * 4 + [2] * 4
+    assert out.meta_info["n_groups"] == 2, "only the two mixed prompts survive"
+    assert out.meta_info["n_allwrong_groups"] == 1, "counts the all-wrong prompt DROPPED"
+    assert out.meta_info["n_anchors"] == 8        # 2 surviving prompts x 4 rollouts
+    assert out.meta_info["n_unique_targets"] == 2  # one anchor per surviving prompt
+    assert out.batch["student_label"][:8].tolist() == [1, 1, 0, 0] + [1, 0, 0, 0]
+    assert out.batch["student_group_id"][:8].tolist() == [0] * 4 + [1] * 4
 
 
 def test_worker_unpacking_of_the_builder_output_feeds_the_loss():
@@ -229,7 +239,7 @@ def test_worker_unpacking_of_the_builder_output_feeds_the_loss():
     assert torch.isfinite(loss) and torch.isfinite(joint.grad).all()
     assert joint.grad[:M].abs().sum() > 0, "students must receive gradient"
     assert joint.grad[M:].abs().sum() == 0, "anchors are stop-grad"
-    assert m["jepa/n_allwrong_groups"] == 1
+    assert m["jepa/n_allwrong_groups"] == 0, "the builder already dropped the all-wrong group"
     assert 0.0 <= m["jepa/violation"] <= 1.0
 
 
@@ -240,38 +250,49 @@ if __name__ == "__main__":
     print("ok")
 
 
-def test_teacher_member_absent_from_mixed_groups():
-    """Regression for run io1aoneh: a constant s=1 teacher column in MIXED groups broke
-    shift invariance — the optimizer pushed every student score down to grow the
-    teacher's softmax mass (q_teacher 0.162->0.257, cos_cot/cos_neg collapsing in
-    lockstep). Mixed groups must be a students-only softmax: exactly shift-invariant,
-    zero teacher mass; the teacher member survives only in all-wrong groups."""
+def test_no_common_mode_drift_in_any_group():
+    """Regression for runs io1aoneh and d512pwma. A constant s=1 teacher column carries
+    no gradient, so the only way to grow its softmax mass is to push every student score
+    down together — the common mode this objective exists to exclude. With the column in
+    every group that collapsed cos_cot/cos_neg 0.56->-0.02 and cost 7pp of val by step
+    120; restricted to all-wrong groups it did the same thing a third the speed
+    (0.57->0.22 by step 124). The column is gone: EVERY group is a students-only softmax,
+    which is exactly invariant to s -> s + gamma.
+
+    The operative check is on the SCORES, not the embeddings: L2 normalisation means a
+    uniform embedding shift is not a uniform score shift, so an embedding-space assertion
+    would test the wrong invariance.
+    """
     torch.manual_seed(3)
     d = 8
-    student = torch.nn.functional.normalize(torch.randn(4, d), dim=-1).requires_grad_(True)
     teacher = torch.nn.functional.normalize(torch.randn(1, d), dim=-1)
-    label = torch.tensor([1.0, 0.0, 1.0, 0.0])          # one mixed group
-    gid = torch.zeros(4, dtype=torch.long)
-
-    loss, m = hgrpo_loss(student, label, teacher, gid)
-    assert m["jepa/hgrpo_q_teacher"] == 0.0             # no teacher slot in a mixed group
-
-    # exact common-mode invariance at the score level: dL/ds_j = -q_j A_j, and for a
-    # students-only softmax sum_j q_j A_j = 0 exactly — a uniform shift of every score
-    # is not a direction in the objective. Recompute q and A the way the loss does.
     a = torch.nn.functional.normalize(teacher, dim=-1)[0]
-    sc = (torch.nn.functional.normalize(student.detach(), dim=-1) * a).sum(-1)
-    q = torch.softmax(sc, dim=0)
-    cbar = (q * label).sum()
-    sigma = (q * (label - cbar).pow(2)).sum().sqrt()
-    A = (label - cbar) / (sigma + 1e-6)
-    assert abs(float((q * A).sum())) < 1e-5
-    loss.backward()                                     # gradient flows to students
-    assert float(student.grad.abs().sum()) > 0.0
 
-    # all-wrong group still gets the teacher member (and hence a training signal)
-    student3 = torch.nn.functional.normalize(torch.randn(3, d), dim=-1).requires_grad_(True)
-    loss3, m3 = hgrpo_loss(student3, torch.zeros(3), teacher, torch.zeros(3, dtype=torch.long))
-    assert m3["jepa/hgrpo_q_teacher"] > 0.0
-    loss3.backward()
-    assert float(student3.grad.abs().sum()) > 0.0
+    def mean_score_drift(labels):
+        st = torch.nn.functional.normalize(torch.randn(len(labels), d), dim=-1).requires_grad_(True)
+        lab = torch.tensor(labels)
+        loss, _ = hgrpo_loss(st, lab, teacher, torch.zeros(len(labels), dtype=torch.long))
+        loss.backward()
+        before = (torch.nn.functional.normalize(st.detach(), dim=-1) * a).sum(-1)
+        after = (torch.nn.functional.normalize(st.detach() - st.grad, dim=-1) * a).sum(-1)
+        return float((after - before).mean()), st.grad, before, after
+
+    # mixed group: trains, but with no net drift — correct up, wrong down, zero-sum
+    drift, grad, before, after = mean_score_drift([1.0, 0.0, 1.0, 0.0])
+    assert abs(drift) < 0.02, f"mixed group drifted {drift:+.4f}"
+    assert float(grad.abs().sum()) > 0.0, "a mixed group must still train"
+    assert (after[[0, 2]] > before[[0, 2]]).all(), "correct rollouts must be pushed up"
+    assert (after[[1, 3]] < before[[1, 3]]).all(), "wrong rollouts must be pushed down"
+
+    # all-wrong group: inert. This is where the old teacher column pumped -0.12/step.
+    drift, grad, _, _ = mean_score_drift([0.0, 0.0, 0.0])
+    assert drift == 0.0 and float(grad.abs().sum()) == 0.0
+
+    # the algebraic reason: sum_j q_j A_j == 0 exactly for a students-only softmax,
+    # so dL/ds_j = -q_j A_j has no common component.
+    st = torch.nn.functional.normalize(torch.randn(4, d), dim=-1)
+    lab = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    q = torch.softmax((st * a).sum(-1), dim=0)
+    cbar = (q * lab).sum()
+    A = (lab - cbar) / ((q * (lab - cbar).pow(2)).sum().sqrt() + 1e-6)
+    assert abs(float((q * A).sum())) < 1e-5

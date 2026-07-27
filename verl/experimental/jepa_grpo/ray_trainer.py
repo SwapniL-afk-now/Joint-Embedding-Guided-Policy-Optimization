@@ -2123,6 +2123,10 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             if not rows:
                 continue
             labels = [1.0 if rew[i] > 0 else 0.0 for i in rows]
+            if not any(v > 0.5 for v in labels):
+                n_allwrong += 1        # dropped, not trained on: counts the waste
+                continue               # sigma = 0 => A == 0. See hgrpo_loss on why an
+                # all-wrong group must not be rescued with a constant teacher column.
             if all(v > 0.5 for v in labels):
                 continue  # all-correct: sigma = 0 => A == 0, nothing to learn
             ds_idx = idx_by_uid.get(u)
@@ -2135,8 +2139,6 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 student_rows.append(_rollout_ids(i))
                 student_label.append(c)
                 student_group.append(n_groups)
-            if not any(v > 0.5 for v in labels):
-                n_allwrong += 1
             n_groups += 1
 
         M = len(student_rows)
