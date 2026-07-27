@@ -53,8 +53,8 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   algorithm.adv_estimator=grpo \
   algorithm.norm_adv_by_std_in_grpo=False \
   algorithm.use_kl_in_reward=False \
-  data.train_files=/workspace/jepa-grpo-cache/data/deepscaler_preview_train.parquet \
-  data.val_files=[/workspace/jepa-grpo-cache/eval_data/aime24.parquet,/workspace/jepa-grpo-cache/eval_data/aime25.parquet,/workspace/jepa-grpo-cache/eval_data/aime26.parquet,/workspace/jepa-grpo-cache/eval_data/amc23.parquet] \
+  data.train_files=/workspace/jepa-grpo-cache/data/math_l35/train.parquet \
+  data.val_files=[/workspace/jepa-grpo-cache/eval_data/math500.parquet,/workspace/jepa-grpo-cache/eval_data/amc23.parquet,/workspace/jepa-grpo-cache/eval_data/aime24.parquet,/workspace/jepa-grpo-cache/eval_data/aime25.parquet] \
   data.train_batch_size=64 \
   +data.gen_batch_size=64 \
   data.val_batch_size=128 \
@@ -110,7 +110,7 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   jepa.predictor_k=0 \
   jepa.alpha_warmup_steps=20 \
   jepa.max_grad_norm=0.5 \
-  jepa.teacher_cache_path=/workspace/jepa-grpo-cache/ds40k.cot.responses.pt \
+  jepa.teacher_cache_path=/workspace/jepa-grpo-cache/mathl35.cot.responses.pt \
   jepa.code_teacher_cache_path= \
   jepa.code_system_prompt= \
   jepa.auto_off_enable=False \
@@ -127,8 +127,8 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   trainer.critic_warmup=0 \
   trainer.logger=["console","wandb"] \
   trainer.project_name=grpo-qwen-3b \
-  trainer.experiment_name=hgrpo-a05-Qwen2.5-Math-1.5B-20260726 \
-  trainer.default_local_dir=checkpoints/grpo-qwen-3b/hgrpo-a05-Qwen2.5-Math-1.5B-20260726 \
+  trainer.experiment_name=hgrpo-a05-mathl35-Qwen2.5-Math-1.5B-20260727 \
+  trainer.default_local_dir=checkpoints/grpo-qwen-3b/hgrpo-a05-mathl35-Qwen2.5-Math-1.5B-20260727 \
   trainer.resume_mode=disable \
   trainer.n_gpus_per_node=2 \
   trainer.nnodes=1 \
@@ -148,9 +148,9 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   trainer.validation_data_dir=null \
   trainer.max_actor_ckpt_to_keep=1 \
   +trainer.val_only=false \
-  +trainer.best_ckpt_sources=["aime24","aime25","aime26","amc23"] \
+  +trainer.best_ckpt_sources=["math500","amc23","aime24","aime25"] \
   +trainer.best_ckpt_metrics=["pass@8","pass@1+pass@8"] \
-  +trainer.validation_seeds=[31415,27182,16180] \
+  +trainer.validation_seeds=[31415] \
   actor_rollout_ref.actor.fsdp_config.fsdp_size=1 \
   actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=98304 \
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=98304 \
