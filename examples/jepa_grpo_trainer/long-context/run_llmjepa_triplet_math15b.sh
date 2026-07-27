@@ -1,14 +1,30 @@
 #!/bin/bash
 cd /workspace/Joint-Embedding-Guided-Policy-Optimization
 export WANDB_ENTITY=ismamnurswapnil-bangladesh-university-of-engineering-and
-# predictor_k=0 (identity predictor: every read is the final content token).
-# Correct student responses are attracted to both cached teacher CoT and Code;
-# both teacher views are stop-gradient anchors. Wrong student responses are
-# repelled from both teachers and the correct student. Student-only SIGReg plus
-# effective-rank patience protect representation diversity.
-# SIGReg plus effective-rank patience protect representation diversity.
-# PREDICTOR_EMBED_LR/WD are dead vars (predictor now trains via the actor's
-# own optimizer, see run_infonce_predinopt.sh) — omitted here too.
+export CUDA_VISIBLE_DEVICES=1
+# CORRECTNESS-CONDITIONED REPRESENTATION GRADIENT (llm-jepa-triplet + frozen anchor).
+#   a_i = sg(f_theta(y^T_cot))                      FROZEN correct-solution anchor
+#   L   = align_w * (1 - cos(p+, a)) + repel_w * tau*softplus((cos(p-,a) - cos(p+,a) + m)/tau)
+# p+ = correct student read, p- = wrong student read, both response-only.
+#
+# THREE changes from the failed code-only arm (run 0ntqn3zc, 170 steps at 3B):
+#  1. triplet_detach_teacher=true. Previously the anchor was differentiable, so the
+#     cheapest descent was to drag the ANCHOR into the student cloud: cos_correct
+#     0.8525->0.9393 and cos_wrong 0.8550->0.9445 rose in LOCKSTEP, jepa/margin stayed
+#     ~0, jepa/violation pinned at 1.00 for all 170 steps. A frozen anchor removes that.
+#  2. alpha 0.0015 -> 0.05. That run had jepa/grad_norm 0.0004 vs actor/grad_norm
+#     0.10-0.16 -- the representation term was 0.3% of the policy gradient, far too weak
+#     to move anything. Check jepa/grad_norm / actor/grad_norm ~ 0.2 at step 25.
+#  3. triplet_include_cot=true, n_code=0: anchor is the teacher CoT, not the Code view.
+#     The old arm asked a CoT read to approach a CODE read, across the modality gap that
+#     dominates this representation -- so modality, not correctness, was the axis being
+#     optimised. A same-modality anchor leaves correctness as the only usable axis.
+#     Cost: the align arm starts near-saturated (cos~0.93). That is fine -- align is not
+#     the discriminative term; the hinge on the DIFFERENCE is, and 1/tau amplifies it.
+# margin=0 makes 1 - jepa/violation exactly nearest-anchor retrieval accuracy.
+# SIGReg off: uniform contraction toward a FROZEN anchor drives the margin to 0 but can
+# never make it positive (tau*log2 floor), so there is no degenerate optimum to guard.
+# FALSIFIER: jepa/margin must rise above 0 and violation fall below 1.0 by ~step 50.
 exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.main_ray \
   --config-name \
   jepa_grpo_ray_qwen25_1_5b \
@@ -24,19 +40,17 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   data.max_response_length=3072 \
   data.filter_overlong_prompts=True \
   data.truncation=error \
-  actor_rollout_ref.model.path=/workspace/models/Qwen2.5-3B-Instruct \
+  actor_rollout_ref.model.path=/workspace/models/Qwen2.5-Math-1.5B-Instruct \
+  actor_rollout_ref.model.lora_rank=0 \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.model.enable_gradient_checkpointing=True \
   +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
-  actor_rollout_ref.model.lora_rank=512 \
-  actor_rollout_ref.model.lora_alpha=1024 \
-  actor_rollout_ref.model.target_modules=all-linear \
   actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
   actor_rollout_ref.actor.loss_agg_mode=token-mean \
   actor_rollout_ref.actor.clip_ratio_low=0.2 \
   actor_rollout_ref.actor.clip_ratio_high=0.2 \
   actor_rollout_ref.actor.clip_ratio_c=3.0 \
-  actor_rollout_ref.actor.optim.lr=5e-7 \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
   actor_rollout_ref.actor.ppo_mini_batch_size=64 \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
@@ -63,44 +77,29 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   jepa.enable=True \
   jepa.n_cot=8 \
   jepa.n_code=0 \
-  jepa.alpha=0.0015 \
+  jepa.alpha=0.05 \
   jepa.ema_decay=0.99 \
   jepa.embed_micro_batch_size=8 \
   jepa.target_max_length=4096 \
   jepa.min_valid_pairs=1 \
-  jepa.loss_type=llm-jepa-geometry \
-  +jepa.geometry_tau=0.1 \
-  +jepa.geometry_margin=0.1 \
-  +jepa.geometry_align_weight=1.0 \
-  +jepa.geometry_wrong_teacher_weight=1.0 \
-  +jepa.geometry_wrong_correct_weight=1.0 \
-  +jepa.collapse_guard_enable=True \
-  +jepa.collapse_effective_rank_min=0.003 \
-  +jepa.collapse_rank_fraction_of_best=0.5 \
-  +jepa.collapse_patience=10 \
-  +jepa.collapse_reenable_patience=10 \
-  +jepa.collapse_warmup_steps=20 \
+  jepa.tcr_reward_beta=0 \
+  jepa.loss_type=llm-jepa-triplet \
+  +jepa.triplet_tau=0.1 \
+  +jepa.triplet_margin=0.0 \
+  +jepa.triplet_repel_weight=1.0 \
+  +jepa.triplet_include_cot=true \
+  +jepa.triplet_detach_teacher=true \
+  jepa.triplet_sigreg_lambda=0.0 \
   jepa.predictor_k=0 \
   jepa.alpha_warmup_steps=20 \
   jepa.max_grad_norm=0.5 \
   jepa.teacher_cache_path=/workspace/jepa-grpo-cache/ds40k.cot.responses.pt \
-  jepa.code_teacher_cache_path=/workspace/jepa-grpo-cache/ds40k.code.responses.pt \
+  jepa.code_teacher_cache_path= \
   jepa.code_system_prompt= \
   jepa.tcr_match=cycle \
   jepa.max_anchors_per_prompt=2 \
   jepa.jepa_anchor_set=correct \
-  jepa.tcr_reward_beta=0 \
-  jepa.tcr_reward_sigma_floor=0.1 \
-  jepa.triplet_sigreg_lambda=0.1 \
-  jepa.n_projections=1024 \
-  jepa.t_min=-5.0 \
-  jepa.t_max=5.0 \
-  jepa.epps_pulley_s=1.0 \
   jepa.auto_off_enable=False \
-  jepa.auto_off_patience=10 \
-  jepa.auto_off_min_delta=0.002 \
-  jepa.auto_off_warmup_steps=20 \
-  jepa.auto_off_min_cos=0.0 \
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576 \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -114,10 +113,10 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   trainer.critic_warmup=0 \
   trainer.logger=["console","wandb"] \
   trainer.project_name=grpo-qwen-3b \
-  trainer.experiment_name=geometry-cot-code-stopgrad-fresh-reenable-Qwen2.5-3B-Instruct-20260722 \
-  trainer.default_local_dir=checkpoints/grpo-qwen-3b/geometry-cot-code-stopgrad-fresh-reenable-Qwen2.5-3B-Instruct-20260722 \
+  trainer.experiment_name=triplet-sg-cotanchor-a05-Qwen2.5-Math-1.5B-20260726 \
+  trainer.default_local_dir=checkpoints/grpo-qwen-3b/triplet-sg-cotanchor-a05-Qwen2.5-Math-1.5B-20260726 \
   trainer.resume_mode=disable \
-  trainer.n_gpus_per_node=2 \
+  trainer.n_gpus_per_node=1 \
   trainer.nnodes=1 \
   trainer.save_freq=10 \
   trainer.test_freq=10 \

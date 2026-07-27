@@ -35,12 +35,32 @@ from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
 from verl.experimental.jepa_grpo.core_algos import (
+    hgrpo_loss,
     llm_jepa_contrastive_loss,
     llm_jepa_geometry_loss,
     llm_jepa_infonce_loss,
     llm_jepa_paper_loss,
     llm_jepa_tcr_dual_loss,
+    llm_jepa_triplet_loss,
 )
+
+
+def _assert_policy_grad_resident(actor_grad_norm: float) -> None:
+    """Fail loudly if the deferred policy gradient never reached .grad.
+
+    Fused mode relies on the actor's backward leaving its gradient resident (the actor
+    skipped its optimizer step). A prior attempt at this fusion reported FSDP stashing the
+    deferred grad in a sharded internal buffer instead, which silently dropped the policy
+    update — a zero norm here is exactly that failure, so raise rather than train on a
+    JEPA-only gradient.
+    """
+    if not (actor_grad_norm > 0.0):
+        raise RuntimeError(
+            "jepa.fuse_optimizer_step: the deferred policy gradient is not resident on "
+            f".grad (norm={actor_grad_norm}). Fusing would apply the JEPA gradient alone "
+            "and silently drop this step's policy update. Set jepa.fuse_optimizer_step="
+            "False to use the two-step path, or materialize the FSDP grad before stepping."
+        )
 
 
 class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
@@ -890,9 +910,11 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
         assert self.jepa_cfg.loss_type in (
-            "llm-jepa", "llm-jepa-contrastive", "llm-jepa-infoNCE", "llm-jepa-geometry", "jepa-tcr-dual", "jepa-tcr-cot"), (
+            "llm-jepa", "llm-jepa-contrastive", "llm-jepa-infoNCE", "llm-jepa-geometry",
+            "llm-jepa-triplet", "h-grpo", "jepa-tcr-dual", "jepa-tcr-cot"), (
             f"worker.jepa_update only supports loss_type 'llm-jepa', 'llm-jepa-contrastive', "
-            f"'llm-jepa-infoNCE', 'llm-jepa-geometry', 'jepa-tcr-dual' or 'jepa-tcr-cot', got {self.jepa_cfg.loss_type!r}"
+            f"'llm-jepa-infoNCE', 'llm-jepa-geometry', 'llm-jepa-triplet', 'h-grpo', "
+            f"'jepa-tcr-dual' or 'jepa-tcr-cot', got {self.jepa_cfg.loss_type!r}"
         )
         if self.jepa_cfg.predictor_k > 0:
             assert len(self.jepa_cfg.predictor_token_ids) == self.jepa_cfg.predictor_k, (
@@ -910,11 +932,33 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             n_pairs = data["cot_input_ids"].shape[0]
         engine = self.actor.engine
         cfg = self.jepa_cfg
+        # Fused mode (jepa.fuse_optimizer_step): the actor DEFERRED its optimizer step,
+        # so the policy gradient is resident on .grad and unapplied — this call owns the
+        # single combined step. Two-step mode: the actor already stepped.
+        _fuse = data.get("fuse_optimizer_step", None)
+        fuse = bool(float(_fuse[0].item())) if _fuse is not None else False
         if n_pairs < self.jepa_cfg.min_valid_pairs:
             # Two-step design: the actor already took its own optimizer step (policy
             # grad applied) before this call. With too few JEPA pairs there is no
             # auxiliary grad to add, so there is simply nothing to do here — do NOT
             # step again (that would re-apply the leftover, already-stepped grad).
+            # FUSED design: the opposite — the policy grad has NOT been applied yet, so
+            # returning here would silently drop this iteration's entire policy update.
+            # Step it alone (no JEPA contribution to add).
+            if fuse:
+                with engine.train_mode():
+                    actor_gn = engine.grad_norm_only()
+                    _assert_policy_grad_resident(actor_gn)
+                    engine.optimizer_step()
+                    engine.lr_scheduler_step()
+                return TensorDict(
+                    {"jepa/skipped": torch.tensor(1.0),
+                     "jepa/fused": torch.tensor(1.0),
+                     "actor/grad_norm": torch.tensor(float(actor_gn)),
+                     "jepa/grad_norm_total": torch.tensor(float(actor_gn)),
+                     "jepa/n_valid_pairs": torch.tensor(float(n_pairs))},
+                    batch_size=[],
+                )
             return TensorDict(
                 {"jepa/skipped": torch.tensor(1.0),
                  "jepa/n_valid_pairs": torch.tensor(float(n_pairs))},
@@ -944,6 +988,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         else:
             alpha = cfg.alpha
 
+        actor_gn = 0.0
         with engine.train_mode():
             # Two-step design: the actor (ray_trainer Step 4) already ran its own
             # complete optimizer step for the policy loss, which leaves its (applied)
@@ -952,7 +997,17 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             # the leftover policy grad would be double-applied.
             # predictor_delta is a param group on this same optimizer, so this
             # zeros its grad too — no separate zero_grad needed.
-            engine.optimizer_zero_grad()
+            #
+            # FUSED design: the resident grad is the DEFERRED, un-applied policy grad.
+            # Keep it — the JEPA backward below accumulates onto it and the single step
+            # at the end applies the sum. Measure it first: this is the only point where
+            # the policy contribution is separable, so it is what keeps actor/grad_norm
+            # exact and comparable with the two-step runs.
+            if fuse:
+                actor_gn = engine.grad_norm_only()
+                _assert_policy_grad_resident(actor_gn)
+            else:
+                engine.optimizer_zero_grad()
             # Arm the predictor-embedding hook for the JEPA forward only.
             self._predictor_hook_active = self.predictor_delta is not None
 
@@ -1105,20 +1160,58 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                     joint_ids, joint_mask, joint_lengths, joint_predictor_k,
                     _loss_fn, micro_bs, alpha, predictor_token_ids=joint_pt,
                 )
-            elif cfg.loss_type in ("llm-jepa-infoNCE", "llm-jepa-geometry"):
+            elif cfg.loss_type == "h-grpo":
+                # One flat student block (M rollout rows, ALL of them -- not correct/wrong
+                # pairs) plus a deduplicated teacher block with one anchor per GROUP.
+                # Every row gets the SAME read operator: predictor_k is forced to 0 by
+                # config validation, because appending a label-dependent [PRED]/[BAD_PRED]
+                # (as the infoNCE/triplet branch below does) would let the group softmax
+                # separate rollouts by their appended token instead of their content.
+                anchor_lengths_all = data["anchor_lengths"].long()
+                target_lengths_all = data["target_lengths"].long()
+                M = int((anchor_lengths_all > 0).sum().item())
+                U = int((target_lengths_all > 0).sum().item())
+                tgt_group_idx = data["tgt_cot_idx"].long()
+                tgt_group_idx = tgt_group_idx[tgt_group_idx >= 0]   # (P,) one per group
+                student_label = data["student_label"].float()[:M]
+                student_gid = data["student_group_id"].long()[:M]
+                assert int(student_gid.max().item()) + 1 == tgt_group_idx.shape[0], (
+                    f"h-grpo: {int(student_gid.max().item()) + 1} groups in student_group_id "
+                    f"but {tgt_group_idx.shape[0]} teacher anchors"
+                )
+
+                joint_ids, joint_mask = self._pad_concat_batch(
+                    data["anchor_input_ids"][:M], data["anchor_attn_mask"][:M],
+                    data["target_input_ids"][:U], data["target_attn_mask"][:U],
+                )
+                joint_lengths = torch.cat([anchor_lengths_all[:M], target_lengths_all[:U]])
+                joint_predictor_k = [0] * (M + U)
+
+                def _loss_fn(joint_emb, _M=M, _tidx=tgt_group_idx,
+                             _lab=student_label, _gid=student_gid):
+                    dev = joint_emb.device
+                    return hgrpo_loss(
+                        student=joint_emb[:_M],
+                        label=_lab.to(dev),
+                        teacher=joint_emb[_M:][_tidx.to(dev)],
+                        group_id=_gid.to(dev),
+                    )
+
+                jepa_metrics = self._embed_chunked_with_backward(
+                    joint_ids, joint_mask, joint_lengths, joint_predictor_k,
+                    _loss_fn, micro_bs, alpha, predictor_token_ids=None,
+                )
+            elif cfg.loss_type in ("llm-jepa-infoNCE", "llm-jepa-geometry", "llm-jepa-triplet"):
                 # Single discriminative InfoNCE over mixed prompts (see
                 # core_algos.llm_jepa_infonce_loss and
                 # ray_trainer._build_jepa_batch_llm_jepa_infonce). Anchor block =
                 # M positive rollouts (read via <|predictor_i|>) then their M
-                # negatives (read via <|bad_predictor_i|>). NO stop-grad on the
-                # teacher (user request): instead of a separate no_grad EMA encode,
-                # anchor rows AND the unique teacher-target rows ride in ONE joint
-                # differentiable forward — same pattern as the plain "llm-jepa"
-                # branch above (`_pad_concat_batch` + a single
-                # `_embed_chunked_with_backward` call, which always runs with
-                # use_ema=False) — so gradient reaches the teacher targets too,
-                # not just the student anchors. EMA/`self.ema_weights` is unused
-                # by this loss_type now.
+                # negatives (read via <|bad_predictor_i|>). CoT and Code teacher
+                # rows share the joint forward for efficiency, but the geometry loss
+                # detaches both teacher views: they are fixed anchors for attraction
+                # and repulsion. SIGReg receives only the correct/wrong student rows,
+                # so anti-collapse gradients cannot leak into teacher targets. The
+                # InfoNCE sibling keeps its existing differentiable-target behavior.
                 anchor_lengths_all = data["anchor_lengths"].long()
                 target_lengths_all = data["target_lengths"].long()
                 N = int((anchor_lengths_all > 0).sum().item())
@@ -1172,7 +1265,30 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                             align_weight=cfg.geometry_align_weight,
                             wrong_teacher_weight=cfg.geometry_wrong_teacher_weight,
                             wrong_correct_weight=cfg.geometry_wrong_correct_weight,
-                            sig_pool=joint_emb,
+                            sig_pool=joint_emb[:_N],
+                            sigreg_lambda=cfg.triplet_sigreg_lambda,
+                            sig_M=cfg.n_projections,
+                            sig_t_min=cfg.t_min,
+                            sig_t_max=cfg.t_max,
+                            sig_s=cfg.epps_pulley_s,
+                        )
+                    if cfg.loss_type == "llm-jepa-triplet":
+                        # Teacher-anchored triplet: paper align (correct->teacher,
+                        # both views) + hinge (wrong >= margin farther than correct).
+                        # triplet_detach_teacher controls whether the anchor is frozen.
+                        return llm_jepa_triplet_loss(
+                            correct=joint_emb[:_M],
+                            wrong=joint_emb[_M:_N],
+                            teacher=teacher_z,
+                            teacher_code=teacher_zc,
+                            has_code=_hc,
+                            group_id=_gid,
+                            tau=cfg.triplet_tau,
+                            margin=cfg.triplet_margin,
+                            repel_weight=cfg.triplet_repel_weight,
+                            include_cot=cfg.triplet_include_cot,
+                            detach_teacher=cfg.triplet_detach_teacher,
+                            sig_pool=joint_emb[:_N],
                             sigreg_lambda=cfg.triplet_sigreg_lambda,
                             sig_M=cfg.n_projections,
                             sig_t_min=cfg.t_min,
@@ -1319,11 +1435,13 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                     micro_bs, alpha, also_boundary=True,
                 )
 
-            # Second of the two sequential steps: apply ONLY the JEPA gradient
-            # (grad was zeroed at the top of this train_mode; the actor already
-            # stepped the policy grad in ray_trainer Step 4). jepa/grad_norm is the
-            # α·JEPA gradient norm; the policy step's norm is logged as
-            # actor/grad_norm by the actor update.
+            # TWO-STEP: apply ONLY the JEPA gradient (grad was zeroed at the top of this
+            # train_mode; the actor already stepped the policy grad in ray_trainer
+            # Step 4). jepa/grad_norm is the α·JEPA gradient norm; the policy step's
+            # norm is logged as actor/grad_norm by the actor update.
+            # FUSED: .grad now holds g_policy + α·g_JEPA. One clip (the actor's own
+            # optim clip_grad — jepa.max_grad_norm and the ratio-matched clip below are
+            # both bypassed) and one optimizer step over the sum.
             self._predictor_hook_active = False  # disarm before any non-JEPA forward
             # Ratio-matched clip: cap the JEPA update at ratio * the live actor
             # grad-norm (passed in from ray_trainer Step 4) so the auxiliary step
@@ -1333,12 +1451,18 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             # ponytail: ratio=1 matches magnitudes; tune the env if JEPA should be
             # deliberately sub/super the policy step.
             import os as _os
-            clip_used = self.jepa_cfg.max_grad_norm
-            _ratio = float(_os.environ.get("JEPA_CLIP_RATIO", "0"))
             _agn = data.get("actor_grad_norm", None)
             _agn = float(_agn[0].item()) if _agn is not None else 0.0
-            if _ratio > 0.0 and _agn > 0.0:
-                clip_used = min(clip_used, _ratio * _agn)
+            if fuse:
+                # Single clip over the summed gradient = the actor's own optim
+                # clip_grad. A JEPA-specific ceiling here would be a second trust
+                # region on a loss that no longer has its own step.
+                clip_used = None
+            else:
+                clip_used = self.jepa_cfg.max_grad_norm
+                _ratio = float(_os.environ.get("JEPA_CLIP_RATIO", "0"))
+                if _ratio > 0.0 and _agn > 0.0:
+                    clip_used = min(clip_used, _ratio * _agn)
             # predictor_delta is a plain (non-FSDP) replicated param, not covered by
             # FSDP's own gradient-sync hooks — average its grad across DP ranks
             # manually (no-op when DP size is 1) BEFORE the shared optimizer step
@@ -1357,6 +1481,12 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 _prev_delta = self.predictor_delta.data.clone()  # for ||Δθ|| applied
 
             grad_norm = engine.optimizer_step(clip_grad_override=clip_used)
+            if fuse:
+                # The actor deferred its step, so engine_workers skipped the LR
+                # scheduler too (it is gated on apply_step). Advance it here or the LR
+                # freezes — invisible under the constant schedule this config uses, a
+                # real bug under warmup/cosine.
+                engine.lr_scheduler_step()
 
             pred_pn = 0.0     # delta param norm after the shared step
             pred_max_row = 0.0  # largest per-row delta norm
@@ -1368,17 +1498,29 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             self._sync_ema()
             aggressive_empty_cache(force_sync=True)
             _total_loss_value = jepa_metrics.get("jepa/llm_jepa_loss", 0.0)
+            _gn = float(grad_norm) if grad_norm is not None else 0.0
             out = {
                 "jepa/total_loss": torch.tensor(float(_total_loss_value)),
                 "jepa/n_valid_pairs": torch.tensor(float(n_pairs)),
                 "jepa/skipped": torch.tensor(0.0),
-                "jepa/grad_norm": torch.tensor(float(grad_norm) if grad_norm is not None else 0.0),
-                "jepa/clip_used": torch.tensor(float(clip_used)),
                 "jepa/actor_grad_norm_seen": torch.tensor(float(_agn)),
                 "jepa/pred_embed_grad_norm": torch.tensor(float(pred_gn)),
                 "jepa/pred_embed_norm": torch.tensor(float(pred_pn)),
                 "jepa/pred_embed_max_row_norm": torch.tensor(float(pred_max_row)),
                 "jepa/pred_embed_step_norm": torch.tensor(float(pred_step)),
             }
+            if fuse:
+                # grad_norm here is the PRE-CLIP norm of the SUM, not a JEPA-only norm —
+                # publish it under a distinct key so the jepa/grad_norm series keeps one
+                # meaning (α·JEPA alone) across runs. actor/grad_norm is the exact
+                # policy-only norm measured before the JEPA backward, same definition the
+                # actor's own step reports in two-step mode.
+                out["jepa/fused"] = torch.tensor(1.0)
+                out["jepa/grad_norm_total"] = torch.tensor(_gn)
+                out["actor/grad_norm"] = torch.tensor(float(actor_gn))
+            else:
+                out["jepa/fused"] = torch.tensor(0.0)
+                out["jepa/grad_norm"] = torch.tensor(_gn)
+                out["jepa/clip_used"] = torch.tensor(float(clip_used))
             out.update({k: torch.tensor(float(v)) for k, v in jepa_metrics.items()})
             return TensorDict(out, batch_size=[])

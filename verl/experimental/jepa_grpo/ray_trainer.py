@@ -46,6 +46,88 @@ from verl.utils.profiler.performance import simple_timer
 logger = logging.getLogger(__name__)
 
 
+def _intra_cos(vecs: np.ndarray) -> float:
+    """Mean pairwise cosine WITHIN a class (not vs. a teacher).
+
+    Rising for "correct" means those reads are literally clustering tighter
+    ("sharpening"); flat/falling for "wrong" means they stay dispersed
+    ("suppression": no confident shared direction). Teacher-free, so both the
+    teacher-anchored and rollout-view figures use it.
+    """
+    if len(vecs) < 2:
+        return float("nan")
+    unit = vecs / np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-12)
+    sim = unit @ unit.T
+    off_diag = sim[~np.eye(len(vecs), dtype=bool)]
+    return float(off_diag.mean())
+
+
+def _within_prompt_cos(p: np.ndarray, correct: np.ndarray,
+                       uids: np.ndarray) -> tuple[float, float]:
+    """(mean correct-correct, mean correct-wrong) cosine, WITHIN each prompt.
+
+    The same split the rollout-view loss makes: correct-correct pairs are its
+    positives, correct-wrong pairs its negatives. Cross-prompt pairs are excluded --
+    the loss never sees them, so including them would measure something else.
+    """
+    unit = p / np.maximum(np.linalg.norm(p, axis=1, keepdims=True), 1e-12)
+    pos, neg = [], []
+    for u in np.unique(uids):
+        rows = np.where(uids == u)[0]
+        c, w = rows[correct[rows]], rows[~correct[rows]]
+        if len(c) >= 2:
+            sim = unit[c] @ unit[c].T
+            pos.extend(sim[~np.eye(len(c), dtype=bool)].tolist())
+        if len(c) and len(w):
+            neg.extend((unit[c] @ unit[w].T).ravel().tolist())
+    return (float(np.mean(pos)) if pos else float("nan"),
+            float(np.mean(neg)) if neg else float("nan"))
+
+
+def _separability(p: np.ndarray, correct: np.ndarray,
+                  groups: np.ndarray | None = None) -> tuple[float, float]:
+    """(silhouette, AUROC) of correct-vs-wrong reads from the embeddings alone.
+
+    Does an unsupervised cluster score / a linear probe increasingly tell the two
+    apart? Both -> 1.0 as the representation sharpens. Returns (nan, nan) when one
+    class is missing or sklearn fails.
+
+    The AUROC is HELD OUT (5-fold CV, grouped by prompt when `groups` is given).
+    An in-sample probe is worthless here: d (~1536) >> n (~256), so logistic
+    regression separates any labelling perfectly (measured: in-sample AUROC is
+    exactly 1.000 on real reads at every step). An earlier version fit and scored
+    on the same rows and only looked informative because `max_iter=200` stopped
+    short of convergence -- it was reporting solver iterations, not geometry.
+    Grouping by prompt also stops a prompt's other rollouts leaking its label.
+    """
+    silhouette_cw = float("nan")
+    auroc_cw = float("nan")
+    y = correct.astype(int)
+    if correct.any() and (~correct).any() and len(p) >= 4:
+        try:
+            from sklearn.metrics import silhouette_score
+            silhouette_cw = float(silhouette_score(p, y))
+        except Exception as exc:
+            logger.warning("rep silhouette_score failed: %s", exc)
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.metrics import roc_auc_score
+            from sklearn.model_selection import GroupKFold, StratifiedKFold, cross_val_predict
+            from sklearn.pipeline import make_pipeline
+            from sklearn.preprocessing import StandardScaler
+
+            n_uniq = len(np.unique(groups)) if groups is not None else 0
+            n_splits = min(5, n_uniq) if n_uniq >= 2 else 5
+            cv, kw = ((GroupKFold(n_splits=n_splits), {"groups": groups}) if n_uniq >= 2
+                      else (StratifiedKFold(n_splits=min(5, int(min(np.bincount(y))) or 2)), {}))
+            pipe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000))
+            score = cross_val_predict(pipe, p, y, cv=cv, method="decision_function", **kw)
+            auroc_cw = float(roc_auc_score(y, score))
+        except Exception as exc:
+            logger.warning("rep auroc_cw failed: %s", exc)
+    return silhouette_cw, auroc_cw
+
+
 class JEPARayPPOTrainer(RayPPOTrainer):
     """Ray PPO trainer augmented with LeJEPA representation alignment.
 
@@ -77,7 +159,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # JEPA-vs-baseline comparison (jepa.enable=False) must load them too or its
         # figure would have nothing to compare the student against.
         self.teacher_targets: dict[int, list[str]] | None = None
-        if self.jepa_cfg.enable or self._rep_tsne_enabled:
+        # No path => teacher-free operation. The rep-tsne figure then plots student
+        # reads alone; _fixed_probe still works, since it only needs student reads.
+        if (self.jepa_cfg.enable or self._rep_tsne_enabled) and self.jepa_cfg.teacher_cache_path:
             raw = torch.load(self.jepa_cfg.teacher_cache_path, map_location="cpu")
             self.teacher_targets = {int(k): list(v) for k, v in raw.items() if v}
 
@@ -91,6 +175,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         self._align_best: dict[str, float] = {k: float("-inf") for k in self._off_arm}
         self._align_stall: dict[str, int] = {k: 0 for k in self._off_arm}
         self._collapse_stall = 0
+        self._collapse_recovery_stall = 0
+        self._latest_rep_probe_rank = None
         self._collapse_latched = False
         self._collapse_best_rank = 0.0
 
@@ -425,10 +511,23 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 uniq_view.append(view)
             return pos
 
+        # Teacher-free operation: no cache is loaded, so there are no teacher rows to
+        # pair against — collect student reads only. The caller skips the paired figure
+        # but still runs _fixed_probe on them.
+        teacher_free = not self.teacher_targets
         n_prompts = 0
         for u in dict.fromkeys(uids):
             if max_prompts > 0 and n_prompts >= max_prompts:
                 break
+            sel = rows_by_uid.get(u, [])
+            if not sel:
+                continue
+            if teacher_free:
+                for idx in sel:
+                    anchors.append(idx)
+                    pair_idx.append((-1, -1))
+                n_prompts += 1
+                continue
             ds_idx = idx_by_uid.get(u)
             if ds_idx is None:
                 continue
@@ -436,9 +535,6 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             if not Z_cot:
                 continue
             Z_code = self.code_teacher_targets.get(ds_idx) if self.code_teacher_targets else None
-            sel = rows_by_uid.get(u, [])
-            if not sel:
-                continue
             info = extra_infos[sel[0]]
             problem = info["problem"] if isinstance(info, dict) else str(info)
             cpos = _uniq_target("cot", problem, Z_cot[0])
@@ -448,7 +544,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 pair_idx.append((cpos, kpos))
             n_prompts += 1
 
-        if len(anchors) < 4 or not uniq_rows:
+        if len(anchors) < 4 or (not uniq_rows and not teacher_free):
             return None
 
         def _strip_eos(t: torch.Tensor) -> torch.Tensor:
@@ -464,10 +560,28 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 msk[r, : t.shape[0]] = 1
             return ids, msk, torch.tensor(lens, dtype=torch.long)
 
-        a_ids, a_mask, a_len = _pack(
-            [_strip_eos(all_input_ids[i][all_attn_mask[i].bool()]) for i in anchors]
-        )
-        t_ids, t_mask, t_len = _pack(uniq_rows)
+        # Response-only student reads, matching the training-batch builders
+        # (_build_jepa_batch_llm_jepa / _build_jepa_batch_llm_jepa_infonce) and the
+        # response-only teacher targets already produced by _tokenize_target above.
+        # Reading [prompt+response] here (as before) would plot a student point that
+        # the loss never actually trains on, and would mismatch the now-response-only
+        # teacher points -- exactly the inconsistency that produced the inverted
+        # sep_margin_cot readings in the rep-tsne diagnostic.
+        responses = batch.batch["responses"]
+        resp_len = responses.shape[1]
+        resp_mask = all_attn_mask[:, -resp_len:]
+        prefix = self._template_prefix_ids()
+
+        def _anchor_ids(i: int) -> torch.Tensor:
+            r = _strip_eos(responses[i][resp_mask[i].bool()])
+            if prefix:
+                r = torch.cat([torch.tensor(prefix, dtype=r.dtype, device=r.device), r])
+            return r
+
+        a_ids, a_mask, a_len = _pack([_anchor_ids(i) for i in anchors])
+        # Keep the packed block so the caller can FREEZE it as the fixed probe set
+        # (see _fixed_probe): the same rows must be re-encodable at later steps.
+        self._last_anchor_block = (a_ids, a_mask, a_len)
 
         cot_out = self.actor_rollout_wg.score_cot_embeddings(
             DataProto.from_single_dict({
@@ -476,6 +590,17 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         )
         if isinstance(cot_out, list):
             cot_out = cot_out[0]
+        student_emb = cot_out["cot_emb"].float().numpy()
+        if not uniq_rows:  # teacher-free: student reads only
+            return student_emb, np.zeros((0, student_emb.shape[1]), dtype=student_emb.dtype), {
+                "correct": np.asarray([bool(rew[i] > 0) for i in anchors], dtype=bool),
+                "cot_idx": np.full(len(anchors), -1, dtype=np.int64),
+                "code_idx": np.full(len(anchors), -1, dtype=np.int64),
+                "uids": np.asarray([str(uids[i]) for i in anchors], dtype=object),
+                "target_view": np.asarray([], dtype=object),
+                "n_prompts": n_prompts,
+            }
+        t_ids, t_mask, t_len = _pack(uniq_rows)
         tgt_out = self.actor_rollout_wg.embed_targets(
             DataProto.from_single_dict({
                 "target_input_ids": t_ids, "target_attn_mask": t_mask, "target_lengths": t_len,
@@ -493,6 +618,106 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             "n_prompts": n_prompts,
         }
         return cot_out["cot_emb"].float().numpy(), tgt_out["target_emb"].float().numpy(), meta
+
+    def _fixed_probe(self, meta: dict) -> None:
+        """Correct-vs-wrong probe on a FROZEN rollout set, re-encoded every rep step.
+
+        The per-batch figure confounds two things: "the representation changed" and
+        "this step drew different problems". Measured on the no-JEPA baseline, the
+        batch term alone swings held-out AUROC over 0.53-0.82 with no trend across 130
+        steps -- larger than any effect the JEPA objective is being asked to produce,
+        so a per-batch series cannot resolve one.
+
+        Fix: snapshot one batch's rollouts (token ids + verifier labels) at the first
+        rep step and re-encode those SAME rows with the current weights every time.
+        The texts are frozen, so only the encoder varies and the series is comparable
+        across steps. The rollouts go off-policy as training proceeds -- that is fine
+        and in fact wanted: this measures the representation, not the policy.
+
+        Logged under rep/fixed_* alongside the per-batch rep/* keys, which stay as the
+        visual. Silently no-ops if the snapshot or the encode is unavailable.
+        """
+        block = getattr(self, "_last_anchor_block", None)
+        if block is None:
+            return
+        snap = getattr(self, "_rep_probe_snapshot", None)
+        if snap is None:
+            correct, uids = meta["correct"], meta["uids"]
+            if not (correct.any() and (~correct).any()):
+                return  # a one-class snapshot would pin the probe at chance forever
+            ids, mask, lens = block
+            snap = {"ids": ids.clone(), "mask": mask.clone(), "lens": lens.clone(),
+                    "correct": correct.copy(), "uids": uids.copy(),
+                    "from_step": int(self.global_steps)}
+            self._rep_probe_snapshot = snap
+
+        correct, uids = snap["correct"], snap["uids"]
+
+        def _read_at(frac: float):
+            """Encode the frozen rows TRUNCATED to `frac` of each response and probe them.
+
+            The whole premise of Outcome Anticipation is that the model knows it is on a
+            wrong path EARLY, while it can still act -- so the number that matters is
+            decodability at a partial prefix, not at the finished rollout. Probing only
+            the completed response (frac == 1.0) cannot distinguish "learned to
+            anticipate" from "can label its own finished work", which it already could.
+            """
+            lens = snap["lens"]
+            if frac >= 1.0:
+                use_len, use_mask = lens, snap["mask"]
+            else:
+                use_len = torch.clamp((lens.float() * frac).long(), min=1)
+                ar = torch.arange(snap["mask"].shape[1]).unsqueeze(0)
+                use_mask = (ar < use_len.unsqueeze(1)).to(snap["mask"].dtype)
+            out = self.actor_rollout_wg.score_cot_embeddings(
+                DataProto.from_single_dict({
+                    "cot_input_ids": snap["ids"], "cot_attn_mask": use_mask,
+                    "cot_lengths": use_len,
+                }).to_tensordict()
+            )
+            if isinstance(out, list):
+                out = out[0]
+            return out["cot_emb"].float().numpy()
+
+        payload = {}
+        try:
+            X = None
+            for frac in (0.25, 0.50, 0.75, 1.00):
+                Xf = _read_at(frac)
+                _, auroc_f = _separability(Xf, correct, uids)
+                payload[f"rep/fixed_auroc_at{int(frac * 100)}"] = auroc_f
+                if frac >= 1.0:
+                    X = Xf
+        except Exception as exc:
+            logger.warning("fixed rep probe skipped: %s", exc)
+            return
+
+        sil, auroc = _separability(X, correct, uids)
+        cos_pos, cos_neg = _within_prompt_cos(X, correct, uids)
+        payload.update({
+            "rep/fixed_auroc_cw": auroc,
+            "rep/fixed_silhouette_cw": sil,
+            "rep/fixed_cos_within_correct": cos_pos,
+            "rep/fixed_cos_correct_wrong": cos_neg,
+            "rep/fixed_sep_margin": cos_pos - cos_neg,
+            "rep/fixed_n": int(len(correct)),
+            "rep/fixed_n_correct": int(correct.sum()),
+            "rep/fixed_from_step": int(snap["from_step"]),
+        })
+        if "wandb" in list(self.config.trainer.logger):
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log(payload, step=int(self.global_steps))
+            except Exception as exc:
+                logger.warning("fixed rep probe wandb log failed: %s", exc)
+        print(f"[fixed_probe] step {self.global_steps} "
+              f"auroc@25/50/75/100="
+              f"{payload['rep/fixed_auroc_at25']:.3f}/{payload['rep/fixed_auroc_at50']:.3f}/"
+              f"{payload['rep/fixed_auroc_at75']:.3f}/{payload['rep/fixed_auroc_at100']:.3f} "
+              f"margin={cos_pos - cos_neg:.4f} "
+              f"(frozen at step {snap['from_step']}, n={len(correct)})")
 
     def _maybe_log_train_rep_tsne(self, batch, reward_tensor, view_tags) -> None:
         """Paper-style representation figure (LLM-JEPA arXiv:2509.14252, Fig. 4/6).
@@ -527,9 +752,11 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         freq = max(1, int(cfg.get("rep_tsne_freq", cfg.test_freq)))
         if self.global_steps % freq != 0:
             return
-        if not self.teacher_targets:
-            logger.warning("train representation t-SNE skipped: no teacher CoT cache")
-            return
+        # No teacher-cache gate here on purpose. _collect_rep_groups sets its own
+        # `teacher_free = not self.teacher_targets` and returns student reads with an empty
+        # teacher block, which _fixed_probe handles. The old gate also required a specific
+        # loss_type, which silently disabled the probe for every jepa.enable=False run --
+        # including all 283 steps of the run it was meant to evaluate.
         try:
             got = self._collect_rep_groups(batch, reward_tensor, view_tags)
         except Exception as exc:
@@ -539,6 +766,18 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             logger.warning("train representation t-SNE skipped: too few anchors")
             return
         p, Z, meta = got
+
+        # Exact guard-compatible student-pool effective rank. This probe remains
+        # available while JEPA is off and therefore drives automatic recovery.
+        unit_p = p / np.maximum(np.linalg.norm(p, axis=1, keepdims=True), 1e-12)
+        eig_p = np.maximum(np.linalg.eigvalsh(unit_p @ unit_p.T), 0.0)
+        prob_p = eig_p / max(float(eig_p.sum()), 1e-12)
+        prob_p = prob_p[prob_p > 1e-12]
+        probe_rank = float(np.exp(-(prob_p * np.log(prob_p)).sum()))
+        probe_rank_norm = min(1.0, probe_rank / max(1, min(p.shape)))
+        self._latest_rep_probe_rank = probe_rank_norm
+
+        self._fixed_probe(meta)
 
         import matplotlib.pyplot as plt
         from sklearn.manifold import TSNE
@@ -606,34 +845,24 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     ax.plot([s_proj[k, 0], tgt[0]], [s_proj[k, 1], tgt[1]],
                             color="0.88", lw=.3, zorder=0)
             c_sel = correct[sel]
-            # Density contour per class UNDER the scatter: makes cluster tightening
-            # ("correct sharpens") vs dispersal ("wrong suppressed") visible in the
-            # snapshot itself, not just inferable from separate mean-cosine numbers.
-            def _density_contour(xy: np.ndarray, color: str):
-                if len(xy) < 8:
-                    return
-                counts, xe, ye = np.histogram2d(xy[:, 0], xy[:, 1], bins=18)
-                # cheap 3x3 box-blur (no scipy dependency) so contours aren't jagged.
-                padded = np.pad(counts, 1, mode="edge")
-                smooth = sum(padded[i:i + counts.shape[0], j:j + counts.shape[1]]
-                             for i in range(3) for j in range(3)) / 9.0
-                if smooth.max() <= 0:
-                    return
-                xc = 0.5 * (xe[:-1] + xe[1:]); yc = 0.5 * (ye[:-1] + ye[1:])
-                ax.contour(xc, yc, smooth.T, levels=4, colors=color, alpha=.35, linewidths=.8)
-            _density_contour(s_proj[c_sel], "tab:blue")
+            # Use a restrained blue/green/black palette. Point shape carries the
+            # view/label semantics, while color remains legible in screenshots and
+            # grayscale print. No density contours are overlaid.
+            student_correct = "#2563eb"  # royal blue
+            student_wrong = "#111827"    # near-black charcoal
+            teacher_cot = "#16a34a"      # leaf green
+            teacher_code = "#065f46"     # deep green/teal
+            ax.scatter(s_proj[c_sel, 0], s_proj[c_sel, 1], c=student_correct, marker="o",
+                       s=18, alpha=.82, edgecolors="white", linewidths=.25,
+                       label="student CoT (correct)")
             if include_wrong and (~c_sel).any():
-                _density_contour(s_proj[~c_sel], "tab:red")
-            ax.scatter(s_proj[c_sel, 0], s_proj[c_sel, 1], c="tab:blue", marker="o",
-                       s=14, alpha=.75, label="student CoT (correct)")
-            if include_wrong and (~c_sel).any():
-                ax.scatter(s_proj[~c_sel, 0], s_proj[~c_sel, 1], c="tab:red", marker="x",
-                           s=18, alpha=.75, label="student CoT (incorrect)")
-            ax.scatter(cot_proj[:, 0], cot_proj[:, 1], c="tab:green", marker="^",
-                       s=44, edgecolors="k", linewidths=.4, label="teacher CoT")
+                ax.scatter(s_proj[~c_sel, 0], s_proj[~c_sel, 1], c=student_wrong, marker="x",
+                           s=24, alpha=.88, linewidths=.9, label="student CoT (incorrect)")
+            ax.scatter(cot_proj[:, 0], cot_proj[:, 1], c=teacher_cot, marker="^",
+                       s=48, edgecolors="#052e16", linewidths=.45, label="teacher CoT")
             if len(code_proj):
-                ax.scatter(code_proj[:, 0], code_proj[:, 1], c="tab:orange", marker="s",
-                           s=44, edgecolors="k", linewidths=.4, label="teacher Code")
+                ax.scatter(code_proj[:, 0], code_proj[:, 1], c=teacher_code, marker="s",
+                           s=48, edgecolors="#022c22", linewidths=.45, label="teacher Code")
             ax.set_title(title, fontsize=10)
             ax.set_xticks([]); ax.set_yticks([])
             ax.legend(fontsize=7, loc="best")
@@ -643,7 +872,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         _panel(ax_b, True, "(b) + incorrect student CoT")
         fig.suptitle(
             f"Representations — step {self.global_steps} "
-            f"(k={self.jepa_cfg.predictor_k}, jepa={'on' if self.jepa_cfg.enable else 'off'})"
+            f"(k={self.jepa_cfg.predictor_k}, jepa={'on' if self.jepa_cfg.enable and not self._jepa_signal_off else 'off'})"
         )
         fig.tight_layout()
         png = stem + ".png"
@@ -696,18 +925,6 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         def _m(v):
             return float(v.mean()) if len(v) else float("nan")
 
-        def _intra_cos(vecs: np.ndarray) -> float:
-            # Mean pairwise cosine WITHIN a class (not vs. teacher) — rising for
-            # "correct" means those reads are literally clustering tighter
-            # ("sharpening"); flat/falling for "wrong" means they stay dispersed
-            # ("suppression": no confident shared direction).
-            if len(vecs) < 2:
-                return float("nan")
-            unit = vecs / np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-12)
-            sim = unit @ unit.T
-            off_diag = sim[~np.eye(len(vecs), dtype=bool)]
-            return float(off_diag.mean())
-
         sep_margin_cot = _m(cos_cot[correct]) - _m(cos_cot[~correct])
         sep_margin_code = (
             (_m(cos_code[correct]) - _m(cos_code[~correct])) if len(cos_code) else float("nan")
@@ -715,25 +932,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         intra_cos_correct = _intra_cos(p[correct])
         intra_cos_wrong = _intra_cos(p[~correct])
 
-        # Quantitative separability: does a simple classifier (or an unsupervised
-        # cluster-quality score) increasingly tell correct/wrong reads apart from
-        # their raw embeddings alone? Both -> 1.0 as training sharpens/suppresses.
-        silhouette_cw = float("nan")
-        auroc_cw = float("nan")
-        if correct.any() and (~correct).any() and len(p) >= 4:
-            try:
-                from sklearn.metrics import silhouette_score
-                silhouette_cw = float(silhouette_score(p, correct.astype(int)))
-            except Exception as exc:
-                logger.warning("rep silhouette_score failed: %s", exc)
-            try:
-                from sklearn.linear_model import LogisticRegression
-                from sklearn.metrics import roc_auc_score
-                clf = LogisticRegression(max_iter=200).fit(p, correct.astype(int))
-                scores = clf.decision_function(p)
-                auroc_cw = float(roc_auc_score(correct.astype(int), scores))
-            except Exception as exc:
-                logger.warning("rep auroc_cw failed: %s", exc)
+        silhouette_cw, auroc_cw = _separability(p, correct, meta["uids"])
 
         summary = {
             "step": int(self.global_steps),
@@ -1071,6 +1270,29 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         self._template_suffix_cache = list(sfx)
         return self._template_suffix_cache
 
+    def _template_prefix_ids(self) -> list:
+        """Token ids of the chat template's constant assistant-message HEADER.
+
+        The mirror of ``_template_suffix_ids``: diff a marker assistant rendering
+        to recover the constant prefix before the content (Qwen:
+        ``<|im_start|>assistant\\n``). Prepended to response-only student anchor
+        reads so they carry the SAME wrapper the teacher targets already get via
+        ``_tokenize_target``'s ``messages[2:3]`` rendering — putting both views on
+        identical footing. The header is constant across rows, so it adds no
+        per-problem signal; it only removes the student/teacher wrapper mismatch.
+        """
+        cached = getattr(self, "_template_prefix_cache", None)
+        if cached is not None:
+            return cached
+        marker = "XQZV"
+        rendered = self.tokenizer.apply_chat_template(
+            [{"role": "assistant", "content": marker}], tokenize=False, add_generation_prompt=False
+        )
+        head = rendered.split(marker, 1)[0] if marker in rendered else ""
+        pfx = self.tokenizer(head, add_special_tokens=False)["input_ids"] if head else []
+        self._template_prefix_cache = list(pfx)
+        return self._template_prefix_cache
+
     def _tokenize_target(self, problem_text: str, resp_text: str, view: str) -> torch.Tensor:
         """Tokenize the verified-correct teacher target view for online z^+ recompute.
 
@@ -1087,7 +1309,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         message + response) — the policy encodes these ids (last-real-token,
         normalized) at train time; there are no cached latents.
         """
-        llm_jepa = self.jepa_cfg.loss_type == "llm-jepa"
+        # Response-only (paper-exact view isolation): the target is the teacher
+        # response ALONE, no prompt (messages[2:3]). All discriminative siblings
+        # (infoNCE/geometry/triplet) join 'llm-jepa' here so their teacher reads are
+        # response-only too — matching the response-only student anchors and letting
+        # the correct/wrong contrast measure reasoning, not the shared prompt.
+        llm_jepa = self.jepa_cfg.loss_type in (
+            "llm-jepa", "llm-jepa-infoNCE", "llm-jepa-geometry", "llm-jepa-triplet")
         cache_key = ("" if llm_jepa else problem_text, resp_text, view)
         hit = self._tok_target_cache.get(cache_key)
         if hit is not None:
@@ -1437,7 +1665,26 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         def _strip_eos(t: torch.Tensor) -> torch.Tensor:
             return t[:-1] if (eos_id is not None and t.shape[0] > 1 and int(t[-1]) == eos_id) else t
 
-        ids_list = [_strip_eos(all_input_ids[i][all_attn_mask[i].bool()]) for i in anchors]
+        # Paper-exact view isolation: Enc(student Text) must encode the RESPONSE
+        # alone, not [prompt + response]. Reading the last token of the full rollout
+        # lets the causal read attend over the shared prompt, collapsing student
+        # (and correct/wrong) reads onto a per-problem point and mismatching the
+        # response-only teacher target it is aligned to (see _tokenize_target's
+        # llm_jepa branch). Slice the response span off the rollout and prepend the
+        # constant assistant header so the student read carries the same wrapper as
+        # the teacher's messages[2:3] rendering.
+        responses = batch.batch["responses"]
+        resp_len = responses.shape[1]
+        resp_mask = all_attn_mask[:, -resp_len:]
+        prefix = self._template_prefix_ids()
+
+        def _resp_ids(i: int) -> torch.Tensor:
+            r = _strip_eos(responses[i][resp_mask[i].bool()])
+            if prefix:
+                r = torch.cat([torch.tensor(prefix, dtype=r.dtype, device=r.device), r])
+            return r
+
+        ids_list = [_resp_ids(i) for i in anchors]
         lengths = [int(t.shape[0]) for t in ids_list]
         max_len = max(lengths)
         anchor_ids = torch.full((R, max_len), pad_id, dtype=all_input_ids.dtype)
@@ -1652,25 +1899,20 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         reward_tensor: torch.Tensor,
         view_tags: np.ndarray,
     ) -> DataProto | None:
-        """Build the llm-jepa-infoNCE batch (loss_type='llm-jepa-infoNCE').
+        """Build the shared InfoNCE/geometry batch from mixed CoT rollouts.
 
-        Data-selection rule (not loss weighting): only MIXED prompts — those with at
-        least one correct AND one wrong CoT rollout — contribute. Each mixed prompt
-        ships min(n_correct, n_wrong) disjoint (y+, y-) pairs (uniform random
-        matching), all sharing one uniformly sampled verified teacher CoT solution
-        t+_cot and, when the code teacher cache has one, one uniformly sampled
-        teacher Code solution t+_code (second anchored view in the loss). All-good
-        and all-wrong prompts ship nothing (they still feed GRPO).
+        Each mixed prompt contributes matched correct/wrong student pairs and one
+        verified teacher CoT target. Geometry additionally requires one verified
+        teacher Code target; InfoNCE may use CoT alone. All-good and all-wrong
+        prompts still feed GRPO but do not contribute to this auxiliary batch.
 
-        Ships ONE anchor block of 2M rows — the M positive rollouts first (read via
-        <|predictor_i|>), then their M negatives (read via <|bad_predictor_i|>) — and
-        ONE target block
-        of deduplicated teacher rows (CoT and Code mixed) with per-pair gather
-        indices (tgt_cot_idx, tgt_code_idx; -1 = no code view). The worker encodes
-        targets with the EMA encoder under no_grad (z+ = sg(f_EMA)).
-        Returns None if fewer than min_valid_pairs mixed prompts.
+        The batch contains one correct/wrong student block and one deduplicated
+        teacher-target block with per-pair gather indices. In the geometry loss,
+        both teacher reads are detached stop-gradient anchors.
         """
         assert self.teacher_targets is not None, "CoT teacher target cache not loaded"
+        if self.jepa_cfg.loss_type == "llm-jepa-geometry":
+            assert self.code_teacher_targets is not None, "Code teacher target cache not loaded"
         uids = batch.non_tensor_batch["uid"]
         extra_infos = batch.non_tensor_batch["extra_info"]
         rew = reward_tensor.sum(dim=-1)
@@ -1678,7 +1920,6 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         all_attn_mask = batch.batch["attention_mask"]
         pad_id = self.tokenizer.pad_token_id or 0
         eos_id = self.tokenizer.eos_token_id
-
         rows_by_uid: dict = defaultdict(list)
         idx_by_uid: dict = {}
         prob_by_uid: dict = {}
@@ -1694,8 +1935,21 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         def _strip_eos(t: torch.Tensor) -> torch.Tensor:
             return t[:-1] if (eos_id is not None and t.shape[0] > 1 and int(t[-1]) == eos_id) else t
 
+        # Response-only student reads (paper view isolation): slice the response span
+        # off the rollout and prepend the constant assistant header so p+/p- match the
+        # response-only teacher targets. Encoding [prompt+response] would glue correct
+        # and wrong reads onto a per-problem point and the contrast could not separate
+        # them (see _build_jepa_batch_llm_jepa and the geometry-run diagnosis).
+        responses = batch.batch["responses"]
+        resp_len = responses.shape[1]
+        resp_mask = all_attn_mask[:, -resp_len:]
+        prefix = self._template_prefix_ids()
+
         def _rollout_ids(i: int) -> torch.Tensor:
-            return _strip_eos(all_input_ids[i][all_attn_mask[i].bool()])
+            r = _strip_eos(responses[i][resp_mask[i].bool()])
+            if prefix:
+                r = torch.cat([torch.tensor(prefix, dtype=r.dtype, device=r.device), r])
+            return r
 
         def _pick(idxs: list) -> int:
             return idxs[int(torch.randint(len(idxs), (1,)).item())]
@@ -1733,6 +1987,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             pos = _uniq("cot", problem, Z_cot[_pick(range(len(Z_cot)))])
             code_targets = getattr(self, "code_teacher_targets", None)
             Z_code = code_targets.get(ds_idx) if code_targets else None
+            if self.jepa_cfg.loss_type == "llm-jepa-geometry" and not Z_code:
+                continue  # geometry defines teacher as the paired CoT+Code views
             cpos = _uniq("code", problem, Z_code[_pick(range(len(Z_code)))]) if Z_code else -1
             k = min(len(correct), len(wrong))
             cperm = [correct[j] for j in torch.randperm(len(correct)).tolist()[:k]]
@@ -1780,6 +2036,145 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         jepa_batch.meta_info["n_unique_targets"] = U
         jepa_batch.meta_info["n_mixed_prompts"] = n_mixed_prompts
         jepa_batch.meta_info["pairs_per_prompt"] = M / max(n_mixed_prompts, 1)
+        return jepa_batch
+
+    def _build_jepa_batch_hgrpo(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> DataProto | None:
+        """Build the H-GRPO batch: WHOLE rollout groups, not matched pairs.
+
+        The sibling ``_build_jepa_batch_llm_jepa_infonce`` emits ``min(|correct|,|wrong|)``
+        matched pairs per mixed prompt. H-GRPO's softmax is defined over the group, so
+        every rollout of a contributing prompt is emitted as one row carrying its verifier
+        label and a compact prompt id, plus ONE teacher CoT anchor per prompt.
+
+        Two group-level filters, both forced by the objective (see core_algos.hgrpo_loss):
+          * ALL-WRONG prompts are KEPT. They are dead weight for every pairwise arm, but
+            the virtual teacher member (score 1, label 1) gives their rollouts a negative
+            advantage, so they are exactly the case the group formulation buys.
+          * ALL-CORRECT prompts are DROPPED. With the teacher member every label is 1, so
+            sigma = 0 and A == 0 -- they would cost two forward passes for a zero gradient.
+
+        Student reads are response-only with the constant assistant header prepended,
+        matching the response-only teacher targets, for the same reason the sibling
+        builders do it: encoding [prompt+response] glues every rollout of a prompt onto one
+        per-problem point and no within-group contrast can separate them.
+        """
+        assert self.teacher_targets is not None, "CoT teacher target cache not loaded"
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+        eos_id = self.tokenizer.eos_token_id
+        rows_by_uid: dict = defaultdict(list)
+        idx_by_uid: dict = {}
+        prob_by_uid: dict = {}
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v != "cot":
+                continue
+            rows_by_uid[u].append(i)
+            if u not in idx_by_uid:
+                info = extra_infos[i]
+                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
+                prob_by_uid[u] = info["problem"] if isinstance(info, dict) else str(info)
+
+        def _strip_eos(t: torch.Tensor) -> torch.Tensor:
+            return t[:-1] if (eos_id is not None and t.shape[0] > 1 and int(t[-1]) == eos_id) else t
+
+        responses = batch.batch["responses"]
+        resp_len = responses.shape[1]
+        resp_mask = all_attn_mask[:, -resp_len:]
+        prefix = self._template_prefix_ids()
+
+        def _rollout_ids(i: int) -> torch.Tensor:
+            r = _strip_eos(responses[i][resp_mask[i].bool()])
+            if prefix:
+                r = torch.cat([torch.tensor(prefix, dtype=r.dtype, device=r.device), r])
+            return r
+
+        def _pick(idxs) -> int:
+            idxs = list(idxs)
+            return idxs[int(torch.randint(len(idxs), (1,)).item())]
+
+        uniq_pos: dict = {}
+        uniq_rows: list[torch.Tensor] = []
+        student_rows: list[torch.Tensor] = []
+        student_label: list[float] = []
+        student_group: list[int] = []
+        tgt_idx: list[int] = []          # teacher row per GROUP (not per student row)
+        n_groups = 0
+        n_allwrong = 0
+
+        def _uniq(view: str, problem: str, text: str) -> int:
+            key = (view, text)
+            pos = uniq_pos.get(key)
+            if pos is None:
+                pos = len(uniq_rows)
+                uniq_pos[key] = pos
+                uniq_rows.append(self._tokenize_target(problem, text, view))
+            return pos
+
+        for u in dict.fromkeys(uids):
+            rows = [i for i in rows_by_uid.get(u, []) if int(all_attn_mask[i].sum()) > 0]
+            if not rows:
+                continue
+            labels = [1.0 if rew[i] > 0 else 0.0 for i in rows]
+            if all(v > 0.5 for v in labels):
+                continue  # all-correct: sigma = 0 => A == 0, nothing to learn
+            ds_idx = idx_by_uid.get(u)
+            Z_cot = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
+            if not Z_cot:
+                continue  # no anchor => no score
+            problem = prob_by_uid.get(u, "")
+            tgt_idx.append(_uniq("cot", problem, Z_cot[_pick(range(len(Z_cot)))]))
+            for i, c in zip(rows, labels):
+                student_rows.append(_rollout_ids(i))
+                student_label.append(c)
+                student_group.append(n_groups)
+            if not any(v > 0.5 for v in labels):
+                n_allwrong += 1
+            n_groups += 1
+
+        M = len(student_rows)
+        if M < self.jepa_cfg.min_valid_pairs or n_groups == 0:
+            return None
+        U = len(uniq_rows)
+        R = max(M, U)
+
+        def _pack(rows: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+            lengths = [int(t.shape[0]) for t in rows]
+            width = max(lengths) if rows else 1
+            ids = torch.full((R, width), pad_id, dtype=batch.batch["input_ids"].dtype)
+            mask = torch.zeros((R, width), dtype=torch.long)
+            for r, t in enumerate(rows):
+                ids[r, : t.shape[0]] = t
+                mask[r, : t.shape[0]] = 1
+            return ids, mask, lengths
+
+        anchor_ids, anchor_mask, anchor_len = _pack(student_rows)
+        target_ids, target_mask, target_len = _pack(uniq_rows)
+
+        jepa_batch = DataProto.from_single_dict({
+            "anchor_input_ids": anchor_ids,
+            "anchor_attn_mask": anchor_mask,
+            "anchor_lengths": torch.tensor(anchor_len + [0] * (R - M), dtype=torch.long),
+            "target_input_ids": target_ids,
+            "target_attn_mask": target_mask,
+            "target_lengths": torch.tensor(target_len + [0] * (R - U), dtype=torch.long),
+            # one teacher row per GROUP, padded to R with -1
+            "tgt_cot_idx": torch.tensor(tgt_idx + [-1] * (R - n_groups), dtype=torch.long),
+            "student_label": torch.tensor(student_label + [0.0] * (R - M), dtype=torch.float),
+            "student_group_id": torch.tensor(student_group + [-1] * (R - M), dtype=torch.long),
+        })
+        jepa_batch.meta_info["n_anchors"] = M
+        jepa_batch.meta_info["n_unique_targets"] = U
+        jepa_batch.meta_info["n_groups"] = n_groups
+        jepa_batch.meta_info["n_allwrong_groups"] = n_allwrong
+        jepa_batch.meta_info["rollouts_per_group"] = M / max(n_groups, 1)
         return jepa_batch
 
     # ------------------------------------------- TCR reward shaping (idea #2) -
@@ -2070,41 +2465,75 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         metrics["jepa/signal_off"] = float(self._jepa_signal_off)
 
     def _maybe_guard_representation_collapse(self, metrics: dict) -> None:
-        """Stop the geometry auxiliary after sustained low representation rank.
+        """Temporarily disable geometry on collapse and re-enable after recovery.
 
-        SIGReg continuously pushes against collapse. This is the last-resort circuit
-        breaker: after warmup, only consecutive unhealthy representation batches
-        advance the counter; a healthy batch resets it. Once patience is exhausted,
-        JEPA is latched off while the ordinary GRPO policy update continues.
+        Active JEPA uses its per-update student-pool effective rank. After collapse
+        patience fires, GRPO continues alone and the independent t-SNE probe supplies
+        the same rank statistic every ``rep_tsne_freq`` steps. Consecutive healthy
+        probes re-enable JEPA; an unhealthy probe resets recovery patience.
         """
         cfg = self.jepa_cfg
+        recovery_patience = int(getattr(cfg, "collapse_reenable_patience", 2))
+        self._collapse_recovery_stall = int(getattr(self, "_collapse_recovery_stall", 0))
         metrics["jepa/collapse_stall"] = float(self._collapse_stall)
+        metrics["jepa/collapse_recovery_stall"] = float(self._collapse_recovery_stall)
         metrics["jepa/collapse_latched"] = float(self._collapse_latched)
         if (not cfg.enable or cfg.loss_type != "llm-jepa-geometry"
-                or not cfg.collapse_guard_enable or self._collapse_latched):
+                or not cfg.collapse_guard_enable):
             return
-        value = metrics.get("jepa/effective_rank_norm")
-        if value is None or self.global_steps < cfg.collapse_warmup_steps:
-            return
-        value = float(value)
-        self._collapse_best_rank = max(self._collapse_best_rank, value)
+
         relative_floor = self._collapse_best_rank * cfg.collapse_rank_fraction_of_best
         threshold = max(cfg.collapse_effective_rank_min, relative_floor)
-        unhealthy = value < threshold
-        self._collapse_stall = self._collapse_stall + 1 if unhealthy else 0
-        if self._collapse_stall >= cfg.collapse_patience:
-            self._collapse_latched = True
-            self._jepa_signal_off = True
-            logger.warning(
-                "[jepa] representation collapse guard fired: normalized effective "
-                "rank %.4f stayed below %.4f (best %.4f) for %d updates; "
-                "disabling JEPA while GRPO continues",
-                value, threshold, self._collapse_best_rank, self._collapse_stall,
-            )
         metrics["jepa/collapse_best_rank"] = self._collapse_best_rank
         metrics["jepa/collapse_threshold"] = threshold
-        metrics["jepa/collapse_unhealthy"] = float(unhealthy)
+
+        if self._collapse_latched:
+            probe = getattr(self, "_latest_rep_probe_rank", None)
+            if probe is None:
+                metrics["jepa/signal_off"] = float(self._jepa_signal_off)
+                return
+            self._latest_rep_probe_rank = None
+            probe = float(probe)
+            healthy = probe >= threshold
+            self._collapse_recovery_stall = self._collapse_recovery_stall + 1 if healthy else 0
+            metrics["jepa/recovery_effective_rank_norm"] = probe
+            metrics["jepa/collapse_recovery_healthy"] = float(healthy)
+            if self._collapse_recovery_stall >= recovery_patience:
+                self._collapse_latched = False
+                self._jepa_signal_off = False
+                self._collapse_stall = 0
+                self._collapse_recovery_stall = 0
+                logger.warning(
+                    "[jepa] representation recovered: probe rank %.4f >= %.4f for %d probes; re-enabling JEPA",
+                    probe, threshold, recovery_patience,
+                )
+        else:
+            # Do not carry an active-mode t-SNE probe into a later recovery window.
+            self._latest_rep_probe_rank = None
+            value = metrics.get("jepa/effective_rank_norm")
+            if value is None or self.global_steps < cfg.collapse_warmup_steps:
+                return
+            value = float(value)
+            self._collapse_best_rank = max(self._collapse_best_rank, value)
+            relative_floor = self._collapse_best_rank * cfg.collapse_rank_fraction_of_best
+            threshold = max(cfg.collapse_effective_rank_min, relative_floor)
+            unhealthy = value < threshold
+            self._collapse_stall = self._collapse_stall + 1 if unhealthy else 0
+            if self._collapse_stall >= cfg.collapse_patience:
+                self._collapse_latched = True
+                self._jepa_signal_off = True
+                self._collapse_recovery_stall = 0
+                logger.warning(
+                    "[jepa] representation collapse guard fired: normalized effective rank %.4f stayed below %.4f "
+                    "(best %.4f) for %d updates; disabling JEPA while GRPO continues",
+                    value, threshold, self._collapse_best_rank, self._collapse_stall,
+                )
+            metrics["jepa/collapse_unhealthy"] = float(unhealthy)
+
+        metrics["jepa/collapse_best_rank"] = self._collapse_best_rank
+        metrics["jepa/collapse_threshold"] = threshold
         metrics["jepa/collapse_stall"] = float(self._collapse_stall)
+        metrics["jepa/collapse_recovery_stall"] = float(self._collapse_recovery_stall)
         metrics["jepa/collapse_latched"] = float(self._collapse_latched)
         metrics["jepa/signal_off"] = float(self._jepa_signal_off)
 
@@ -2123,6 +2552,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             "align_best": {k: (None if v == float("-inf") else v) for k, v in self._align_best.items()},
             "align_stall": self._align_stall,
             "collapse_stall": self._collapse_stall,
+            "collapse_recovery_stall": self._collapse_recovery_stall,
             "collapse_latched": self._collapse_latched,
             "collapse_best_rank": self._collapse_best_rank,
         }
@@ -2147,6 +2577,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     {k: (float("-inf") if v is None else float(v)) for k, v in state["align_best"].items()}
                 )
                 self._collapse_stall = int(state.get("collapse_stall", 0))
+                self._collapse_recovery_stall = int(state.get("collapse_recovery_stall", 0))
                 self._collapse_latched = bool(state.get("collapse_latched", False))
                 self._collapse_best_rank = float(state.get("collapse_best_rank", 0.0))
                 self._align_stall.update({k: int(v) for k, v in state["align_stall"].items()})
@@ -2413,7 +2844,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 # FSDP is warm here, so the forward-only embedding pass is memory-safe.
                 # beta == 0 disables shaping mathematically; skip the whole
                 # forward-only embedding pass it would otherwise still pay for.
-                if self.jepa_cfg.enable and not self._jepa_signal_off and float(self.jepa_cfg.tcr_reward_beta) != 0.0:
+                # ...and skip it outright with no teacher cache loaded: the term scores
+                # rollouts against cached teacher solutions, so with no cache there is
+                # nothing to shape toward.
+                if (self.jepa_cfg.enable and not self._jepa_signal_off
+                        and float(self.jepa_cfg.tcr_reward_beta) != 0.0
+                        and self.teacher_targets):
                     with simple_timer("tcr_reward_shaping", timing_raw):
                         view_tags_s = batch.non_tensor_batch["view"]
                         shape_per_row, shaping_metrics = self._compute_tcr_reward_shaping(
@@ -2479,7 +2915,14 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                                 reward_tensor=reward_tensor,
                                 view_tags=view_tags,
                             )
-                        elif self.jepa_cfg.loss_type in ("llm-jepa-infoNCE", "llm-jepa-geometry"):
+                        elif self.jepa_cfg.loss_type == "h-grpo":
+                            jepa_batch = self._build_jepa_batch_hgrpo(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
+                        elif self.jepa_cfg.loss_type in (
+                            "llm-jepa-infoNCE", "llm-jepa-geometry", "llm-jepa-triplet"):
                             jepa_batch = self._build_jepa_batch_llm_jepa_infonce(
                                 batch=batch,
                                 reward_tensor=reward_tensor,
@@ -2535,16 +2978,41 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 self._log_gpu_mem("after_old_log_prob")
 
                 # ── Step 4: GRPO actor update ────────────────────────────
-                # The actor takes its OWN complete optimizer step here (policy grad
-                # applied + FSDP grad finalize). The JEPA update (Step 5) then takes a
-                # SECOND, separate step for the auxiliary grad. Two sequential steps —
-                # NOT a fused single step: the earlier "defer the policy step and fuse
-                # it into jepa_update" scheme silently DROPPED the policy gradient,
-                # because FSDP stashes a deferred (un-stepped) grad in its sharded
-                # internal buffer and never materialises it onto .grad for jepa_update
-                # to add to. θ → θ−lr·g_policy → θ−lr·α·g_JEPA; at this lr the two-step
-                # update is indistinguishable from the summed-loss single step.
+                # DEFAULT (jepa.fuse_optimizer_step=False): the actor takes its OWN
+                # complete optimizer step here (policy grad applied + FSDP grad
+                # finalize), and the JEPA update (Step 5) takes a SECOND, separate step
+                # for the auxiliary grad. θ → θ−lr·g_policy → θ−lr·α·g_JEPA.
+                #
+                # FUSED (jepa.fuse_optimizer_step=True): the actor's step is DEFERRED
+                # (apply_step=False leaves the policy grad resident on .grad) and
+                # jepa_update accumulates α·g_JEPA onto it, then issues ONE step over
+                # the sum — the paper's L_GRPO + α·L_JEPA semantics, with one Adam
+                # moment update, one weight decay and one clip per iteration.
+                # An earlier attempt at this reported that FSDP stashes the deferred
+                # grad in a sharded internal buffer without materialising it onto
+                # .grad, which would silently DROP the policy update; worker.jepa_update
+                # therefore asserts the resident grad norm is non-zero before stepping,
+                # turning that failure mode from silent corruption into a hard error.
+                fuse_steps = bool(
+                    jepa_active
+                    and jepa_batch is not None
+                    and self.jepa_cfg.fuse_optimizer_step
+                )
+                if self.jepa_cfg.fuse_optimizer_step and not _single_opt_step:
+                    # Not an optimization — a correctness precondition: the engine
+                    # zeroes grad at the top of EVERY mini-batch (BaseEngine.train_batch),
+                    # so with >1 mini-batch or >1 epoch a deferred step would retain only
+                    # the last mini-batch's gradient.
+                    fuse_steps = False
+                    print(
+                        "[fuse_optimizer_step] disabled: requires ppo_epochs==1 and "
+                        f"ppo_mini_batch_size ({actor_cfg.ppo_mini_batch_size}) >= "
+                        f"train_batch_size ({self.config.data.train_batch_size}); "
+                        "falling back to two sequential optimizer steps."
+                    )
                 with simple_timer("update_actor", timing_raw):
+                    if fuse_steps:
+                        batch.meta_info["defer_optimizer_step"] = True
                     actor_output = self._update_actor(batch)
                     actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_metrics)
@@ -2576,6 +3044,11 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                             jepa_td["actor_grad_norm"] = torch.full(
                                 (jepa_td.batch_size[0],), _actor_gn
                             )
+                            # Fused mode: the policy grad is resident but UN-stepped;
+                            # jepa_update owns the single combined optimizer step.
+                            jepa_td["fuse_optimizer_step"] = torch.full(
+                                (jepa_td.batch_size[0],), float(fuse_steps)
+                            )
                             # Per-arm plateau latches -> worker zeroes the disabled align
                             # term's gradient (preds still feed SIGReg). dual mode only.
                             if self.jepa_cfg.loss_type in ("llm-jepa", "jepa-tcr-dual", "jepa-tcr-cot"):
@@ -2599,6 +3072,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                             if "n_mixed_prompts" in jepa_batch.meta_info:
                                 metrics["jepa/n_mixed_prompts"] = float(jepa_batch.meta_info["n_mixed_prompts"])
                                 metrics["jepa/pairs_per_prompt"] = float(jepa_batch.meta_info["pairs_per_prompt"])
+                            if "n_groups" in jepa_batch.meta_info:
+                                metrics["jepa/n_groups"] = float(jepa_batch.meta_info["n_groups"])
+                                metrics["jepa/rollouts_per_group"] = float(jepa_batch.meta_info["rollouts_per_group"])
                     else:
                         metrics["jepa/skipped"] = 1.0
                         metrics["jepa/n_valid_pairs"] = 0.0

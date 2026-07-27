@@ -258,6 +258,11 @@ class BaseEngineCtx:
         self.mode = mode
         assert self.mode in ("train", "eval")
         self.disable_auto_offload = kwargs.pop("disable_auto_offload", False)
+        # keep_grad=True suppresses the zero_grad() that the train-mode context normally
+        # performs on exit, so a caller that ran train_batch(apply_step=False) still finds
+        # its accumulated gradient on .grad afterwards and can add a second backward pass
+        # before issuing ONE combined optimizer step. Default False = unchanged behavior.
+        self.keep_grad = kwargs.pop("keep_grad", False)
 
     def _context_switch(self, device):
         if self.disable_auto_offload:

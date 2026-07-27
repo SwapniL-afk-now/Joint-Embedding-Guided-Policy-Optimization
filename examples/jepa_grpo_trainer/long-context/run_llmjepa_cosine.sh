@@ -1,14 +1,15 @@
 #!/bin/bash
 cd /workspace/Joint-Embedding-Guided-Policy-Optimization
 export WANDB_ENTITY=ismamnurswapnil-bangladesh-university-of-engineering-and
-# predictor_k=0 (identity predictor: every read is the final content token).
-# Correct student responses are attracted to both cached teacher CoT and Code;
-# both teacher views are stop-gradient anchors. Wrong student responses are
-# repelled from both teachers and the correct student. Student-only SIGReg plus
-# effective-rank patience protect representation diversity.
-# SIGReg plus effective-rank patience protect representation diversity.
-# PREDICTOR_EMBED_LR/WD are dead vars (predictor now trains via the actor's
-# own optimizer, see run_infonce_predinopt.sh) — omitted here too.
+# Paper-exact LLM-JEPA cosine loss (arXiv:2509.14252 / official finetune.py):
+#   L = (1 - cos(Pred(Enc(student CoT)), Enc(teacher CoT)))
+#     + (1 - cos(Pred(Enc(student CoT)), Enc(teacher Code)))
+# CORRECT student responses only (jepa_anchor_set=correct). NO stop-grad on the
+# targets (tied-weights, single differentiable forward). predictor_k=0 => Pred=id.
+# Reads are RESPONSE-ONLY on both sides now: teacher via _tokenize_target's
+# messages[2:3] path, student via the response-span slice in _build_jepa_batch_llm_jepa
+# (+ constant assistant header for wrapper symmetry). No SIGReg / collapse guard /
+# geometry margins — the paper loss has none.
 exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.main_ray \
   --config-name \
   jepa_grpo_ray_qwen25_1_5b \
@@ -68,18 +69,7 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   jepa.embed_micro_batch_size=8 \
   jepa.target_max_length=4096 \
   jepa.min_valid_pairs=1 \
-  jepa.loss_type=llm-jepa-geometry \
-  +jepa.geometry_tau=0.1 \
-  +jepa.geometry_margin=0.1 \
-  +jepa.geometry_align_weight=1.0 \
-  +jepa.geometry_wrong_teacher_weight=1.0 \
-  +jepa.geometry_wrong_correct_weight=1.0 \
-  +jepa.collapse_guard_enable=True \
-  +jepa.collapse_effective_rank_min=0.003 \
-  +jepa.collapse_rank_fraction_of_best=0.5 \
-  +jepa.collapse_patience=10 \
-  +jepa.collapse_reenable_patience=10 \
-  +jepa.collapse_warmup_steps=20 \
+  jepa.loss_type=llm-jepa \
   jepa.predictor_k=0 \
   jepa.alpha_warmup_steps=20 \
   jepa.max_grad_norm=0.5 \
@@ -89,18 +79,7 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   jepa.tcr_match=cycle \
   jepa.max_anchors_per_prompt=2 \
   jepa.jepa_anchor_set=correct \
-  jepa.tcr_reward_beta=0 \
-  jepa.tcr_reward_sigma_floor=0.1 \
-  jepa.triplet_sigreg_lambda=0.1 \
-  jepa.n_projections=1024 \
-  jepa.t_min=-5.0 \
-  jepa.t_max=5.0 \
-  jepa.epps_pulley_s=1.0 \
   jepa.auto_off_enable=False \
-  jepa.auto_off_patience=10 \
-  jepa.auto_off_min_delta=0.002 \
-  jepa.auto_off_warmup_steps=20 \
-  jepa.auto_off_min_cos=0.0 \
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576 \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -114,8 +93,8 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   trainer.critic_warmup=0 \
   trainer.logger=["console","wandb"] \
   trainer.project_name=grpo-qwen-3b \
-  trainer.experiment_name=geometry-cot-code-stopgrad-fresh-reenable-Qwen2.5-3B-Instruct-20260722 \
-  trainer.default_local_dir=checkpoints/grpo-qwen-3b/geometry-cot-code-stopgrad-fresh-reenable-Qwen2.5-3B-Instruct-20260722 \
+  trainer.experiment_name=llmjepa-cosine-responseonly-Qwen2.5-3B-Instruct-20260723 \
+  trainer.default_local_dir=checkpoints/grpo-qwen-3b/llmjepa-cosine-responseonly-Qwen2.5-3B-Instruct-20260723 \
   trainer.resume_mode=disable \
   trainer.n_gpus_per_node=2 \
   trainer.nnodes=1 \

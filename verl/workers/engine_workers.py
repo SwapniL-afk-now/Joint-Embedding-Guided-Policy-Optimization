@@ -315,7 +315,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         with (
-            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+            self.engine.train_mode(disable_auto_offload=disable_auto_offload,
+                                   keep_grad=not apply_step),
             Timer(name="train_batch", logger=None),
         ):
             # update
@@ -394,7 +395,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 tu.assign_non_tensor(data, **{key: val})
 
         with (
-            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+            # keep_grad: apply_step=False means a caller will fuse another backward onto
+            # this gradient and issue one combined step, so the context must not zero it.
+            self.engine.train_mode(disable_auto_offload=disable_auto_offload,
+                                   keep_grad=not apply_step),
             Timer(name="train_batch", logger=None) as timer,
         ):
             output = self.engine.train_batch(data, loss_function=self.loss_fn, apply_step=apply_step)

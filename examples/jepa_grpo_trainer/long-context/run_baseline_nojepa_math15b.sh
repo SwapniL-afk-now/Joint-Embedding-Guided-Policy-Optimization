@@ -1,14 +1,21 @@
 #!/bin/bash
 cd /workspace/Joint-Embedding-Guided-Policy-Optimization
 export WANDB_ENTITY=ismamnurswapnil-bangladesh-university-of-engineering-and
-# predictor_k=0 (identity predictor: every read is the final content token).
-# Correct student responses are attracted to both cached teacher CoT and Code;
-# both teacher views are stop-gradient anchors. Wrong student responses are
-# repelled from both teachers and the correct student. Student-only SIGReg plus
-# effective-rank patience protect representation diversity.
-# SIGReg plus effective-rank patience protect representation diversity.
-# PREDICTOR_EMBED_LR/WD are dead vars (predictor now trains via the actor's
-# own optimizer, see run_infonce_predinopt.sh) — omitted here too.
+export CUDA_VISIBLE_DEVICES=0
+# LLM-JEPA-TRIPLET, CODE-ONLY target: discriminative extension that also uses
+# WRONG responses, aligned to the Code teacher view ONLY (triplet_include_cot=false).
+#   L = align_w * (1 - cos(p+, z_code))
+#     + repel_w * tau*softplus((cos(p-, z_code) - cos(p+, z_code) + m)/tau)
+# p+ = correct student read, p- = wrong student read, z_code = teacher Code view.
+# Dropped the CoT target: student-CoT-vs-teacher-CoT is a SAME-modality alignment
+# (both natural-language reasoning about the same problem) that saturates near
+# instantly (cos~0.93-0.95 from step 1, align_cot~0.06) and carries almost no
+# learning signal -- the LLM-JEPA paper itself never aligns Text to Text, only
+# Text to a genuinely different view (Code). Code-only puts all alignment weight
+# on the one cross-view arm that is actually discriminative (cos~0.80-0.88).
+# NO stop-grad on the teacher (tied-weights, single differentiable forward). k=0 => Pred=id.
+# Reads are RESPONSE-ONLY on both sides (student anchor slice + teacher messages[2:3]).
+# SIGReg off by default (triplet_sigreg_lambda=0); raise it if reads drift to collapse.
 exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.main_ray \
   --config-name \
   jepa_grpo_ray_qwen25_1_5b \
@@ -24,19 +31,17 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   data.max_response_length=3072 \
   data.filter_overlong_prompts=True \
   data.truncation=error \
-  actor_rollout_ref.model.path=/workspace/models/Qwen2.5-3B-Instruct \
+  actor_rollout_ref.model.path=/workspace/models/Qwen2.5-Math-1.5B-Instruct \
+  actor_rollout_ref.model.lora_rank=0 \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.model.enable_gradient_checkpointing=True \
   +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
-  actor_rollout_ref.model.lora_rank=512 \
-  actor_rollout_ref.model.lora_alpha=1024 \
-  actor_rollout_ref.model.target_modules=all-linear \
   actor_rollout_ref.actor.policy_loss.loss_mode=vanilla \
   actor_rollout_ref.actor.loss_agg_mode=token-mean \
   actor_rollout_ref.actor.clip_ratio_low=0.2 \
   actor_rollout_ref.actor.clip_ratio_high=0.2 \
   actor_rollout_ref.actor.clip_ratio_c=3.0 \
-  actor_rollout_ref.actor.optim.lr=5e-7 \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
   actor_rollout_ref.actor.ppo_mini_batch_size=64 \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
@@ -60,7 +65,7 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
   actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
   actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24576 \
-  jepa.enable=True \
+  jepa.enable=False \
   jepa.n_cot=8 \
   jepa.n_code=0 \
   jepa.alpha=0.0015 \
@@ -68,18 +73,12 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   jepa.embed_micro_batch_size=8 \
   jepa.target_max_length=4096 \
   jepa.min_valid_pairs=1 \
-  jepa.loss_type=llm-jepa-geometry \
-  +jepa.geometry_tau=0.1 \
-  +jepa.geometry_margin=0.1 \
-  +jepa.geometry_align_weight=1.0 \
-  +jepa.geometry_wrong_teacher_weight=1.0 \
-  +jepa.geometry_wrong_correct_weight=1.0 \
-  +jepa.collapse_guard_enable=True \
-  +jepa.collapse_effective_rank_min=0.003 \
-  +jepa.collapse_rank_fraction_of_best=0.5 \
-  +jepa.collapse_patience=10 \
-  +jepa.collapse_reenable_patience=10 \
-  +jepa.collapse_warmup_steps=20 \
+  jepa.loss_type=llm-jepa-triplet \
+  +jepa.triplet_tau=0.1 \
+  +jepa.triplet_margin=0.1 \
+  +jepa.triplet_repel_weight=1.0 \
+  +jepa.triplet_include_cot=false \
+  jepa.triplet_sigreg_lambda=0.0 \
   jepa.predictor_k=0 \
   jepa.alpha_warmup_steps=20 \
   jepa.max_grad_norm=0.5 \
@@ -89,18 +88,7 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   jepa.tcr_match=cycle \
   jepa.max_anchors_per_prompt=2 \
   jepa.jepa_anchor_set=correct \
-  jepa.tcr_reward_beta=0 \
-  jepa.tcr_reward_sigma_floor=0.1 \
-  jepa.triplet_sigreg_lambda=0.1 \
-  jepa.n_projections=1024 \
-  jepa.t_min=-5.0 \
-  jepa.t_max=5.0 \
-  jepa.epps_pulley_s=1.0 \
   jepa.auto_off_enable=False \
-  jepa.auto_off_patience=10 \
-  jepa.auto_off_min_delta=0.002 \
-  jepa.auto_off_warmup_steps=20 \
-  jepa.auto_off_min_cos=0.0 \
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576 \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -114,10 +102,10 @@ exec /workspace/exploration/.venv/bin/python3 -m verl.experimental.jepa_grpo.mai
   trainer.critic_warmup=0 \
   trainer.logger=["console","wandb"] \
   trainer.project_name=grpo-qwen-3b \
-  trainer.experiment_name=geometry-cot-code-stopgrad-fresh-reenable-Qwen2.5-3B-Instruct-20260722 \
-  trainer.default_local_dir=checkpoints/grpo-qwen-3b/geometry-cot-code-stopgrad-fresh-reenable-Qwen2.5-3B-Instruct-20260722 \
+  trainer.experiment_name=baseline-nojepa-full-Qwen2.5-Math-1.5B-20260725 \
+  trainer.default_local_dir=checkpoints/grpo-qwen-3b/baseline-nojepa-full-Qwen2.5-Math-1.5B-20260725 \
   trainer.resume_mode=disable \
-  trainer.n_gpus_per_node=2 \
+  trainer.n_gpus_per_node=1 \
   trainer.nnodes=1 \
   trainer.save_freq=10 \
   trainer.test_freq=10 \

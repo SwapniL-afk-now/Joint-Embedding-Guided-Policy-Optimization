@@ -1389,7 +1389,8 @@ class RayPPOTrainer:
                         self.global_steps,
                         max_ckpt_to_keep=1,
                         tag=dir_name,
-                        save_contents=["peft_adapter", "extra"],
+                        # full-parameter runs have no adapter to save; keep the full weights instead
+                        save_contents=["peft_adapter", "extra"] if self.ref_in_actor else ["model", "extra"],
                     )
                     saved_actor_path = best_local_path
                 else:

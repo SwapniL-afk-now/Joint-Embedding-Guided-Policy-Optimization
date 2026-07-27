@@ -1072,6 +1072,25 @@ class FSDPEngine(BaseEngine):
         """
         self.optimizer.zero_grad()
 
+    def grad_norm_only(self) -> float:
+        """Total gradient norm WITHOUT touching the gradients.
+
+        Same FSDP-version dispatch as `optimizer_step`'s clip, but with a max-norm large
+        enough that the clip coefficient always clamps to 1.0, so grads are scaled by
+        exactly 1.0 (a no-op). Lets a caller read ONE contribution's norm when several
+        backward passes accumulate into a single optimizer step.
+        """
+        big = 1e30
+        if isinstance(self.module, FSDP):
+            grad_norm = self.module.clip_grad_norm_(big)
+        elif isinstance(self.module, FSDPModule):
+            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=big)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.module.parameters(), max_norm=big)
+        if isinstance(grad_norm, DTensor):
+            grad_norm = grad_norm.full_tensor()
+        return float(grad_norm)
+
     def optimizer_step(self, clip_grad_override: Optional[float] = None):
         """
         Clip gradients, skip update if non-finite, and step optimizer.
@@ -1344,7 +1363,11 @@ class EngineTrainModeCtx(BaseEngineCtx):
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, FSDPEngine)
         set_ulysses_sequence_parallel_group(self.prev_sp_group)
-        self.engine.optimizer_zero_grad()
+        # keep_grad: the caller deferred its optimizer step and needs the accumulated
+        # gradient to survive this context so it can fuse a second backward into ONE step.
+        # Zeroing here is otherwise belt-and-braces -- train_batch already zeroes on entry.
+        if not self.keep_grad:
+            self.engine.optimizer_zero_grad()
         super().__exit__(exc_type, exc_value, traceback)
 
 

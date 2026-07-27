@@ -139,3 +139,6 @@ results/
 eval_smoketest/
 *.out
 grpo-1.5b-math-wandb.csv
+
+# run artifacts (t-SNE dumps, per-run diagnostics)
+analysis/
