@@ -1224,14 +1224,20 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 joint_lengths = torch.cat([anchor_lengths_all[:M], target_lengths_all[:U]])
                 joint_predictor_k = [0] * (M + U)
 
+                # The anchor is [x, y_S] and x is identical across a group's rollouts, so
+                # within-group variation in anchor_length IS response-length variation --
+                # the group centring in hgrpo_loss removes the shared prompt constant.
+                student_len = anchor_lengths_all[:M] if cfg.length_decorrelate else None
+
                 def _loss_fn(joint_emb, _M=M, _tidx=tgt_group_idx,
-                             _lab=student_label, _gid=student_gid):
+                             _lab=student_label, _gid=student_gid, _len=student_len):
                     dev = joint_emb.device
                     return hgrpo_loss(
                         student=joint_emb[:_M],
                         label=_lab.to(dev),
                         teacher=joint_emb[_M:][_tidx.to(dev)],
                         group_id=_gid.to(dev),
+                        length=None if _len is None else _len.to(dev),
                     )
 
                 jepa_metrics = self._embed_chunked_with_backward(

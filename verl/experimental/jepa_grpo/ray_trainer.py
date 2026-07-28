@@ -2480,7 +2480,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         metrics["jepa/collapse_stall"] = float(self._collapse_stall)
         metrics["jepa/collapse_recovery_stall"] = float(self._collapse_recovery_stall)
         metrics["jepa/collapse_latched"] = float(self._collapse_latched)
-        if (not cfg.enable or cfg.loss_type != "llm-jepa-geometry"
+        # h-grpo needs this guard as much as llm-jepa-geometry does, and until now was
+        # excluded from it: on run ar6ntx2j jepa/effective_rank_norm peaked at 0.051
+        # (step ~400) then decayed to 0.0155 by step 799 -- below the 0.018 its own gate 3
+        # calls degenerate -- with jepa/collapse_stall pinned at 0 the whole time, because
+        # this early-return fired every step. The threshold (max(0.003, 0.5*best) ~ 0.026)
+        # would have latched it off around step 600.
+        if (not cfg.enable or cfg.loss_type not in ("llm-jepa-geometry", "h-grpo")
                 or not cfg.collapse_guard_enable):
             return
 

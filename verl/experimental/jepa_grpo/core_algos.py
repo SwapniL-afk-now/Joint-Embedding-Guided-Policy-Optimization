@@ -1041,6 +1041,7 @@ def hgrpo_loss(
     teacher: torch.Tensor,      # (P, d) one anchor per prompt — DETACHED here
     group_id: torch.Tensor,     # (M,) long, compact prompt id in 0..P-1
     eps_a: float = 1e-6,
+    length: torch.Tensor | None = None,   # (M,) rollout token counts, for decorrelation
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """H-GRPO: GRPO's group-relative surrogate with the token policy replaced by a
     group-normalised distribution over hidden-state compatibility.
@@ -1113,6 +1114,7 @@ def hgrpo_loss(
         "jepa/n_allwrong_groups": 0,
         "jepa/effective_rank": 0.0, "jepa/effective_rank_norm": 0.0,
         "jepa/n_anchors_cot": 0, "jepa/n_anchors_code": 0, "jepa/pool_size": 0,
+        "jepa/length_r2": 0.0,
     }
     if M == 0:
         return torch.zeros((), device=device, dtype=dtype), empty
@@ -1146,6 +1148,33 @@ def hgrpo_loss(
     assert bool((counts > 0).all()), "hgrpo_loss: group with no rollouts"
     slot = torch.zeros((P, Gmax), dtype=torch.bool, device=device).index_put(
         (gid, col), torch.ones(M, dtype=torch.bool, device=device))
+
+    # ---- length decorrelation (jepa.length_decorrelate) ----
+    # Project s onto the orthogonal complement of centred length WITHIN each group:
+    #     s_resid = s - beta_i * (len_ij - mean_i len),   beta_i = OLS slope of s on len
+    # Length is data, not a function of theta, so d(s_resid)/ds is the projection (I - P)
+    # and the gradient stays exact. This preserves the shift invariance the whole design
+    # rests on (a constant added to every s still cancels in the softmax), and it removes
+    # ONLY the component the confound lives in. If the margin survives this, the signal is
+    # real; if it collapses to ~0, the margin was length all along -- which is the point.
+    length_r2 = 0.0
+    if length is not None:
+        n = slot.sum(dim=1, keepdim=True).clamp_min(1).to(dtype)
+        l_mat = torch.zeros((P, Gmax), device=device, dtype=dtype).index_put(
+            (gid, col), length.to(device=device, dtype=dtype))
+        dl = (l_mat - (l_mat * slot).sum(dim=1, keepdim=True) / n) * slot
+        s_fill = s_mat.masked_fill(~slot, 0.0)
+        ds = (s_fill - (s_fill * slot).sum(dim=1, keepdim=True) / n) * slot
+        denom = dl.pow(2).sum(dim=1, keepdim=True)
+        beta = (ds * dl).sum(dim=1, keepdim=True) / denom.clamp_min(eps_a)
+        with torch.no_grad():   # variance of s explained by length, before removal
+            ss = ds.pow(2).sum(dim=1, keepdim=True)
+            ok = (denom > eps_a) & (ss > eps_a)
+            length_r2 = float(((beta.pow(2) * denom / ss.clamp_min(eps_a))[ok]).mean().cpu()
+                              ) if bool(ok.any()) else 0.0
+        # Re-mask so absent slots stay -inf and keep taking exactly zero softmax mass.
+        s_mat = (s_fill - beta * dl).masked_fill(~slot, float("-inf"))
+        s = s_mat[gid, col]
 
     q = torch.softmax(s_mat, dim=1)                   # (P, Gmax), differentiable via s
     q_old = q.detach()
@@ -1197,6 +1226,9 @@ def hgrpo_loss(
         "jepa/n_anchors_cot": M,
         "jepa/n_anchors_code": 0,
         "jepa/pool_size": M,
+        # Fraction of within-group variance in s that length alone explained (pre-removal).
+        # This is the confound, measured live: watch it instead of inferring it afterwards.
+        "jepa/length_r2": length_r2,
     }
     return loss, metrics
 

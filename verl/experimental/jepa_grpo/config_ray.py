@@ -71,6 +71,16 @@ class JEPARayConfig:
     # 1.0). Requires ppo_epochs==1 and ppo_mini_batch_size >= train_batch_size
     # (the engine zeroes grad per mini-batch), enforced in ray_trainer.
     fuse_optimizer_step: bool = False
+    # Residualise the h-grpo compatibility score s_ij against rollout LENGTH, within
+    # each group, before the softmax. Measured on run ar6ntx2j (800 steps, 1.5B):
+    # corr(jepa/margin, response_length) = +0.81 while corr(length, critic/score) = -0.11
+    # -- the margin was being bought with tokens, not correctness. The anchor is a full
+    # worked teacher solution, and in a last-token read, length is a dominant direction,
+    # so a rollout raises a_i.z_ij by becoming teacher-SHAPED (long) regardless of whether
+    # it is right. Response length grew 608->1045 and 19% of rollouts hit the cap, where a
+    # truncation is scored wrong -- the objective manufactured its own false negatives.
+    # Off by default so existing scripts reproduce bit-for-bit.
+    length_decorrelate: bool = False
     embed_micro_batch_size: int = 16
     # Independent context budget for the frozen/no-grad teacher-text target
     # encoder.  Keep rollout sequences short while allowing a long-thinking
