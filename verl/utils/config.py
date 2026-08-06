@@ -179,6 +179,11 @@ def validate_config(
 
         validate_sharpening_config(config)
 
+    if config.get("custom_abstract_rl", {}).get("enable", False):
+        from verl.experimental.abstract_rl.config import validate_abstract_rl_config
+
+        validate_abstract_rl_config(config)
+
     # critic
     if use_critic:
         critic_config = omega_conf_to_dataclass(config.critic)

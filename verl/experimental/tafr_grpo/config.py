@@ -12,23 +12,99 @@ from omegaconf import DictConfig, OmegaConf
 
 TAFR_VARIANTS = {"full", "anchor_only", "replay_only"}
 
+TAFR_LOSS_VERSIONS = {"k3_legacy", "failure_token_adv"}
+
+TAFR_ADV_NORMS = {"p99", "dense_token_credit", "pbrs_pure"}
+
 
 @dataclass
 class TAFRGRPOConfig:
     """Typed config for TAFR-GRPO.
 
-    TAFR-GRPO actor loss:
+    Two loss versions:
 
-    L_t(theta) = L_GRPO(theta)
-        + beta D_KL(pi_theta || pi_anchor^t)
-        - beta(1 - r_bar_x) D_KL(pi_replay^t || pi_theta)
+    k3_legacy (kept for ablation and existing checkpoints):
 
-    where pi_anchor and pi_replay are frozen lagged EMA/reference mixtures.
+        L_t(theta) = L_GRPO(theta)
+            + beta D_KL(pi_theta || pi_anchor^t)
+            - beta(1 - r_bar_x) D_KL(pi_replay^t || pi_theta)
+
+        where pi_anchor and pi_replay are frozen lagged EMA/reference mixtures.
+
+    failure_token_adv (paper token-advantage path):
+
+        L_t(theta) = PPO(A_GRPO + beta A_reg), where
+
+            A^reg_{i,t} = log pi_anchor(y_{i,t} | s_{i,t})
+                          - log pi_old(y_{i,t} | s_{i,t})
+                          + (1 - r_bar_x) [log pi_old(y_{i,t} | s_{i,t})
+                                           - log pi_failure(y_{i,t} | s_{i,t})].
+
+        The complete detached A_reg is RMS-matched to the GRPO advantage; beta
+        sets its relative RMS target (0.5 means approximately 50%).
     """
 
     enable: bool = False
-    beta: float = 0.0
-    anchor_beta: float = 0.0
+    loss_version: str = "failure_token_adv"
+    beta: float = 0.5
+    # k3_legacy only: split `beta` into its two opposing halves. One knob cannot
+    # strengthen the replay push without also strengthening the anchor pull that
+    # suppresses it -- measured at beta 0.5/1.0, failure_sft_loss stays at ~0.29
+    # (clone never fits) vs 0.073 at beta 0.1, i.e. replay goes inert at high beta.
+    # None means "use beta", so existing arms are unchanged.
+    beta_anchor: float | None = None
+    beta_replay: float | None = None
+    # Paper regularization-advantage construction.
+    failure_advantage_clip: float = 5.0
+    # None falls back to the GRPO clip_ratio.
+    failure_clip_ratio: float | None = None
+    # Reuse the exact chosen-token log-probabilities captured during vLLM
+    # rollout instead of running a separate old-policy forward.
+    reuse_rollout_log_probs: bool = False
+    # When enabled, recompute the HF old log-probs AND use the rollout ones,
+    # logging parity metrics until they are validated.
+    verify_rollout_log_probs: bool = False
+    # Ablation control: permute A_reg within each sequence's valid tokens, keeping
+    # its magnitude and per-row statistics but destroying token alignment. If this
+    # arm matches the real one, the per-token structure carries no information.
+    shuffle_advantage_tokens: bool = False
+    # Relative strength of A_reg's two halves. Summed BEFORE the joint RMS match,
+    # so without these the mix is dictated by raw magnitudes that drift on their own
+    # (anchor ramps between refreshes; failure grows with SFT updates).
+    anchor_weight: float = 1.0
+    failure_weight: float = 1.0
+    # Normalize each half to unit RMS before weighting, making the realized mix
+    # exactly anchor_weight : failure_weight regardless of that drift.
+    normalize_terms_separately: bool = False
+    # How A_reg is normalized before it is added to the GRPO advantage.
+    #   p99                -- legacy: per-part unit RMS, then a p99-quantile match against
+    #                         the batch RMS of the GRPO advantage. One global scalar, and
+    #                         the result is NOT zero-mean within a sequence, so it shifts
+    #                         the sequence-level GRPO preference.
+    #   dense_token_credit -- residuals are zero-mean per sequence (sequence-level
+    #                         preference untouched) and scaled by each rollout's own
+    #                         |A_GRPO|, so the perturbation is the same fraction of every
+    #                         rollout's advantage. anchor_weight/failure_weight act as
+    #                         lambda_a/lambda_f; failure_advantage_clip is unused.
+    adv_norm: str = "p99"
+    # dense_token_credit knobs (ignored when adv_norm == "p99").
+    dtc_dose: float = 0.5   # rms(A_dense) = dtc_dose * |A_grpo| per rollout
+    dtc_tau: float = 5.0
+    dtc_eps: float = 1e-8
+    # Floor on the per-rollout |A_GRPO| scale. Homogeneous groups have A_GRPO == 0;
+    # this keeps their dense term small but finite. Set to ~RMS(A_GRPO) (0.75 as
+    # measured) to make those groups carry a full-strength dense signal instead.
+    dtc_eps_floor: float = 0.01
+    dtc_ema_decay: float = 0.99
+    # Diagnostics: write decoded tokens next to their A_reg components here.
+    # null disables. Dumps 2 wrong + 2 correct rows per step (~200 KB/step).
+    token_advantage_dump_dir: Optional[str] = None
+    token_advantage_dump_every: int = 1
+    # Only run the failure-model prefill on groups with group_reward_mean < 1.
+    score_only_active_groups: bool = True
+    # Number of successful failure-SFT updates before the failure advantage
+    # is activated (warm start). Persisted in tafr_state.pt.
+    failure_min_updates_before_use: int = 1
     ema_gamma: float = 0.99
     mix_eta: float = 1.0
     sft_update_interval_grpo_steps: int = 5
@@ -89,7 +165,9 @@ def validate_tafr_config(config: DictConfig | dict) -> TAFRGRPOConfig:
         return custom
 
     algorithm = config.get("algorithm", {})
-    actor = config.get("actor_rollout_ref", {}).get("actor", {})
+    actor_rollout_ref = config.get("actor_rollout_ref", {})
+    actor = actor_rollout_ref.get("actor", {})
+    model = actor_rollout_ref.get("model", {})
 
     raw_adv_estimator = algorithm.get("adv_estimator", "")
     adv_estimator = str(getattr(raw_adv_estimator, "value", raw_adv_estimator)).lower()
@@ -104,6 +182,32 @@ def validate_tafr_config(config: DictConfig | dict) -> TAFRGRPOConfig:
 
     if custom.beta < 0:
         raise ValueError("custom_tafr_grpo.beta must be non-negative.")
+    for _name in ("beta_anchor", "beta_replay"):
+        _v = getattr(custom, _name, None)
+        if _v is not None and float(_v) < 0:
+            raise ValueError(f"custom_tafr_grpo.{_name} must be non-negative.")
+        if _v is not None and custom.loss_version != "k3_legacy":
+            raise ValueError(f"custom_tafr_grpo.{_name} only applies to loss_version=k3_legacy.")
+    if custom.loss_version not in TAFR_LOSS_VERSIONS:
+        raise ValueError(f"custom_tafr_grpo.loss_version must be one of {sorted(TAFR_LOSS_VERSIONS)}.")
+    if custom.adv_norm not in TAFR_ADV_NORMS:
+        raise ValueError(f"custom_tafr_grpo.adv_norm must be one of {sorted(TAFR_ADV_NORMS)}.")
+    if custom.adv_norm != "p99" and custom.loss_version != "failure_token_adv":
+        raise ValueError("custom_tafr_grpo.adv_norm only applies to loss_version='failure_token_adv'.")
+    if custom.dtc_eps_floor <= 0:
+        raise ValueError("custom_tafr_grpo.dtc_eps_floor must be positive.")
+    if not 0.0 <= custom.dtc_ema_decay < 1.0:
+        raise ValueError("custom_tafr_grpo.dtc_ema_decay must be in [0, 1).")
+    if custom.dtc_dose < 0:
+        raise ValueError("custom_tafr_grpo.dtc_dose must be non-negative.")
+    if custom.dtc_tau <= 0:
+        raise ValueError("custom_tafr_grpo.dtc_tau must be positive.")
+    if custom.failure_advantage_clip <= 0:
+        raise ValueError("custom_tafr_grpo.failure_advantage_clip must be positive.")
+    if custom.failure_clip_ratio is not None and custom.failure_clip_ratio <= 0:
+        raise ValueError("custom_tafr_grpo.failure_clip_ratio must be positive or null.")
+    if custom.failure_min_updates_before_use < 1:
+        raise ValueError("custom_tafr_grpo.failure_min_updates_before_use must be >= 1.")
     if not 0 <= custom.ema_gamma <= 1:
         raise ValueError("custom_tafr_grpo.ema_gamma must be in [0, 1].")
     if not 0 <= custom.mix_eta <= 1:
@@ -128,6 +232,22 @@ def validate_tafr_config(config: DictConfig | dict) -> TAFRGRPOConfig:
         raise ValueError(f"custom_tafr_grpo.variant must be one of {sorted(TAFR_VARIANTS)}.")
     if custom.logprob_backend not in {"hf", "vllm"}:
         raise ValueError("custom_tafr_grpo.logprob_backend must be 'hf' or 'vllm'.")
+    lora_rank = int(model.get("lora_rank", 0) or 0)
+    if custom.logprob_backend == "vllm" and lora_rank <= 0:
+        raise ValueError(
+            "custom_tafr_grpo.logprob_backend='vllm' requires actor_rollout_ref.model.lora_rank > 0; "
+            "use logprob_backend='hf' for full fine-tuning."
+        )
+    if custom.logprob_backend == "hf" and custom.reuse_rollout_log_probs:
+        raise ValueError(
+            "HF TAFR scoring requires reuse_rollout_log_probs=false so pi_old, pi_anchor, and pi_failure "
+            "use the same log-probability backend."
+        )
+    if custom.logprob_backend == "vllm" and not custom.reuse_rollout_log_probs:
+        raise ValueError(
+            "vLLM TAFR scoring requires reuse_rollout_log_probs=true so pi_old, pi_anchor, and pi_failure "
+            "use the same log-probability backend."
+        )
     if custom.vllm_score_micro_batch_size <= 0:
         raise ValueError("custom_tafr_grpo.vllm_score_micro_batch_size must be positive.")
 

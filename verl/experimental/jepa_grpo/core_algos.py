@@ -227,88 +227,135 @@ def lejepa_loss(
 
 
 # ---------------------------------------------------------------------------
-# LLM-JEPA (paper-exact) loss — Huang, LeCun, Balestriero 2025, arXiv:2509.14252
+# LLM-JEPA RL Text-to-Code loss — Huang, LeCun, Balestriero 2025, arXiv:2509.14252
 # ---------------------------------------------------------------------------
 
 def llm_jepa_paper_loss(
-    pred: torch.Tensor,          # (N, d) Pred(Enc([x, y_S, [PRED]×k])) — student CoT reads, L2-normalized
-    target_cot: torch.Tensor,    # (N, d) Enc([x, y_T_cot]) — teacher CoT view, L2-normalized, NOT detached
-    target_code: torch.Tensor,   # (N, d) Enc([x, y_T_code]) — teacher Code view, L2-normalized, NOT detached
-    has_code: torch.Tensor,      # (N,) bool — rows with a code target (False -> code arm skips that row)
-    align_cot_on: bool = True,
-    align_code_on: bool = True,
+    pred: torch.Tensor,
+    target_code: torch.Tensor,
+    has_code: torch.Tensor | None = None,
+    sigreg_lambda: float = 0.0,
+    sigreg_projections: int = 1024,
+    sigreg_n_freq: int = 17,
+    sigreg_t_min: float = -5.0,
+    sigreg_t_max: float = 5.0,
+    sigreg_s: float = 1.0,
+    target_view: str = "code",
+    weights: torch.Tensor | None = None,
+    neg_weights: torch.Tensor | None = None,
+    neg_target: torch.Tensor | None = None,
+    neg_margin: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Exact replication of the official LLM-JEPA fine-tuning loss (finetune.py):
+    """RL JEPA: one response-view cosine target plus optional SIGReg.
 
-        L_JEPA = 1 - mean_i cos(Pred(Enc(Text_i)), Enc(Code_i))
+    p = Pred(Enc(prompt + [PRED]))
+    z = stopgrad(Enc(student response))
+    L = mean(1 - cosine(p, z)) with optional SIGReg(p).
 
-    Paper/reference-implementation properties preserved verbatim:
-      - metric d(.,.) = cosine distance via F.cosine_similarity (here: dot product
-        of pre-L2-normalized embeddings — mathematically identical, including the
-        gradient, since normalization is part of the cosine derivative);
-      - a FLAT mean over pairs (no reward stratification, no prompt averaging);
-      - NO stop-gradient on either branch: the reference concatenates all views
-        into one differentiable forward, so Enc(target) receives gradient exactly
-        like Pred(Enc(text)) does. Callers must therefore pass NON-detached
-        target embeddings from a grad-enabled forward;
-      - no SIGReg / InfoNCE / variance term (those are ablations, not the loss).
+    Advantage-aligned extension (all optional, loss_type='llm-jepa'):
+      weights    (A,)   per-anchor pull weights (e.g. softmax(Â/tau) over the prompt
+                       group). The pull becomes the weighted mean
+                       Σ w_i (1 - cos(p_i, z_i)) / Σ w_i instead of the flat mean —
+                       shared sample support with the Dr.GRPO policy gradient (AWR
+                       identity), which is what aligns the two gradients.
+      neg_weights (A,) per-anchor repel weights (e.g. softmax(-Â/tau)); nonzero only
+                       on bad (Â < 0) anchors. Those rows are pushed AWAY from
+                       neg_target (their own response embedding) by the triplet-style
+                       hinge max(0, neg_margin - cos) — the hard-negative arm.
+      neg_target  (A,d) per-anchor repel target (detached); ignored when
+                       neg_weights is None/absent.
+      neg_margin  float triplet margin for the repel arm.
 
-    Deviation (per project design, not the paper): the paper's single (Text, Code)
-    view pair becomes TWO pairs sharing one prediction — the student's generated
-    CoT predicts BOTH the teacher's CoT response and the teacher's Code response:
+    When weights/neg_weights are None the loss is byte-for-byte the previous flat-mean
+    behaviour (pure function of its tensors, unit-testable).
 
-        L = d(p, Enc([x, y^T_cot])) + d(p, Enc([x, y^T_code]))
+    target_code and target_view are retained for compatibility with older callers; the
+    active RL recipe passes the student CoT response with target_view="cot"
 
-    Each arm is the unmodified paper loss; they are summed with equal weight.
+    The target is detached because RL has no LM/NTP loss to anchor the target
+    branch. SIGReg acts on live predictions; applying it only to detached
+    targets would not contribute a training gradient. The reference cosine
+    objective is intentionally uncentered.
     """
-    device, dtype = pred.device, pred.dtype
-    N = pred.shape[0]
-    if N == 0:
-        zero = torch.zeros((), device=device, dtype=dtype)
+    device = pred.device
+    valid = (torch.ones(pred.shape[0], device=device, dtype=torch.bool)
+             if has_code is None else has_code.to(device=device, dtype=torch.bool))
+    n = int(valid.sum().item())
+    if n == 0:
+        zero = pred.sum() * 0.0
         return zero, {
-            "jepa/llm_jepa_loss": 0.0, "jepa/align_cot": 0.0, "jepa/align_code": 0.0,
+            "jepa/llm_jepa_loss": 0.0, "jepa/tcr_loss": 0.0,
+            "jepa/align_cot": 0.0, "jepa/align_code": 0.0,
             "jepa/cos_cot": 0.0, "jepa/cos_code": 0.0,
-            "jepa/n_anchors_cot": 0, "jepa/n_anchors_code": 0, "jepa/pool_size": 0,
+            "jepa/cos_pred_target": 0.0, "jepa/cos_pred_target_raw": 0.0,
+            "jepa/n_anchors_cot": 0, "jepa/n_anchors_code": 0,
+            "jepa/pool_size": 0, "jepa/paper_sigreg_loss": 0.0,
+            "jepa/tcr_sigreg_loss": 0.0, "jepa/sigreg_lambda": float(sigreg_lambda),
+            "jepa/repel_loss": 0.0, "jepa/n_neg_anchors": 0,
+            "jepa/adv_weight_mean": 0.0, "jepa/neg_weight_mean": 0.0,
         }
 
-    # Embeddings arrive unit-norm; dot == F.cosine_similarity of the raw states.
-    cos_cot = (pred * target_cot).sum(dim=-1)                  # (N,)
-    align_cot = (1.0 - cos_cot).mean()
-
-    hc = has_code.to(device=device, dtype=torch.bool)
-    n_code = int(hc.sum().item())
-    if n_code > 0:
-        cos_code = (pred[hc] * target_code[hc]).sum(dim=-1)    # (n_code,)
-        align_code = (1.0 - cos_code).mean()
+    p = pred[valid]
+    z = target_code[valid].detach()
+    cosine = F.cosine_similarity(p, z, dim=-1)
+    ell = 1.0 - cosine
+    w = weights[valid].to(device=device, dtype=pred.dtype) if weights is not None else None
+    if w is not None:
+        align = (ell * w).sum() / w.sum().clamp(min=1e-8)
     else:
-        cos_code = pred.new_zeros((0,))
-        align_code = torch.zeros((), device=device, dtype=dtype)
+        align = ell.mean()
 
-    c_cot = 1.0 if align_cot_on else 0.0
-    c_code = 1.0 if align_code_on else 0.0
-    loss = c_cot * align_cot + c_code * align_code
+    # Repel arm (triplet-style hinge, hard negatives). neg_target rows are the bad
+    # anchors' OWN response embeddings; only rows with neg_weights > 0 participate.
+    repel = pred.new_zeros(())
+    n_neg = 0
+    neg_w_mean = 0.0
+    if neg_weights is not None and neg_target is not None and neg_margin > 0.0:
+        nw = neg_weights[valid].to(device=device, dtype=pred.dtype)
+        active = nw > 0.0
+        if active.any():
+            z_neg = neg_target[valid][active].detach()
+            cos_neg = F.cosine_similarity(p[active], z_neg, dim=-1)
+            hinge = torch.clamp(neg_margin - cos_neg, min=0.0)
+            wn = nw[active]
+            repel = (hinge * wn).sum() / wn.sum().clamp(min=1e-8)
+            n_neg = int(active.sum().item())
+            neg_w_mean = float(wn.detach().mean().cpu())
 
+    lam = max(0.0, min(1.0, float(sigreg_lambda)))
+    if lam > 0.0:
+        sig = sigreg_loss(
+            p, M=sigreg_projections, n_freq=sigreg_n_freq,
+            t_min=sigreg_t_min, t_max=sigreg_t_max, s=sigreg_s,
+        )
+        loss = (1.0 - lam) * (align + repel) + lam * sig
+    else:
+        sig = align.new_zeros(())
+        loss = align + repel
+    mean_cos = float(cosine.detach().mean().cpu())
+    loss_value = float(loss.detach().cpu())
+    sig_value = float(sig.detach().cpu())
+    is_cot = target_view == "cot"
     metrics = {
-        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
-        "jepa/tcr_loss": float(loss.detach().cpu()),  # alias: keeps wandb key parity with prior runs
-        "jepa/align_cot": float(align_cot.detach().cpu()),
-        "jepa/align_code": float(align_code.detach().cpu()),
-        "jepa/cos_cot": float(cos_cot.detach().mean().cpu()),
-        "jepa/cos_code": float(cos_code.detach().mean().cpu()) if n_code > 0 else 0.0,
-        "jepa/n_anchors_cot": int(N),
-        "jepa/n_anchors_code": int(n_code),
-        "jepa/pool_size": int(N),
-        "jepa/arm_cot_on": float(align_cot_on),
-        "jepa/arm_code_on": float(align_code_on),
-        # Constant-zero keys kept ONLY for wandb panel parity with prior
-        # jepa-tcr-dual runs (e.g. grpo-qwen-3b/jxorb8w4): the paper loss has no
-        # SIGReg, self-consistency, or lambda mixing.
-        "jepa/self_consist_loss": 0.0,
-        "jepa/tcr_sigreg_loss": 0.0,
-        "jepa/cos_self": 0.0,
-        "jepa/n_self_pairs": 0,
-        "jepa/tcr_lambda": 0.0,
-        "jepa/arm_self_on": 0.0,
+        "jepa/llm_jepa_loss": loss_value, "jepa/tcr_loss": loss_value,
+        "jepa/align_cot": float(align.detach().cpu()) if is_cot else 0.0,
+        "jepa/align_code": float(align.detach().cpu()) if not is_cot else 0.0,
+        "jepa/cos_cot": mean_cos if is_cot else 0.0,
+        "jepa/cos_code": mean_cos if not is_cot else 0.0,
+        "jepa/cos_pred_target": mean_cos, "jepa/cos_pred_target_raw": mean_cos,
+        "jepa/cos_code_raw": mean_cos if not is_cot else 0.0,
+        "jepa/n_anchors_cot": n if is_cot else 0,
+        "jepa/n_anchors_code": n if not is_cot else 0,
+        "jepa/pool_size": n, "jepa/paper_sigreg_loss": sig_value,
+        "jepa/tcr_sigreg_loss": sig_value, "jepa/sigreg_lambda": lam,
+        "jepa/self_consist_loss": 0.0, "jepa/cos_self": 0.0,
+        "jepa/n_self_pairs": 0, "jepa/tcr_lambda": 0.0,
+        "jepa/arm_cot_on": 1.0 if is_cot else 0.0,
+        "jepa/arm_code_on": 0.0 if is_cot else 1.0,
+        "jepa/repel_loss": float(repel.detach().cpu()),
+        "jepa/n_neg_anchors": int(n_neg),
+        "jepa/adv_weight_mean": float(w.detach().mean().cpu()) if w is not None else 0.0,
+        "jepa/neg_weight_mean": neg_w_mean,
     }
     return loss, metrics
 
@@ -1032,6 +1079,121 @@ def llm_jepa_triplet_loss(
 
 
 # ---------------------------------------------------------------------------
+# Correct-cluster LLM-JEPA (loss_type='llm-jepa-cluster')
+# ---------------------------------------------------------------------------
+
+def llm_jepa_cluster_loss(
+    correct: torch.Tensor,      # (M, d) reads of CORRECT responses, response-only encode
+    group_id: torch.Tensor,     # (M,) long — prompt id per read
+    min_correct: int = 2,
+    repel: float = 0.0,         # >0: subtract repel * mean all-pairs cos (collapse guard)
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """LLM-JEPA's cosine loss with every correct response as a view of the same target.
+
+        L = mean_{x in E} mean_{i != j in C_x} (1 - cos(z_i, z_j))
+
+    where E = prompts with |C_x| >= min_correct. The metric is the paper's
+    d(a, b) = 1 - cos(a, b) unchanged (arXiv LLM-JEPA finetune.py); the only
+    deviation is that the paper's ONE (Text, Code) view pair becomes all ordered
+    pairs among a prompt's correct responses, so a group with k correct answers
+    pulls all k together instead of picking a single pair.
+
+    Deliberately absent (per design):
+      - no stop-gradient: every read is grad-enabled on both sides of each pair,
+        matching the reference implementation's single differentiable forward;
+      - no SIGReg / variance / InfoNCE term;
+      - no negatives and no wrong-response arm — attraction only;
+      - no predictor tokens (callers pass predictor_k=0, identity Pred(x)=x).
+
+    Averaging is per-prompt-then-mean, not a flat mean over pairs: a group with 7
+    correct answers has 42 ordered pairs against a 2-correct group's 2, and a flat
+    mean would let easy prompts set the gradient.
+
+    Uses the closed form  sum_{i!=j} z_i.z_j = ||sum_i z_i||^2 - n  (unit norms),
+    which is O(n*d) instead of materializing the n*n gram matrix and is exactly
+    equal to the double sum (asserted in the self-check below).
+    """
+    device, dtype = correct.device, correct.dtype
+    empty = {
+        "jepa/llm_jepa_loss": 0.0, "jepa/tcr_loss": 0.0, "jepa/cluster_loss": 0.0,
+        "jepa/cos_correct_correct": 0.0, "jepa/n_eligible_prompts": 0,
+        "jepa/n_anchors_cot": 0, "jepa/n_anchors_code": 0, "jepa/pool_size": 0,
+        "jepa/cluster_group_size_mean": 0.0,
+        # Collapse watch: attraction-only with no SIGReg can drive every read onto
+        # one point. This is the mean cosine over ALL reads regardless of prompt --
+        # it should stay well below the within-prompt figure. If the two converge
+        # toward 1.0 the representation has collapsed.
+        "jepa/cos_all_pairs": 0.0, "jepa/cluster_margin": 0.0,
+        "jepa/effective_rank": 0.0, "jepa/effective_rank_norm": 0.0,
+    }
+    M = int(correct.shape[0])
+    if M == 0:
+        return torch.zeros((), device=device, dtype=dtype), empty
+
+    # fp32 throughout: the closed form differences ||S||^2 - n are two quantities of
+    # similar magnitude, and the reads arrive from the FSDP forward in bf16. Measured
+    # bf16 error on a d=1536, n=8 group is 1.4e-3 -- the same order as the cosine
+    # signal itself, i.e. the metric would be pure noise. Cast, don't optimize.
+    acc = torch.float32
+    z = F.normalize(correct.to(acc), dim=-1)
+    gid = group_id.to(device=device, dtype=torch.long)
+    G = int(gid.max().item()) + 1
+
+    cnt = torch.zeros(G, device=device, dtype=acc).index_add_(
+        0, gid, torch.ones(M, device=device, dtype=acc))
+    gsum = torch.zeros(G, z.shape[-1], device=device, dtype=acc).index_add_(0, gid, z)
+
+    eligible = cnt >= float(min_correct)
+    n_elig = int(eligible.sum().item())
+    if n_elig == 0:
+        # Keep the graph alive with an exact zero so the caller's backward is valid.
+        return z.sum() * 0.0, empty
+
+    n = cnt[eligible]
+    # mean_{i!=j} cos = (||S||^2 - n) / (n(n-1)); per-prompt loss = 1 - that.
+    mean_cos = (gsum[eligible].pow(2).sum(dim=-1) - n) / (n * (n - 1.0))
+    # Returned in fp32 on purpose: this loss lives near 1.0, where bf16's resolution
+    # is 2^-8 = 0.0039 -- casting back to the input dtype rounds 0.9990 to exactly
+    # 1.0 and destroys both the logged metric and any margin we hope to measure.
+    loss = (1.0 - mean_cos).mean()
+
+    # Collapse guard. Attraction-only has inf L = 0 at ANY constant encoder, and that
+    # minimum is reachable through the shared weights -- measured on
+    # cluster-jepafirst-20260729: cluster_loss 0.208->0.167 while cos_all_pairs rose
+    # 0.685->0.770 FASTER than cos_correct_correct (0.792->0.833), so the margin fell
+    # 0.107->0.063 and effective_rank 4.73->3.43. The loss "improved" by pulling
+    # everything together. Subtracting the all-pairs term makes the objective the
+    # within-prompt MARGIN, which collapse cannot lower: both cosines -> 1 => loss -> 0.
+    cos_all_grad = None
+    if repel > 0.0 and M > 1:
+        cos_all_grad = (z.sum(dim=0).pow(2).sum() - M) / (M * (M - 1.0))
+        loss = loss - repel * (1.0 - cos_all_grad)
+
+    with torch.no_grad():
+        total = z.sum(dim=0)
+        cos_all = ((total.pow(2).sum() - M) / max(M * (M - 1), 1)) if M > 1 else z.new_zeros(())
+        erank, erank_norm = representation_effective_rank(z)
+
+    metrics = dict(empty)
+    metrics.update({
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),
+        "jepa/tcr_loss": float(loss.detach().cpu()),  # alias: wandb key parity
+        "jepa/cluster_loss": float(loss.detach().cpu()),
+        "jepa/cos_correct_correct": float(mean_cos.detach().mean().cpu()),
+        "jepa/cos_all_pairs": float(cos_all.cpu()),
+        # The only quantity collapse cannot fake. Watch THIS, not cluster_loss.
+        "jepa/cluster_margin": float(mean_cos.detach().mean().cpu() - cos_all.cpu()),
+        "jepa/n_eligible_prompts": n_elig,
+        "jepa/cluster_group_size_mean": float(n.detach().mean().cpu()),
+        "jepa/n_anchors_cot": M,
+        "jepa/pool_size": M,
+        "jepa/effective_rank": erank,
+        "jepa/effective_rank_norm": erank_norm,
+    })
+    return loss, metrics
+
+
+# ---------------------------------------------------------------------------
 # Hidden-State GRPO (loss_type='h-grpo')
 # ---------------------------------------------------------------------------
 
@@ -1253,12 +1415,12 @@ if __name__ == "__main__":
     gg = torch.arange(4)
     loss, m = llm_jepa_contrastive_loss(
         gp, tc, tk, hcode, gg, empty, empty, empty_g, empty, empty, empty_g)
-    paper_loss, pm = llm_jepa_paper_loss(gp, tc, tk, hcode)
-    # paper = align_cot + align_code (sum); contrastive pools the two as separate units
-    # -> mean of the two, i.e. paper/2. Check the per-arm means match the paper's arms.
-    assert abs(m["jepa/align_cot"] - pm["jepa/align_cot"]) < 1e-5, (m["jepa/align_cot"], pm["jepa/align_cot"])
-    assert abs(m["jepa/align_code"] - pm["jepa/align_code"]) < 1e-5
-    assert abs(float(loss) - (pm["jepa/align_cot"] + pm["jepa/align_code"]) / 2.0) < 1e-5
+    paper_cot, pm_cot = llm_jepa_paper_loss(gp, tc, hcode, sigreg_lambda=0.0, target_view="cot")
+    paper_code, pm_code = llm_jepa_paper_loss(gp, tk, hcode, sigreg_lambda=0.0)
+    # The contrastive arm pools the one CoT and one Code target per prompt.
+    assert abs(m["jepa/align_cot"] - pm_cot["jepa/align_cot"]) < 1e-5
+    assert abs(m["jepa/align_code"] - pm_code["jepa/align_code"]) < 1e-5
+    assert abs(float(loss) - (pm_cot["jepa/align_cot"] + pm_code["jepa/align_code"]) / 2.0) < 1e-5
     assert 0.0 <= float(loss) <= 2.0  # cosine distance 1-cos in [0,2]; contrast (1+cos)/2 in [0,1]
     assert m["jepa/n_bad_anchors"] == 0 and m["jepa/n_contrast_pairs"] == 0
 
@@ -1351,3 +1513,63 @@ if __name__ == "__main__":
     l0, m0 = llm_jepa_infonce_loss(empty, empty, empty)
     assert float(l0) == 0.0 and m0["jepa/n_anchors_cot"] == 0
     print("llm_jepa_infonce_loss self-check passed")
+
+    # ---- llm_jepa_cluster_loss -------------------------------------------
+    # (a) closed form == naive double loop over ordered pairs, per prompt
+    g = torch.tensor([0, 0, 0, 1, 1, 2])          # sizes 3, 2, 1 -> prompt 2 ineligible
+    r = torch.randn(6, d)
+    lc, mc = llm_jepa_cluster_loss(r, g)
+    zc = F.normalize(r, dim=-1)
+    naive = []
+    for p in (0, 1):
+        rows = (g == p).nonzero().flatten()
+        pairs = [1.0 - float(zc[i] @ zc[j]) for i in rows for j in rows if i != j]
+        naive.append(sum(pairs) / len(pairs))
+    assert abs(float(lc) - sum(naive) / len(naive)) < 1e-5, (float(lc), naive)
+    assert mc["jepa/n_eligible_prompts"] == 2          # singleton prompt excluded
+    assert abs(mc["jepa/cluster_group_size_mean"] - 2.5) < 1e-6
+
+    # (b) identical reads in a group -> that group contributes 0 distance
+    same = torch.stack([zc[0], zc[0], zc[0]])
+    l_same, _ = llm_jepa_cluster_loss(same, torch.tensor([0, 0, 0]))
+    assert float(l_same) < 1e-5
+
+    # (c) tight cluster scores lower than a spread one
+    tight = F.normalize(torch.tensor([[1.0, 0.02], [1.0, -0.02], [1.0, 0.0]]), dim=-1)
+    spread = F.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]), dim=-1)
+    gg = torch.tensor([0, 0, 0])
+    assert float(llm_jepa_cluster_loss(tight, gg)[0]) < float(llm_jepa_cluster_loss(spread, gg)[0])
+
+    # (d) NO stop-grad: every read on both sides of a pair gets gradient
+    rg = r.clone().requires_grad_(True)
+    llm_jepa_cluster_loss(rg, g)[0].backward()
+    assert rg.grad is not None
+    per_row = rg.grad.abs().sum(dim=-1)
+    assert (per_row[:5] > 0).all(), per_row      # all eligible-group rows move
+    assert float(per_row[5]) == 0.0              # the singleton contributes nothing
+
+    # (e) group isolation: perturbing prompt 1 leaves prompt 0's term untouched
+    r2 = r.clone(); r2[3:5] = torch.randn(2, d)
+    only0 = lambda t: float(llm_jepa_cluster_loss(t[:3], g[:3])[0])
+    assert abs(only0(r) - only0(r2)) < 1e-6
+
+    # (f) min_correct gate and empty input
+    l_gate, m_gate = llm_jepa_cluster_loss(r, g, min_correct=4)
+    assert float(l_gate) == 0.0 and m_gate["jepa/n_eligible_prompts"] == 0
+    l_e, m_e = llm_jepa_cluster_loss(torch.zeros(0, d), torch.zeros(0, dtype=torch.long))
+    assert float(l_e) == 0.0 and m_e["jepa/pool_size"] == 0
+    print("llm_jepa_cluster_loss self-check passed")
+
+    # (g) bf16 reads must not poison the closed form (fp32 accumulation)
+    rb = torch.randn(8, 1536).bfloat16()          # the values the forward actually yields
+    gb = torch.zeros(8, dtype=torch.long)
+    ref64 = float(llm_jepa_cluster_loss(rb.double(), gb)[0])   # same values, exact accumulation
+    assert abs(float(llm_jepa_cluster_loss(rb, gb)[0]) - ref64) < 1e-5, (
+        float(llm_jepa_cluster_loss(rb, gb)[0]), ref64)
+    # gradient must still flow back into the bf16 input
+    rbg = rb.bfloat16().requires_grad_(True)
+    lbf, _ = llm_jepa_cluster_loss(rbg, gb)
+    assert lbf.dtype == torch.float32
+    lbf.backward()
+    assert rbg.grad is not None and rbg.grad.abs().sum() > 0
+    print("llm_jepa_cluster_loss dtype self-check passed")

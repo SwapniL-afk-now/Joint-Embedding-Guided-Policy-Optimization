@@ -26,6 +26,201 @@ def replay_gate(group_reward_mean: torch.Tensor) -> torch.Tensor:
     return 1.0 - group_reward_mean
 
 
+def shuffle_within_rows(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Permute each row's valid entries among its own valid positions.
+
+    Ablation control: preserves every marginal property A_reg is normalized on --
+    per-row mean, per-row std, global RMS -- and destroys ONLY the alignment
+    between the signal and the token it was computed at. If training with the
+    shuffled advantage matches the real one, the per-token structure carries no
+    error-localization information and the mechanism is decorative.
+    """
+    out = values.clone()
+    for i in range(values.shape[0]):
+        idx = mask[i].nonzero(as_tuple=False).squeeze(-1)
+        if idx.numel() > 1:
+            out[i, idx] = values[i, idx[torch.randperm(idx.numel(), device=values.device)]]
+    return out
+
+
+def compute_regularization_token_advantage(
+    *,
+    anchor_log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    failure_log_prob: torch.Tensor,
+    grpo_advantage: torch.Tensor,
+    group_reward_mean: torch.Tensor,
+    response_mask: torch.Tensor,
+    advantage_clip: float,
+    failure_model_ready: bool,
+    shuffle_tokens: bool = False,
+    anchor_weight: float = 1.0,
+    failure_weight: float = 1.0,
+    normalize_terms_separately: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Construct the detached paper TAFR regularization advantage.
+
+    A_reg = log(pi_anchor / pi_old)
+          + c_x * log(pi_old / pi_failure),  c_x = 1 - group_reward_mean.
+
+    The complete A_reg is RMS-matched to GRPO once on the logical batch. The
+    outer beta controls the requested relative strength (beta=0.5 targets 50%).
+    """
+    mask = response_mask.to(dtype=torch.float32)
+    reward_mean = group_reward_mean.float().reshape(-1).clamp(0.0, 1.0)
+    difficulty = 1.0 - reward_mean
+    if not failure_model_ready:
+        difficulty = torch.zeros_like(difficulty)
+    difficulty = difficulty.unsqueeze(-1)
+
+    stability_signal = anchor_log_prob.detach().float() - old_log_prob.detach().float()
+    failure_signal = old_log_prob.detach().float() - failure_log_prob.detach().float()
+    failure_component = difficulty * failure_signal
+
+    valid_tokens = mask.sum().clamp_min(1.0)
+
+    def _rms(values: torch.Tensor) -> torch.Tensor:
+        return ((values.square() * mask).sum() / valid_tokens).sqrt()
+
+    anchor_part, failure_part = stability_signal, failure_component
+    # Natural magnitudes, before any weighting or normalization. These are what
+    # drift on their own (anchor ramps between refreshes, failure grows with SFT),
+    # so watch them to choose the weights.
+    raw_anchor_rms = _rms(stability_signal * mask)
+    raw_failure_rms = _rms(failure_component * mask)
+    if normalize_terms_separately:
+        # Without this the mix is set by raw magnitudes, which drift for unrelated
+        # reasons: the anchor term ramps between refreshes (frozen anchor, moving
+        # policy) and the failure term grows as the failure model accumulates SFT
+        # updates. Normalizing each to unit RMS first makes the realized mix exactly
+        # anchor_weight : failure_weight.
+        a_rms, f_rms = _rms(anchor_part), _rms(failure_part)
+        anchor_part = torch.where(a_rms > 1.0e-8, anchor_part / a_rms.clamp_min(1.0e-8), torch.zeros_like(anchor_part))
+        failure_part = torch.where(
+            f_rms > 1.0e-8, failure_part / f_rms.clamp_min(1.0e-8), torch.zeros_like(failure_part)
+        )
+
+    anchor_contribution = float(anchor_weight) * anchor_part * mask
+    failure_contribution = float(failure_weight) * failure_part * mask
+    raw_advantage = anchor_contribution + failure_contribution
+    if shuffle_tokens:
+        # Shuffle AFTER composing and BEFORE normalizing, so the arm differs from
+        # the real one only in token alignment.
+        raw_advantage = shuffle_within_rows(raw_advantage, response_mask.bool()) * mask
+
+    valid = mask.sum().clamp_min(1.0)
+    # Match the TAIL, not the RMS. A_reg is a heavy-tailed log-prob difference
+    # (p50 ~2e-4, p99 ~3.5) while GRPO's advantage is flat, so RMS-matching leaves
+    # the top 1% of tokens at ~4.5x GRPO -- overriding the outcome signal on exactly
+    # the tokens it fires on. Scaling by |A_reg|'s p99 puts the tail at GRPO's scale
+    # by construction, so A_reg shapes within a rollout without ever dominating it.
+    sel = raw_advantage[mask.bool()].abs()
+    raw_rms = torch.quantile(sel.float(), 0.99) if sel.numel() > 1 else sel.sum()
+    grpo = grpo_advantage.detach().float() * mask
+    grpo_rms = ((grpo.square() * mask).sum() / valid).sqrt()
+    # Homogeneous batches have zero GRPO advantage but are exactly where TAFR
+    # must still learn, so use GRPOs unit-normalized reference scale there.
+    reference_rms = torch.where(grpo_rms > 1.0e-8, grpo_rms, torch.ones_like(grpo_rms))
+    scale = torch.where(raw_rms > 1.0e-8, reference_rms / raw_rms.clamp_min(1.0e-8), torch.zeros_like(raw_rms))
+    scaled_advantage = raw_advantage * scale
+    # After scaling, A_reg's RMS equals GRPO's by construction -- but A_reg is sparse
+    # and spiky where GRPO's is flat, so its tail tokens still overwhelm the outcome
+    # signal. An absolute clip of 5.0 is ~7x GRPO's per-token magnitude. Expressing
+    # the cap in units of the GRPO advantage keeps A_reg subordinate per token, not
+    # merely on average, and keeps that guarantee when GRPO's scale changes.
+    clip_limit = advantage_clip  # now a rare safety net, not the alignment mechanism
+    advantage = scaled_advantage.clamp(min=-clip_limit, max=clip_limit) * mask
+    advantage = advantage.detach()
+
+    stats = {
+        "difficulty": difficulty.detach(),
+        "stability_signal": stability_signal.detach(),
+        "failure_signal": failure_signal.detach(),
+        "failure_component": failure_component.detach(),
+        "raw_advantage": raw_advantage.detach(),
+        "scaled_advantage": scaled_advantage.detach(),
+        "advantage": advantage,
+        # Realized mix, so the anchor:failure balance is observable rather than inferred.
+        "raw_anchor_rms": raw_anchor_rms.detach(),
+        "raw_failure_rms": raw_failure_rms.detach(),
+        "anchor_contribution_rms": _rms(anchor_contribution).detach(),
+        "failure_contribution_rms": _rms(failure_contribution).detach(),
+        "raw_advantage_rms": raw_rms.detach(),
+        "grpo_advantage_rms": grpo_rms.detach(),
+        "reference_advantage_rms": reference_rms.detach(),
+        "normalization_scale": scale.detach(),
+        "advantage_clip_limit": torch.as_tensor(clip_limit).detach(),
+    }
+    return advantage, stats
+
+
+def masked_loss_aggregate(
+    token_loss: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str,
+    global_batch_info: Optional[dict] = None,
+) -> torch.Tensor:
+    """Aggregate a [batch, response_length] token loss with the verl GRPO modes.
+
+    Keep the auxiliary term on exactly the same normalization convention as
+    GRPO, including DP/global-batch scaling.
+    """
+    from verl.trainer.ppo.core_algos import agg_loss
+
+    return agg_loss(
+        loss_mat=token_loss,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        **(global_batch_info or {}),
+    )
+
+
+def compute_regularization_policy_loss(
+    *,
+    current_log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    regularization_advantage: torch.Tensor,
+    response_mask: torch.Tensor,
+    clip_ratio: float,
+    loss_agg_mode: str,
+    global_batch_info: Optional[dict] = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute a PPO-clipped token policy loss from detached A_reg.
+
+    The clipping decision is fully independent of the GRPO clipping: only the
+    This helper is diagnostic; training fuses beta-scaled A_reg into A_GRPO before one PPO clip.
+    """
+    old_log_prob_d = old_log_prob.detach()
+    log_ratio = current_log_prob - old_log_prob_d
+    ratio = torch.exp(log_ratio)
+
+    clipped_ratio = ratio.clamp(min=1.0 - clip_ratio, max=1.0 + clip_ratio)
+
+    unclipped_objective = ratio * regularization_advantage
+    clipped_objective = clipped_ratio * regularization_advantage
+
+    token_loss = -torch.minimum(unclipped_objective, clipped_objective)
+
+    regularization_loss = masked_loss_aggregate(
+        token_loss,
+        response_mask,
+        loss_agg_mode,
+        global_batch_info=global_batch_info,
+    )
+
+    mask = response_mask.to(dtype=regularization_advantage.dtype)
+    valid = mask.sum().clamp_min(1.0)
+    stats = {
+        "regularization_loss": regularization_loss.detach(),
+        "token_loss": token_loss.detach(),
+        "ppo_ratio": ratio.detach(),
+        "ppo_ratio_clip_fraction": (
+            ((ratio < (1.0 - clip_ratio)) | (ratio > (1.0 + clip_ratio))).to(regularization_advantage.dtype) * mask
+        ).sum() / valid,
+    }
+    return regularization_loss, stats
+
+
 def _group_mean(values: torch.Tensor, group_ids: Optional[Iterable[object]]) -> torch.Tensor:
     if values.numel() == 0:
         return values.sum()
@@ -50,6 +245,8 @@ def compute_tafr_grpo_auxiliary_loss(
     response_mask: torch.Tensor,
     group_reward_mean: torch.Tensor,
     beta: float,
+    beta_anchor: Optional[float] = None,
+    beta_replay: Optional[float] = None,
     variant: str = "full",
     anchor_log_prob: Optional[torch.Tensor] = None,
     replay_log_prob: Optional[torch.Tensor] = None,
@@ -64,8 +261,12 @@ def compute_tafr_grpo_auxiliary_loss(
     Replay KL:   D_KL(pi_replay || pi_theta)  = log pi_replay(y_i) - log pi_theta(y_i)
 
     Actor loss adds:
-        + beta * anchor_kl   (stay close to stable anchor)
-        - beta * (1 - r_bar_x) * replay_kl   (move away from failure modes)
+        + b_a * anchor_kl   (stay close to stable anchor)
+        - b_r * (1 - r_bar_x) * replay_kl   (move away from failure modes)
+
+    b_a/b_r default to `beta` (single-knob behaviour). Pass beta_anchor/beta_replay
+    to weight the two opposing pushes independently -- with one knob, raising the
+    replay push always raises the anchor pull that cancels it.
 
     Only log_prob carries actor gradients; anchor_log_prob and replay_log_prob
     must be detached (frozen models).
@@ -111,7 +312,9 @@ def compute_tafr_grpo_auxiliary_loss(
         replay_lp_metric = float(response_length_normalized_mean(frozen_replay, response_mask).mean().cpu())
         actor_lp_on_replay_metric = float(response_length_normalized_mean(log_prob.detach(), response_mask).mean().cpu())
 
-    loss = float(beta) * anchor_loss - float(beta) * replay_loss
+    b_a = float(beta if beta_anchor is None else beta_anchor)
+    b_r = float(beta if beta_replay is None else beta_replay)
+    loss = b_a * anchor_loss - b_r * replay_loss
     group_reward_mean_d = group_reward_mean.detach()
 
     metrics = {
@@ -126,6 +329,18 @@ def compute_tafr_grpo_auxiliary_loss(
             ((group_reward_mean_d > 0) & (group_reward_mean_d < 1)).float().mean().cpu()
         ),
         "tafr_grpo/beta": float(beta),
+        "tafr_grpo/beta_anchor": b_a,
+        "tafr_grpo/beta_replay": b_r,
+        # The TAFR term itself, decomposed. loss = anchor_term - replay_term, so
+        # tafr_advantage is the signed quantity TAFR adds on top of the GRPO objective:
+        # positive means the net push is toward the failure/replay model, negative means
+        # the anchor pull dominates. These are the numbers to plot against beta in an
+        # ablation -- kl_anchor/kl_replay above are beta-independent, so they cannot show
+        # how much of the update TAFR is actually responsible for.
+        "tafr_grpo/anchor_term": b_a * anchor_kl_metric,
+        "tafr_grpo/replay_term": b_r * replay_kl_metric,
+        "tafr_grpo/tafr_advantage": -float(loss.detach().cpu()),
+        "tafr_grpo/tafr_advantage_abs": abs(float(loss.detach().cpu())),
     }
     if variant in {"full", "anchor_only"}:
         metrics["tafr_grpo/actor_logprob"] = actor_lp_metric

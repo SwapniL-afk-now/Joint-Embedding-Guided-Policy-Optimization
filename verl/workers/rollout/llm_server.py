@@ -175,6 +175,7 @@ class LLMServerClient:
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
 
+    @auto_await
     @rollout_trace_op
     async def generate(
         self,
@@ -217,6 +218,35 @@ class LLMServerClient:
             return output
         finally:
             self._release_server(server_id)
+
+    @auto_await
+    async def generate_batch(self, requests: list[dict[str, Any]]) -> list[TokenOutput]:
+        """Submit independent token-generation requests concurrently."""
+        tasks = []
+        acquired: list[tuple[str, ray.actor.ActorHandle]] = []
+        for request in requests:
+            server_id, server = await self._acquire_server(str(request["request_id"]))
+            acquired.append((server_id, server))
+            multimodal_kwargs = {}
+            if request.get("audio_data") is not None:
+                multimodal_kwargs["audio_data"] = request["audio_data"]
+            if request.get("mm_processor_kwargs"):
+                multimodal_kwargs["mm_processor_kwargs"] = request["mm_processor_kwargs"]
+            tasks.append(
+                server.generate.remote(
+                    request_id=uuid4().hex,
+                    prompt_ids=request["prompt_ids"],
+                    sampling_params=request["sampling_params"],
+                    image_data=request.get("image_data"),
+                    video_data=request.get("video_data"),
+                    **multimodal_kwargs,
+                )
+            )
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for server_id, _ in acquired:
+                self._release_server(server_id)
 
     @auto_await
     async def score_tafr_logprobs(

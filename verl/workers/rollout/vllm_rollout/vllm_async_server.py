@@ -503,7 +503,14 @@ class vLLMHttpServer:
         assert max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        # Booleans retain the legacy sampled-token behavior. A positive integer
+        # asks vLLM for top alternatives, used by Hindsight-Posterior GRPO.
+        requested_logprobs = sampling_params.pop("logprobs", False)
+        sampling_params["logprobs"] = (
+            0
+            if requested_logprobs is True
+            else (int(requested_logprobs) if isinstance(requested_logprobs, int) and requested_logprobs > 0 else None)
+        )
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -568,6 +575,11 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            if sampling_params.logprobs > 0:
+                extra_fields["top_logprobs"] = [
+                    [(int(token_id), float(item.logprob)) for token_id, item in entries.items()]
+                    for entries in final_res.outputs[0].logprobs
+                ]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:

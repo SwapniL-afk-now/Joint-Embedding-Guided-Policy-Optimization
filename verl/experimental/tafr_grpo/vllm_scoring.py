@@ -14,6 +14,8 @@ class TAFRVLLMAdapterSpec:
 TAFR_VLLM_ADAPTERS: dict[str, TAFRVLLMAdapterSpec] = {
     "anchor": TAFRVLLMAdapterSpec(name="tafr_anchor", int_id=124, path="tafr_anchor_lora_path"),
     "replay": TAFRVLLMAdapterSpec(name="tafr_replay", int_id=125, path="tafr_replay_lora_path"),
+    # Paper advantage path: distinct anchor and failure-model LoRA slots.
+    "failure": TAFRVLLMAdapterSpec(name="tafr_failure", int_id=126, path="tafr_failure_lora_path"),
 }
 
 

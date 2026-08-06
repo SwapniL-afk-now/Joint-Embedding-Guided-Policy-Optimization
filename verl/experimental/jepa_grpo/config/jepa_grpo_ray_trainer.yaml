@@ -20,16 +20,25 @@ jepa:
   t_min: -5.0
   t_max: 5.0
   epps_pulley_s: 1.0
+  cot_system_prompt: "You are solving a difficult competition math problem using Python. Break the problem down, then write code to compute or verify each part. Run the code and check the output makes sense before trusting it. If the result looks wrong or an approach fails, revise the code or try a different method — do not force an answer. Final answer in \boxed{}."
   code_system_prompt: "You are a Python programming expert. Solve the following math problem by writing a complete, executable Python program that prints the answer."
   loss_type: llm-jepa          # DEFAULT: paper-exact LLM-JEPA (arXiv:2509.14252); also: jepa-tcr-dual | jepa-tcr-cot
   predictor_k: 4             # literal <|predictor_i|> tokens (paper §3.1, GSM8K-best k=4); trainer adds them to the tokenizer
   triplet_sigreg_lambda: 0.05  # SIGReg lambda for the jepa-tcr-dual loss
+  paper_sigreg_lambda: 0.0     # llm-jepa: L = (1-lam)*align + lam*SIGReg (0 = paper-exact)
+  self_code_targets: true      # llm-jepa: detached correct student CoT response target
   # -- jepa-tcr-dual teacher caches --
   teacher_cache_path: ""       # .pt of {dataset_index: (n_i,d)} teacher-correct targets
   n_targets_per_q: 4           # cap of cached targets used per question
   tcr_match: cycle             # anchor->target pairing: cycle | random
   max_anchors_per_prompt: 2    # llm-jepa: anchors per prompt in the JEPA backward (0 = all)
   jepa_anchor_set: correct     # anchors: correct | all | wrong (reward-stratified)
+  # -- advantage-aligned JEPA (llm-jepa; see ADVANTAGE_ALIGNED_JEPA.md) --
+  adv_weighting: false         # true = weight pulls by softmax(Â/tau) per prompt group; anchors = ALL rollouts
+  adv_target: best             # 'best' = group-best-advantage response target; 'self' = own response
+  adv_tau: 0.0                 # softmax temperature; 0.0 = auto (per-group advantage std, floor 1e-3)
+  neg_pull: false              # true = repel arm: anchors with Â < 0 pushed away from own response
+  neg_margin: 0.2              # triplet margin for the repel hinge max(0, m - cos)
   # -- jepa-tcr-dual teacher-alignment reward shaping --
   tcr_reward_beta: 0.5         # advantage-shaping strength (standardized score scale)
   tcr_reward_sigma_floor: 0.1  # min within-stratum std (noise guard)
@@ -43,6 +52,12 @@ jepa:
   auto_off_min_delta: 0.002
   auto_off_warmup_steps: 20
   auto_off_min_cos: 0.0        # plateau counter only starts once arm cosine >= this value (0.0 = disabled)
+  # -- optimizer-step coupling (defaults reproduce the existing two-step behaviour) --
+  fuse_optimizer_step: false   # true = ONE Adam step over g_policy + alpha*g_JEPA
+  update_before_policy: false  # decoupled only: true = JEPA step BEFORE the policy step
+  # -- llm-jepa-cluster --
+  min_correct_for_cluster: 2   # min correct rollouts a prompt needs to contribute a pair
+  cluster_repel: 0.0           # >0 => margin objective (loss - repel*(1-cos_all_pairs))
 
 # ── Algorithm (GRPO, no KL) ─────────────────────────────────────────────────
 algorithm:

@@ -117,7 +117,9 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def train_batch(self, data: TensorDict, loss_function: Callable, apply_step: bool = True) -> Any:
+    def train_batch(
+        self, data: TensorDict, loss_function: Callable, apply_step: bool = True, zero_grad: bool = True
+    ) -> Any:
         """
         Perform a training step on a batch of data.
 
@@ -130,19 +132,39 @@ class BaseEngine:
                 parameters) before issuing one combined `optimizer_step()` itself. Used to fuse
                 multiple losses into a single optimizer step instead of taking independent steps.
                 Defaults to True, which preserves the original one-call-does-everything behavior.
+            zero_grad: If False, do NOT zero the gradient before this batch's backward pass, so
+                it accumulates onto whatever is already there. This is the other half of
+                `apply_step=False`: together they turn a sequence of calls into gradient-
+                accumulation units of one logical batch with a single optimizer step at the end.
+                Defaults to True, which preserves the original per-call zeroing.
 
         Returns:
             dict[str, torch.Tensor]: A dictionary containing the aggregated training metrics for the batch.
         """
         maybe_fix_3d_position_ids(data)
 
-        self.optimizer_zero_grad()
+        if zero_grad:
+            self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
         if apply_step:
             grad_norm = self.optimizer_step()
             if self.is_mp_src_rank_with_outputs():
                 assert "grad_norm" not in outputs["metrics"]
                 outputs["metrics"]["grad_norm"] = grad_norm
+                # Observable proof of the one-step-per-logical-batch invariant; the
+                # counters are reset by optimizer_zero_grad. These must be Metric
+                # objects, not bare floats: train_mini_batch collects each key into a
+                # list across micro-batches and chain.from_iterable()s anything that
+                # is not a list of Metric, which fails on a list of scalars.
+                from verl.utils.metric import AggregationType, Metric
+
+                outputs["metrics"]["optimization/optimizer_step_calls_this_batch"] = Metric(
+                    value=float(getattr(self, "_optimizer_step_calls", 1)), aggregation=AggregationType.MAX
+                )
+                outputs["metrics"]["optimization/optimizer_step_skipped_nonfinite"] = Metric(
+                    value=float(getattr(self, "_optimizer_steps_skipped_nonfinite", 0)),
+                    aggregation=AggregationType.SUM,
+                )
         return outputs
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:

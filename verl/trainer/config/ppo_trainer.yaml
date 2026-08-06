@@ -109,6 +109,34 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+# config for Group Policy-Improvement Cross Entropy (GPI-CE)
+custom_gpi_ce:
+
+  # Whether to enable the GPI-CE objective (replaces advantage estimation entirely)
+  enable: false
+
+  # Online candidates per prompt; MUST equal actor_rollout_ref.rollout.n
+  online_per_prompt: 4
+
+  # Offline candidates appended per prompt after the rollout replicas sleep
+  offline_per_prompt: 4
+
+  # tau in q* = softmax(s_old + r/tau); 0.5 for binary rewards
+  temperature: 0.5
+
+  # Sequence score reduction; only token_mean is implemented
+  score_normalization: token_mean
+
+  # Score offline candidates with the training verifier instead of trusting the parquet
+  verify_offline: true
+
+  # Cycle available offline responses when a prompt has fewer than offline_per_prompt
+  allow_short_offline: false
+
+  # Build q* inside the training forward instead of running a separate old-policy
+  # forward. Exact when ppo_epochs=1 and there is one optimizer step per batch.
+  fuse_old_log_prob: true
+
 # config for Trajectory-Anchored Failure-Replay GRPO
 custom_tafr_grpo:
 
@@ -119,7 +147,6 @@ custom_tafr_grpo:
   beta: 0.0
 
   # Anchor KL coefficient (overrides beta when > 0; 0 = use beta)
-  anchor_beta: 0.0
 
   # EMA decay for saved GRPO and failure-SFT checkpoints
   ema_gamma: 0.99
@@ -204,6 +231,91 @@ custom_sharpening_grpo:
 
   # PPO clip epsilon for the sequence sharpening surrogate
   clip_ratio: 0.2
+
+# config for abstract-reasoning compression GRPO
+custom_abstract_rl:
+
+  # Whether to enable the abstraction utility reward + compression KL
+  enable: false
+
+  # false -> U_i = r_i (compression-only ablation)
+  use_utility: true
+
+  # lambda on the abstraction compression KL; 0 -> usefulness-only ablation
+  kl_coef: 0.05
+
+  # verl KL estimator for the compression term ("low_var_kl" is k3)
+  kl_type: low_var_kl
+  kl_clip: 2.0
+
+  # clip bound on the per-token likelihood gain Delta
+  delta_clip: 1.0
+  invalid_delta: zero
+  valid_bonus: 0.2
+
+  # "matched": baseline scored under the same template with an empty abstract
+  # "stored" : spec-exact, baseline read from the rollout old_log_probs
+  delta_baseline: matched
+
+  # true -> feed 2U-1 (identical to the +-1 task reward when Delta == 0)
+  utility_affine: true
+
+  # abstraction delimiters
+  open_tag: "<abstract>"
+  close_tag: "</abstract>"
+
+  # only the last N response tokens are scanned for the tags
+  max_scan_tokens: 512
+
+  # append the abstraction instruction to the rollout prompt (train and val)
+  inject_instruction: true
+
+  # "spec" is the instruction exactly as specified; "strong" states the same
+  # requirement imperatively and measures a ~7x higher emission rate
+  instruction_variant: spec
+
+  # free-form instruction; wins over instruction_variant when non-empty
+  instruction_override: ""
+
+  # true -> only correct rollouts enter the scoring batch (~2x cheaper)
+  score_only_correct: false
+
+  # token budget per GPU for the teacher-forced scoring forward
+  scoring_max_token_len_per_gpu: 24576
+
+  # cap on reasoning tokens re-scored per row (0 = no cap)
+  max_score_response_tokens: 0
+
+  # two-phase format bootstrap: graft abstractions into rollouts that emitted none,
+  # for the first N steps. 0 disables it. This is a SECOND generation stage and makes
+  # the update a reward-weighted self-distillation until it latches off.
+  bootstrap_steps: 0
+
+  # fraction of eligible rollouts to graft; must be strictly between 0 and 1, or the
+  # gradient on emitting the tags cancels within the group
+  bootstrap_graft_fraction: 0.5
+
+  # latch grafting off once the native emission rate holds at/above this...
+  bootstrap_native_threshold: 0.3
+
+  # ...for this many consecutive steps
+  bootstrap_patience: 3
+
+  # token cap on a grafted abstraction block
+  bootstrap_max_abstract_tokens: 256
+
+  # for the first N steps replace the policy loss with a plain SFT loss on the
+  # abstraction span of correct, valid rollouts (the bootstrap update is not a
+  # policy gradient anyway). Must be <= bootstrap_steps. 0 disables.
+  bootstrap_sft_steps: 0
+  bootstrap_sft_lr: 0.0
+  bootstrap_sft_clip_grad: 0.0
+  bootstrap_sft_accuracy_drop: 0.10
+  bootstrap_sft_min_length_fraction: 0.6
+  bootstrap_abstract_cache: ''
+
+  # print N parsed examples per step (smoke runs)
+  debug_print_n: 0
 
 # config for the trainer
 trainer:

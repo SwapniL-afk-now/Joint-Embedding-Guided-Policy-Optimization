@@ -49,6 +49,36 @@ def concat_dict_to_str(dict: dict, step):
         "train/pass_at_8",
         "train/unique_answer_ratio_at_k",
         "train/exploration_collapse_rate",
+        # GPI-CE: target_mass_offline is the one that says whether the offline
+        # candidates earn any of q*'s mass; degenerate_group_fraction is how much of
+        # the batch has tied rewards and therefore contributes exactly zero gradient.
+        "gpi/loss",
+        "gpi/target_mass_offline",
+        "gpi/old_mass_offline",
+        "gpi/target_reward_improvement",
+        "gpi/degenerate_group_fraction",
+        "gpi/projection_kl",
+        "gpi/target_entropy",
+        "gpi/policy_entropy",
+        "gpi/reward_offline_mean",
+        "gpi/reward_online_mean",
+        "gpi/seq_score_offline_mean",
+        "gpi/seq_score_online_mean",
+        # Is A_reg per-token in effect, or only in shape? within >> between means
+        # it varies along each rollout instead of just rescaling whole rollouts.
+        "tafr_adv/raw_anchor_rms",
+        "tafr_adv/raw_failure_rms",
+        "tafr_adv/anchor_contribution_rms",
+        "tafr_adv/failure_contribution_rms",
+        "tafr_adv/failure_over_anchor_ratio",
+        "tafr_adv/advantage_abs_p50",
+        "tafr_adv/advantage_abs_p90",
+        "tafr_adv/advantage_abs_p99",
+        "tafr_adv/advantage_abs_max_all",
+        "tafr_adv/advantage_within_seq_std",
+        "tafr_adv/advantage_between_seq_std",
+        "tafr_adv/failure_signal_within_seq_std",
+        "tafr_adv/failure_signal_between_seq_std",
         "tafr_grpo/loss_total",
         "tafr_grpo/loss_grpo",
         "tafr_grpo/kl_anchor",
@@ -59,6 +89,29 @@ def concat_dict_to_str(dict: dict, step):
         "tafr_grpo/did_sft_update_this_step",
         "tafr_grpo/did_checkpoint_save_this_step",
         "tafr_grpo/failure_sft_loss",
+        "tafr_grpo/failure_sft_updates",
+        "tafr_adv/failure_model_ready",
+        "tafr_adv/failure_model_update_count",
+        "tafr_adv/active_group_fraction",
+        "tafr_adv/scored_token_fraction",
+        "tafr_adv/failure_signal_mean",
+        "tafr_adv/failure_signal_std",
+        "tafr_adv/regularization_loss",
+        "tafr_adv/weighted_regularization_loss",
+        "tafr_adv/combined_policy_loss",
+        "tafr_adv/loss_delta_vs_grpo",
+        "tafr_adv/stability_signal_mean",
+        "tafr_adv/stability_signal_std",
+        "tafr_adv/regularization_advantage_rms",
+        "tafr_adv/grpo_advantage_rms",
+        "tafr_adv/weighted_regularization_advantage_rms",
+        "tafr_adv/regularization_to_grpo_rms_ratio",
+        "tafr_adv/normalization_scale",
+        "tafr_adv/all_correct/failure_component_abs_max",
+        "tafr_adv/failure_loss",
+        "tafr_adv/weighted_failure_loss",
+        "tafr_adv/all_correct/advantage_abs_max",
+        "actor/optimization/optimizer_step_calls_this_batch",
         "val/amc23/pass_at_1",
         "val/amc23/pass_at_8",
         "val/amc23/avg_at_k",
@@ -81,6 +134,10 @@ def concat_dict_to_str(dict: dict, step):
         "code/pass_at_1",
         "code/avg_reward",
     ]
+    # Per-phase timings are how you find where a step actually goes; printing the
+    # whole family costs nothing and beats guessing from the total.
+    preferred = preferred + sorted(k for k in dict if k.startswith("timing_s/") and k not in preferred)
+    preferred = preferred + sorted(k for k in dict if k.startswith("abstract_rl/") and k not in preferred)
     output = [f"step:{step}"]
     seen = set()
     for k in preferred:

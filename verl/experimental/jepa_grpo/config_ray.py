@@ -31,12 +31,9 @@ class JEPARayConfig:
     """
 
     enable: bool = True
-    # Split of actor_rollout_ref.rollout.n completions per prompt between the
-    # CoT-framed and Code-framed system prompts. Both subsets contribute to
-    # the GRPO policy-gradient update (the old behavior generated a SEPARATE,
-    # full rollout_n-sized Code batch on top of the CoT one, whose reward was
-    # used only for JEPA pairing — half the rollout compute never reached the
-    # policy gradient). n_cot + n_code must equal rollout_n; see validate().
+    # Split actor_rollout_ref.rollout.n between CoT and Code prompts. Both
+    # subsets contribute to GRPO; the self-response llm-jepa arm uses only
+    # correct CoT rows as anchors and targets. n_cot + n_code must equal rollout_n.
     n_cot: int = 8
     n_code: int = 0
     # Also run a Code-view pass during validation and report val-code/* and
@@ -71,6 +68,20 @@ class JEPARayConfig:
     # 1.0). Requires ppo_epochs==1 and ppo_mini_batch_size >= train_batch_size
     # (the engine zeroes grad per mini-batch), enforced in ray_trainer.
     fuse_optimizer_step: bool = False
+    # DECOUPLED ordering only (fuse_optimizer_step=False): run the JEPA update BEFORE the
+    # GRPO policy update instead of after it, so the representation step is applied first
+    # and the policy step lands on the already-shaped weights (the sequencing borrowed from
+    # EEPO, arXiv:2510.05837, which places its rollout-side update ahead of the GRPO step).
+    # NOTE: two sequential Adam steps on the SHARED actor optimizer alternately update its
+    # m/v buffers, and Adam's second-moment rescaling means `alpha` no longer controls the
+    # relative contribution -- see the fuse_optimizer_step rationale under 'h-grpo' below.
+    # This flag exists to MEASURE that difference against the fused arm, not because the
+    # ordering is free of it.
+    update_before_policy: bool = False
+    # llm-jepa-cluster: minimum correct rollouts a prompt needs to contribute. 2 is the
+    # floor (one pair); higher values restrict the loss to prompts the policy solves often.
+    min_correct_for_cluster: int = 2
+    cluster_repel: float = 0.0  # >0: optimise the within-prompt MARGIN (collapse guard)
     # Residualise the h-grpo compatibility score s_ij against rollout LENGTH, within
     # each group, before the softmax. Measured on run ar6ntx2j (800 steps, 1.5B):
     # corr(jepa/margin, response_length) = +0.81 while corr(length, critic/score) = -0.11
@@ -94,26 +105,43 @@ class JEPARayConfig:
     t_min: float = -5.0
     t_max: float = 5.0
     epps_pulley_s: float = 1.0
+    # CoT view system prompt override; if empty keeps the dataset/chat-template
+    # default system prompt. The user message is left exactly as the dataset
+    # built it — only the system role is replaced.
+    cot_system_prompt: str = (
+        "You are solving a difficult competition math problem using Python. "
+        "Break the problem down, then write code to compute or verify each "
+        "part. Run the code and check the output makes sense before trusting "
+        "it. If the result looks wrong or an approach fails, revise the code "
+        "or try a different method — do not force an answer. Final answer in "
+        "\\boxed{}."
+    )
     # Code view system prompt override; if empty uses default math CoT prompt
     code_system_prompt: str = (
-        "You are a Python programming expert. "
-        "Solve the following math problem by writing a complete, executable Python program "
-        "that prints the answer. Do not include any natural language explanation outside comments."
+        "You are an expert competitive-programming Python solver. "
+        "Solve the math problem by writing one complete, executable Python 3 program. "
+        "Reason and verify the solution silently before responding. "
+        "The program must be self-contained, deterministic, and print only the final answer; "
+        "do not rely on external files, network access, or nonstandard packages. "
+        "Use exact arithmetic or sufficient numerical precision when needed, handle edge cases, "
+        "and ensure the program runs as written. Do not include explanations or prose outside comments."
+    )
+    # Appended to the USER message of the code view (not the system prompt — the
+    # math-RL model follows user content better for output formatting). Measured
+    # in the code-prompt probe: this format line lifts code output-match rate
+    # from ~0.20 to ~0.24 and code fence usage to ~97%.
+    code_format_line: str = (
+        "\n\nOutput exactly one ```python code block containing the complete executable program. "
+        "Include no prose before or after the code block; the program itself must print only the final answer."
     )
     # JEPA objective. The ray/worker path supports:
-    #   "llm-jepa" (DEFAULT) — the paper-exact LLM-JEPA loss (arXiv:2509.14252,
-    #       official finetune.py), adapted to RL: the student generates CoT rollouts
-    #       only; each rollout's tied-weight-predictor read p = Pred(Enc([x, y_S,
-    #       [PRED]×k])) predicts BOTH pregenerated big-teacher views, y^T_cot and
-    #       y^T_code, with the paper's cosine-distance loss
-    #           L = (1 - cos(p, Enc([x, y^T_cot]))) + (1 - cos(p, Enc([x, y^T_code])))
-    #       flat-averaged over anchors. NO stop-gradient on any branch (both the
-    #       anchor and target encodes are grad-enabled, exactly like the reference
-    #       implementation's concatenated single-model forward), no SIGReg, no
-    #       stratification, no self-consistency arm, no reward shaping (set
-    #       tcr_reward_beta=0). Requires teacher_cache_path AND
-    #       code_teacher_cache_path (verified-correct TEXT caches {idx: [y^+, ...]}).
+    #   "llm-jepa" (DEFAULT) — RL JEPA with one student-CoT target:
+    #       p = Pred(Enc(prompt + [PRED])); z = stopgrad(Enc(student CoT response));
+    #       L = mean(1 - cosine(p, z)) plus optional SIGReg on the live prediction.
+    #       Only correct CoT rollouts are selected. Code rollouts remain solely
+    #       for GRPO execution rewards; they do not enter the JEPA loss.
     #       See core_algos.llm_jepa_paper_loss.
+
     #   "jepa-tcr-dual" — Dual-target, self-consistent Teacher-Correct Representation
     #       alignment. SEPARATE CoT and Code student anchors, each with [PRED]; each
     #       view's pred is pulled toward its OWN precomputed teacher-correct target
@@ -145,6 +173,10 @@ class JEPARayConfig:
     loss_type: str = "llm-jepa"
     # llm-jepa-infoNCE only: softmax temperature τ.
     infonce_tau: float = 0.1
+    paper_sigreg_lambda: float = 0.0
+    # llm-jepa only: use the student's own correct CoT response as the detached target.
+    # The target is response-only; Code rollouts are not used by this JEPA arm.
+    self_code_targets: bool = True
     # llm-jepa-geometry parameters.
     geometry_tau: float = 0.1
     geometry_margin: float = 0.1
@@ -209,15 +241,36 @@ class JEPARayConfig:
     # also the main speed lever of the JEPA backward (anchors dominate GradCache cost:
     # 2 forwards + 1 backward per anchor row). 0 = unlimited (use every selected anchor).
     max_anchors_per_prompt: int = 2
-    # Which student rollouts become JEPA anchors (jepa-tcr-loss only). All anchors,
+    # Which student rollouts become JEPA inputs. All selected responses,
     # correct or wrong, use the identical [x, y_S, [PRED]xk] -> sg(z_T^+) format; the
     # [PRED] token predicts the teacher-correct latent from the student's response
     # context (refinement for correct, latent correction for wrong). Reward-stratified,
     # prompt-averaged so wrong-anchor counts never implicitly weight the loss.
     #   "correct" — only rew>0 rollouts (default; reproduces today's selection)
-    #   "all"     — every rollout (correct + wrong)
+    #   "all"     — every rollout (correct + wrong; unfiltered cluster mode)
     #   "wrong"   — only rew<=0 rollouts (analysis ablation)
     jepa_anchor_set: str = "correct"
+    # -- Advantage-aligned JEPA (gradient-alignment fix; loss_type='llm-jepa') --
+    # Couples the self-predictive pull to the Dr.GRPO advantage Â so the aux gradient
+    # shares the policy gradient's sample support (AWR identity) instead of a uniform
+    # correct-only pull that is ~orthogonal to it. Only read by the llm-jepa path.
+    #   adv_weighting: weight each anchor's pull by softmax(Â/tau) over its prompt
+    #     group, and (when adv_target='best') pull every anchor toward the group's
+    #     highest-advantage response embedding instead of its own. All rollouts of a
+    #     prompt become anchors (advantage is the filter; max_anchors_per_prompt still
+    #     caps the total, keeping the group's argmax row).
+    #   adv_tau: softmax temperature. 0.0 = auto: per-group std of the group's
+    #     advantages (floored at 1e-3), i.e. scale-matched to Dr.GRPO's unnormalized
+    #     advantages; >0 = fixed.
+    #   neg_pull: add the repel arm — anchors with Â < 0 are read with
+    #     <|bad_predictor_i|> tokens and pushed AWAY from their own response embedding
+    #     by max(0, neg_margin - cos), weighted by softmax(-Â/tau). Gives the pull a
+    #     direction (hard-negatives) and prevents the trivial self-prediction plateau.
+    adv_weighting: bool = False
+    adv_target: str = "best"       # 'best' = group-best response target; 'self' = own response
+    adv_tau: float = 0.0           # 0.0 = auto (per-group advantage std, floored)
+    neg_pull: bool = False
+    neg_margin: float = 0.2
     # -- jepa-tcr-dual reward shaping (idea #2) --
     # Uses the SAME teacher_cache_path / n_targets_per_q as jepa-tcr-loss, but applies
     # the alignment as an additive advantage term β·ŝ_i (NO differentiable loss / no
@@ -287,41 +340,54 @@ class JEPARayConfig:
             return
         if self.loss_type not in (
             "llm-jepa", "llm-jepa-contrastive", "llm-jepa-infoNCE", "llm-jepa-geometry",
-            "llm-jepa-triplet", "h-grpo", "jepa-tcr-dual", "jepa-tcr-cot"
+            "llm-jepa-triplet", "llm-jepa-cluster", "h-grpo", "jepa-tcr-dual", "jepa-tcr-cot"
         ):
             raise ValueError(
                 f"jepa.loss_type must be 'llm-jepa', 'llm-jepa-contrastive', 'llm-jepa-infoNCE', "
-                f"'llm-jepa-geometry', 'llm-jepa-triplet', 'h-grpo', 'jepa-tcr-dual' "
-                f"or 'jepa-tcr-cot'; got {self.loss_type!r}"
+                f"'llm-jepa-geometry', 'llm-jepa-triplet', 'llm-jepa-cluster', 'h-grpo', "
+                f"'jepa-tcr-dual' or 'jepa-tcr-cot'; got {self.loss_type!r}"
             )
-        if not self.teacher_cache_path:
+        # 'llm-jepa-cluster' (core_algos.llm_jepa_cluster_loss): the prompt's own CORRECT
+        # rollouts are each other's views -- L = mean_x mean_{i!=j in C_x} (1 - cos(z_i,z_j))
+        # over prompts with |C_x| >= 2. It uses NO teacher target, so it is the one loss_type
+        # that needs no cache at all; it must therefore be exempted before the shared
+        # teacher_cache_path check below rather than after it.
+        if self.loss_type == "llm-jepa-cluster":
+            if self.predictor_k != 0:
+                raise ValueError(
+                    "jepa.loss_type='llm-jepa-cluster' requires predictor_k=0 (the paper's "
+                    "identity predictor Pred(x)=x, last-content-token read). Appending "
+                    "[PRED] tokens would add a shortcut the correct-vs-correct objective "
+                    f"cannot need. Got predictor_k={self.predictor_k}."
+                )
+            if self.n_code > 0:
+                raise ValueError(
+                    "jepa.loss_type='llm-jepa-cluster' uses CoT student rollouts only; "
+                    f"set n_code=0 (got {self.n_code})."
+                )
+            if self.min_correct_for_cluster < 2:
+                raise ValueError(
+                    "jepa.min_correct_for_cluster must be >= 2: a correct read needs at "
+                    "least one other correct read to be pulled toward. Got "
+                    f"{self.min_correct_for_cluster}."
+                )
+            return
+        if self.loss_type != "llm-jepa" and not self.teacher_cache_path:
             raise ValueError(
                 f"jepa.loss_type={self.loss_type!r} requires jepa.teacher_cache_path "
-                "(the CoT-view verified-correct TEXT cache {idx: [y^+,...]} from "
-                "precompute_teacher_targets.py --view cot; z^+ is recomputed online)"
+                "(the verified-correct TEXT cache {idx: [y^+,...]})"
             )
-        # 'jepa-tcr-cot' is the CoT-only mode: no code cache, no code rollouts, no
-        # self-consistency arm. The dual machinery degrades to align_cot + SIGReg(pred_cot)
-        # when the code arm is empty (see llm_jepa_tcr_dual_loss / n_code=0 handling).
-        # llm-jepa: the student CoT predicts BOTH pregenerated teacher views, so the
-        # code-view TEXT cache is required even though no code rollouts are generated.
-        # llm-jepa-contrastive shares llm-jepa's data contract (student CoT predicts BOTH
-        # teacher views for its correct anchors); it additionally uses wrong rollouts, which
-        # need no extra cache. Both require the code-view cache, n_code=0, and predictor_k>0.
-        if self.loss_type in ("llm-jepa", "llm-jepa-contrastive") and not self.code_teacher_cache_path:
+        # llm-jepa is self-CoT only: no teacher Code cache and no Code JEPA arm.
+        # Code rows may still be present in the combined GRPO batch for execution
+        # rewards. Other loss types retain their existing cache requirements.
+        if self.loss_type == "llm-jepa" and not self.self_code_targets:
             raise ValueError(
-                f"jepa.loss_type={self.loss_type!r} requires jepa.code_teacher_cache_path "
-                "(the pregenerated big-teacher Code-view TEXT cache {idx: [y^+,...]}); "
-                "the student's CoT prediction is aligned to BOTH teacher views."
-            )
-        if self.loss_type in ("llm-jepa", "llm-jepa-contrastive") and self.n_code > 0:
-            raise ValueError(
-                f"jepa.loss_type={self.loss_type!r}: the student generates CoT rollouts only; "
-                f"set n_code=0 (got {self.n_code})."
+                "jepa.loss_type=llm-jepa requires jepa.self_code_targets=True; "
+                "the target is the detached correct student CoT response."
             )
         if self.loss_type == "llm-jepa-contrastive" and self.predictor_k <= 0:
             raise ValueError(
-                "jepa.loss_type='llm-jepa-contrastive' needs the <good_pred>/<bad_pred> reads; "
+                "jepa.loss_type=llm-jepa-contrastive needs the <good_pred>/<bad_pred> reads; "
                 f"set predictor_k > 0 (got {self.predictor_k})."
             )
         # llm-jepa-infoNCE: CoT rollouts + CoT teacher cache only. With predictor_k > 0
@@ -442,15 +508,20 @@ class JEPARayConfig:
             raise ValueError(
                 f"jepa.jepa_anchor_set must be 'correct', 'all' or 'wrong'; got {self.jepa_anchor_set!r}"
             )
+        if self.adv_target not in ("best", "self"):
+            raise ValueError(
+                f"jepa.adv_target must be 'best' or 'self'; got {self.adv_target!r}"
+            )
+        if self.adv_tau < 0:
+            raise ValueError(f"jepa.adv_tau must be >= 0; got {self.adv_tau}")
+        if self.neg_margin < 0:
+            raise ValueError(f"jepa.neg_margin must be >= 0; got {self.neg_margin}")
         if self.tcr_reward_beta < 0:
             raise ValueError(f"jepa.tcr_reward_beta must be >= 0; got {self.tcr_reward_beta}")
         if self.tcr_reward_sigma_floor <= 0:
             raise ValueError(f"jepa.tcr_reward_sigma_floor must be > 0; got {self.tcr_reward_sigma_floor}")
         if self.n_cot < 0 or self.n_code < 0:
             raise ValueError(f"jepa.n_cot ({self.n_cot}) and jepa.n_code ({self.n_code}) must be >= 0")
-        # n_code == 0 is allowed: no code-framed rollouts are generated and the
-        # loss's "code" arm becomes a cot->code-teacher pull (CoT anchors paired
-        # with code_teacher_cache targets); it still needs the code cache above.
         if self.n_cot + self.n_code != rollout_n:
             raise ValueError(
                 f"jepa.n_cot ({self.n_cot}) + jepa.n_code ({self.n_code}) must equal "

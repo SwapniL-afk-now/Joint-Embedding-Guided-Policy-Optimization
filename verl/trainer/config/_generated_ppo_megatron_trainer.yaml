@@ -99,10 +99,27 @@ actor_rollout_ref:
       clip_cov_ub: 5.0
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
+    wasserstein_guidance:
+      _target_: verl.workers.config.WassersteinGuidanceConfig
+      enable: false
+      lambda_wg: 0.01
+      alpha_transport: 0.2
+      embed_model: BAAI/bge-small-en-v1.5
+      decode_model: ''
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null
+    ppo_loss_coef: 1.0
     entropy_coeff: 0
+    exploration:
+      _target_: verl.trainer.ppo.exploration.ExplorationConfig
+      enabled: false
+      alpha_max: 0.3
+      delta: 3.0
+      ema_gamma: 0.995
+      ema_update_every: 5
+      entropy_threshold_ratio: 0.5
+      warmup_steps: 100
     calculate_entropy: false
     calculate_sum_pi_squared: false
     use_kl_loss: false
@@ -112,6 +129,7 @@ actor_rollout_ref:
     kl_loss_type: low_var_kl
     ppo_epochs: 1
     shuffle: false
+    accumulate_minibatch_grads: false
     data_loader_seed: 42
     checkpoint:
       _target_: verl.trainer.config.CheckpointConfig
@@ -874,6 +892,68 @@ distillation:
         response_length: ${oc.select:actor_rollout_ref.rollout.response_length}
         temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
   teacher_key: data_source
+custom_gpi_ce:
+  enable: false
+  online_per_prompt: 4
+  offline_per_prompt: 4
+  temperature: 0.5
+  score_normalization: token_mean
+  verify_offline: true
+  allow_short_offline: false
+  fuse_old_log_prob: true
+custom_tafr_grpo:
+  enable: false
+  beta: 0.0
+  ema_gamma: 0.99
+  mix_eta: 1.0
+  sft_update_interval_grpo_steps: 5
+  checkpoint_interval_grpo_steps: 10
+  disable_builtin_kl: true
+  failure_sft_lr: 1.0e-06
+  failure_sft_batch_size: 8
+  failure_sft_max_token_len_per_gpu: 0
+  failure_sft_max_updates_per_interval: 1
+  save_to_disk_interval_grpo_steps: 0
+  save_failure_sft_optimizer: true
+  failure_data_max_size: null
+  failure_data_sampling: recent
+  anchor_checkpoint_dir: null
+  replay_checkpoint_dir: null
+  variant: full
+  logprob_backend: hf
+  vllm_score_micro_batch_size: 16
+custom_sharpening_grpo:
+  enable: false
+  use_grpo_reward: true
+  gamma: 0.1
+  alpha: 1.0
+  beta: 0.1
+  group_size: 8
+  clip_ratio: 0.2
+custom_abstract_rl:
+  enable: false
+  use_utility: true
+  kl_coef: 0.05
+  kl_type: low_var_kl
+  delta_clip: 1.0
+  delta_baseline: matched
+  utility_affine: true
+  open_tag: <abstract>
+  close_tag: </abstract>
+  max_scan_tokens: 512
+  inject_instruction: true
+  instruction_variant: spec
+  instruction_override: ''
+  score_only_correct: false
+  scoring_max_token_len_per_gpu: 24576
+  max_score_response_tokens: 0
+  bootstrap_steps: 0
+  bootstrap_graft_fraction: 0.5
+  bootstrap_native_threshold: 0.3
+  bootstrap_patience: 3
+  bootstrap_max_abstract_tokens: 256
+  bootstrap_sft_steps: 0
+  debug_print_n: 0
 trainer:
   balance_batch: true
   total_epochs: 30

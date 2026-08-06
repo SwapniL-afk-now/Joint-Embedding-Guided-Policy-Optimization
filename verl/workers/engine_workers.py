@@ -186,7 +186,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def _initialize_exploration(self):
         if not getattr(self.exploration_config, "enabled", False):
             self.exploration = None
-            setattr(self.engine, "exploration", None)
+            self.engine.exploration = None
             return
 
         tracker = EMALoRATracker(
@@ -208,7 +208,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # SED state is intentionally in-memory for v1. After checkpoint load we
         # reinitialize EMA from current LoRA weights, so exploration memory starts
         # near the resumed policy until the EMA catches up.
-        setattr(self.engine, "exploration", self.exploration)
+        self.engine.exploration = self.exploration
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """
@@ -293,6 +293,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # issuing one combined step afterward (see BaseEngine.train_batch). Applies uniformly to
         # all mini-batches produced by this call. Defaults to True (original behavior).
         apply_step = tu.pop(data, key="apply_step", default=True)
+        # accumulate_minibatch_grads=True turns the mini-batches of this call into
+        # gradient-accumulation units of ONE logical batch: zero the gradient only
+        # before the first, step the optimizer only after the last. Without it each
+        # mini-batch zeroes, backs off and steps independently (the historical
+        # behavior, preserved by the default).
+        accumulate_minibatch_grads = tu.pop(data, key="accumulate_minibatch_grads", default=False)
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -315,8 +321,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         with (
-            self.engine.train_mode(disable_auto_offload=disable_auto_offload,
-                                   keep_grad=not apply_step),
+            self.engine.train_mode(disable_auto_offload=disable_auto_offload, keep_grad=not apply_step),
             Timer(name="train_batch", logger=None),
         ):
             # update
@@ -338,12 +343,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 else:
                     global_token_num = None
 
+                is_last = batch_idx == total_num_iterations - 1
                 tu.assign_non_tensor(
                     mini_batch_td,
                     global_token_num=NonTensorData(global_token_num),
-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
+                    update_lr_scheduler=is_last,
                     disable_auto_offload=True,
-                    apply_step=apply_step,
+                    apply_step=(apply_step and is_last) if accumulate_minibatch_grads else apply_step,
+                    zero_grad=(batch_idx == 0) if accumulate_minibatch_grads else True,
                 )
                 actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
@@ -355,11 +362,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     for key, val in output.items():
                         # flattn dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.aggregate_dp(val)
-                                if isinstance(val[0], Metric)
-                                else list(chain.from_iterable(val))
-                            )
+                            try:
+                                output[key] = (
+                                    Metric.aggregate_dp(val)
+                                    if isinstance(val[0], Metric)
+                                    else list(chain.from_iterable(val))
+                                )
+                            except TypeError as exc:
+                                raise TypeError(f"metric {key!r} = {val!r}: {exc}") from exc
                     append_to_dict(metrics, output)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
@@ -380,6 +390,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # optimizer, so it can add a further backward pass (e.g. an auxiliary loss on the same
         # parameters) before issuing one combined optimizer step itself. Defaults to True.
         apply_step = tu.get(data, key="apply_step", default=True)
+        # zero_grad=False accumulates this mini-batch's gradient onto the previous
+        # one instead of starting fresh (see train_mini_batch's
+        # accumulate_minibatch_grads).
+        zero_grad = tu.get(data, key="zero_grad", default=True)
 
         # inject engineering parameters if not specified
         default_keys = dict(
@@ -394,14 +408,19 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
 
+        from verl.experimental.abstract_rl.trainer_hooks import sft_warmup_optimizer
+
         with (
             # keep_grad: apply_step=False means a caller will fuse another backward onto
             # this gradient and issue one combined step, so the context must not zero it.
-            self.engine.train_mode(disable_auto_offload=disable_auto_offload,
-                                   keep_grad=not apply_step),
+            self.engine.train_mode(disable_auto_offload=disable_auto_offload, keep_grad=not apply_step),
+            # no-op unless the abstract_rl format warm-up is active this step
+            sft_warmup_optimizer(self.engine, tu.get(data, key="custom_abstract_rl", default=None)),
             Timer(name="train_batch", logger=None) as timer,
         ):
-            output = self.engine.train_batch(data, loss_function=self.loss_fn, apply_step=apply_step)
+            output = self.engine.train_batch(
+                data, loss_function=self.loss_fn, apply_step=apply_step, zero_grad=zero_grad
+            )
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
@@ -738,6 +757,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="tafr_failure_log_prob")
+    def tafr_compute_failure_log_prob(self, data: TensorDict) -> TensorDict:
+        output = self.actor.engine.tafr_compute_failure_log_prob(data)
+        return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="purple", role="tafr_replay_log_prob")
     def tafr_compute_replay_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.actor.engine.tafr_compute_replay_log_prob(data)
@@ -755,6 +780,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return self.actor.engine.tafr_failure_sft_update(records, tafr_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def tafr_update_failure_ema(self, tafr_config: dict):
+        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
+        return self.actor.engine.tafr_update_failure_ema(tafr_config)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def tafr_save_and_refresh(self, local_path: str, global_step: int, failure_model_changed: bool, tafr_config: dict):
         assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
         return self.actor.engine.tafr_save_and_refresh(local_path, global_step, failure_model_changed, tafr_config)
@@ -765,9 +795,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return self.actor.engine.tafr_export_vllm_adapters(tafr_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def tafr_load(self, local_path: str):
+    def tafr_load(self, local_path: str, tafr_config: dict | None = None):
         assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
-        return self.actor.engine.tafr_load(local_path)
+        return self.actor.engine.tafr_load(local_path, tafr_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
