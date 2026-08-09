@@ -267,6 +267,15 @@ custom_abstract_rl:
   # only the last N response tokens are scanned for the tags
   max_scan_tokens: 512
 
+  # hard cap on |A_i|; over budget -> invalid (v_i=0, same as missing/degenerate).
+  # 0 disables. Fixes the reward hack where the model dumped the whole solution
+  # into <abstract> -- see plan.md section 15.
+  max_abstract_tokens: 120
+
+  # beta: subtracted from U_i as beta * |A_i| / max_abstract_tokens, on valid rows.
+  # 0 disables (default, for backward-compatible test/CLI behavior).
+  length_penalty_coef: 0.0
+
   # append the abstraction instruction to the rollout prompt (train and val)
   inject_instruction: true
 
@@ -277,6 +286,10 @@ custom_abstract_rl:
   # free-form instruction; wins over instruction_variant when non-empty
   instruction_override: ""
 
+  # "user_turn" appends to the last user message; "system" inserts/extends a
+  # dedicated system message instead
+  instruction_placement: user_turn
+
   # true -> only correct rollouts enter the scoring batch (~2x cheaper)
   score_only_correct: false
 
@@ -285,6 +298,12 @@ custom_abstract_rl:
 
   # cap on reasoning tokens re-scored per row (0 = no cap)
   max_score_response_tokens: 0
+
+  # "trailing": append-to-the-tail graft (solution already known, target sits
+  # after Y). "fill_gap": pass 1 already asks for abstract+solution together; a
+  # missing/degenerate abstract gets a question-only pass-2 fill and the row is
+  # reassembled abstract-first regardless of where pass 1 put it.
+  bootstrap_mode: trailing
 
   # two-phase format bootstrap: graft abstractions into rollouts that emitted none,
   # for the first N steps. 0 disables it. This is a SECOND generation stage and makes

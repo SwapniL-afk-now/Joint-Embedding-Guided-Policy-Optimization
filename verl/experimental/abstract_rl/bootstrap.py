@@ -161,16 +161,20 @@ class BootstrapState:
             self.consecutive_above = 0
 
 
+def thin_rows(eligible: list[int], fraction: float, seed: int) -> list[int]:
+    """Randomly keep ``fraction`` of ``eligible``, deterministic given ``seed``."""
+    if not eligible:
+        return []
+    rng = np.random.default_rng(seed)
+    keep = max(0, min(int(round(len(eligible) * fraction)), len(eligible)))
+    return sorted(rng.choice(eligible, size=keep, replace=False).tolist()) if keep else []
+
+
 def select_rows(spans: list[AbstractSpan], resp_len: int, cfg: AbstractRLConfig, seed: int) -> list[int]:
     """Rows with no abstraction and room to hold one, thinned to the graft fraction."""
     budget = cfg.bootstrap_max_abstract_tokens + 16  # tags + separators
     eligible = [i for i, s in enumerate(spans) if not s.valid and s.response_len + budget <= resp_len]
-    if not eligible:
-        return []
-    rng = np.random.default_rng(seed)
-    keep = int(round(len(eligible) * cfg.bootstrap_graft_fraction))
-    keep = max(0, min(keep, len(eligible)))
-    return sorted(rng.choice(eligible, size=keep, replace=False).tolist()) if keep else []
+    return thin_rows(eligible, cfg.bootstrap_graft_fraction, seed)
 
 
 BOXED_RE = re.compile(r"\\boxed\s*\{[^{}]*\}")
@@ -208,6 +212,123 @@ def is_degenerate(text: str, min_words: int = 8, min_chars: int = 40, min_unique
     if len(set(words)) / len(words) < min_unique_ratio:  # repetition loop
         return True
     return any(marker in stripped for marker in SOUP_MARKERS)
+
+
+def find_abstract_text(text: str, open_tag: str, close_tag: str) -> tuple[str, str] | None:
+    """``(abstract_text, y_text)`` if a well-formed tag pair exists anywhere in
+    ``text``, else ``None``. Unlike ``parsing.py``'s scan, this is unwindowed and
+    order-agnostic -- pass-1 output under ``bootstrap_mode=fill_gap`` was never told
+    a required position. ``y_text`` is ``text`` with the whole abstract block
+    (tags included) removed, so it's ready to be reassembled as ``abstract + Y``
+    regardless of where the block originally sat.
+
+    First well-formed pair wins (mirrors ``_parse_leading``'s convention, since the
+    target layout is abstract-first): a stray later open tag inside ``y_text`` is
+    left alone -- reassembly is a text operation here, not the final training parse
+    (``parse_batch(..., leading=True)`` re-parses the reassembled text for that).
+    """
+    open_i = text.find(open_tag)
+    if open_i < 0:
+        return None
+    close_i = text.find(close_tag, open_i + len(open_tag))
+    if close_i < 0:
+        return None
+    abstract_text = text[open_i + len(open_tag) : close_i]
+    y_text = (text[:open_i] + text[close_i + len(close_tag) :]).strip()
+    return abstract_text, y_text
+
+
+def build_prior_batch(
+    tokenizer, batch, rows: list[int], max_prompt_length: int
+) -> tuple[DataProto | None, list[int]]:
+    """One short user turn per row asking only for the abstract, from the question
+    alone (``PRIOR_TEMPLATE`` -- no solution in the prompt, unlike ``PHASE2_TEMPLATE``).
+
+    No solution-fitting/truncation is needed: the prompt is question-only, so it
+    is never at risk of overflowing ``max_prompt_length`` the way a pasted-in
+    solution is.
+    """
+    from .config import PRIOR_TEMPLATE
+    from .scoring import _question_text
+
+    raw = np.empty(len(rows), dtype=object)
+    passthrough = {key: np.empty(len(rows), dtype=object) for key in ("data_source", "reward_model", "extra_info")}
+    kept = []
+    for k, i in enumerate(rows):
+        content = PRIOR_TEMPLATE.format(question=_question_text(tokenizer, batch, i))
+        if _prompt_tokens(tokenizer, content) > max_prompt_length:
+            continue
+        raw[len(kept)] = [{"role": "user", "content": content}]
+        for key, column in passthrough.items():
+            source = batch.non_tensor_batch.get(key)
+            column[len(kept)] = source[i] if source is not None else ({} if key != "data_source" else "math_dapo")
+        kept.append(i)
+    if not kept:
+        return None, []
+    raw = raw[: len(kept)]
+    passthrough = {key: column[: len(kept)] for key, column in passthrough.items()}
+    return DataProto.from_single_dict({"raw_prompt": raw, **passthrough}), kept
+
+
+def reposition_responses(
+    tokenizer,
+    batch,
+    assignments: dict[int, tuple[str, str]],
+    cfg: AbstractRLConfig,
+) -> tuple[int, int]:
+    """Replace ``responses[i]`` wholesale with ``abstract (tagged) + "\\n" + Y``,
+    tokenized fresh from the reassembled text. Unlike ``graft_texts`` (append at
+    the tail), this **overwrites the entire row**, including zeroing out whatever
+    used to occupy the tail past the new length -- the old content is not a valid
+    suffix of the reassembled sequence.
+
+    ``assignments`` maps row index -> ``(abstract_text, y_text)``. Returns
+    ``(repositioned, rejected)``; rejects degenerate abstracts or a reassembled
+    sequence that doesn't fit ``resp_len``.
+    """
+    responses = batch.batch["responses"]
+    response_mask = batch.batch["response_mask"]
+    input_ids = batch.batch["input_ids"]
+    attention_mask = batch.batch["attention_mask"]
+    position_ids = batch.batch["position_ids"]
+    resp_len = responses.shape[1]
+    prompt_len = input_ids.shape[1] - resp_len
+    if position_ids.dim() != 2:
+        return 0, 0
+
+    repositioned = 0
+    rejected = 0
+    for i, (abstract_text, y_text) in assignments.items():
+        cleaned = clean_abstract(abstract_text)
+        if not cleaned or is_degenerate(cleaned):
+            rejected += 1
+            continue
+        full_text = f"{cfg.open_tag}\n{cleaned}\n{cfg.close_tag}\n{y_text}"
+        ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+        if not ids or len(ids) > resp_len:
+            rejected += 1
+            continue
+
+        new_ids = torch.tensor(ids, dtype=responses.dtype, device=responses.device)
+        n = len(ids)
+        responses[i, :n] = new_ids
+        responses[i, n:] = 0
+        response_mask[i, :n] = 1
+        response_mask[i, n:] = 0
+        input_ids[i, prompt_len : prompt_len + n] = new_ids
+        input_ids[i, prompt_len + n :] = 0
+        attention_mask[i, prompt_len : prompt_len + n] = 1
+        attention_mask[i, prompt_len + n :] = 0
+        last_pos = int(position_ids[i, prompt_len - 1]) if prompt_len > 0 else -1
+        position_ids[i, prompt_len : prompt_len + n] = torch.arange(
+            last_pos + 1, last_pos + 1 + n, dtype=position_ids.dtype, device=position_ids.device
+        )
+        position_ids[i, prompt_len + n :] = position_ids[i, prompt_len + n - 1] if n > 0 else last_pos
+        repositioned += 1
+
+    if repositioned and "rollout_log_probs" in batch.batch:
+        batch.batch.pop("rollout_log_probs")
+    return repositioned, rejected
 
 
 class AbstractCache:

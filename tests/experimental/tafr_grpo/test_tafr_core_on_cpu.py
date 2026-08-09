@@ -67,6 +67,16 @@ def test_replay_gate_boundaries():
 
 
 def test_tafr_replay_loss_zero_for_all_correct_group():
+    # Tried ungating this (making replay_loss symmetric with anchor_loss, relying on
+    # the per-token k3 estimator to self-cancel where pi_anchor(t) ~= pi_replay(t)
+    # rather than a group-level switch) and measured a real regression on GPU1
+    # (run 42r70off): val/math500/pass_at_1 dropped to 0.498 and didn't recover to
+    # the band the gated runs held steady in. The self-cancellation assumption isn't
+    # enforced anywhere -- the failure clone can diverge from the anchor model
+    # broadly, not just at error tokens -- so ungating added an uncorrelated,
+    # ungated gradient source even on all-correct groups. Reverted: gate = 1 -
+    # r_bar_x zeroes replay_loss here, concentrating the repulsion-from-failure
+    # signal on groups that are actually failing.
     log_prob = torch.tensor([[-3.0, -4.0]], requires_grad=True)
     replay_log_prob = torch.tensor([[-1.0, -1.0]])
     out = compute_tafr_grpo_auxiliary_loss(
@@ -77,7 +87,7 @@ def test_tafr_replay_loss_zero_for_all_correct_group():
         variant="replay_only",
         replay_log_prob=replay_log_prob,
     )
-    assert out.loss.item() == 0.0
+    assert torch.allclose(out.loss, torch.tensor(0.0))
 
 
 def test_tafr_replay_loss_full_for_all_wrong_group():
@@ -96,6 +106,40 @@ def test_tafr_replay_loss_full_for_all_wrong_group():
     r = torch.exp(log_ratio)
     expected_kl = (((r - 1) - log_ratio).clamp(min=-10, max=10).mean()).detach()
     assert torch.allclose(out.loss, -0.5 * expected_kl)
+
+
+def test_tafr_anchor_loss_ungated_regardless_of_group_reward():
+    # Tried gating anchor_loss symmetrically with replay_loss (zero on all-correct
+    # groups, full strength on all-wrong ones). Matched GRPO's mean val over steps
+    # 100-190 but ran ~3x noisier (val range 0.076 over steps 250-260 vs ~0.02-0.026
+    # for GRPO / the old gated baseline), and the instability wasn't damping between
+    # checkpoints. Reverted: anchor_loss is full-strength always, independent of
+    # group_reward_mean -- only replay_loss is gated by difficulty.
+    log_prob = torch.tensor([[-3.0, -4.0]], requires_grad=True)
+    anchor_log_prob = torch.tensor([[-1.0, -1.0]])
+
+    out_correct = compute_tafr_grpo_auxiliary_loss(
+        log_prob=log_prob,
+        response_mask=torch.ones_like(log_prob, dtype=torch.bool),
+        group_reward_mean=torch.tensor([1.0]),
+        beta=0.7,
+        variant="anchor_only",
+        anchor_log_prob=anchor_log_prob,
+    )
+    log_ratio = (anchor_log_prob - log_prob).clamp(min=-20, max=20)
+    r = torch.exp(log_ratio)
+    expected_kl = (((r - 1) - log_ratio).clamp(min=-10, max=10).mean()).detach()
+    assert torch.allclose(out_correct.loss, 0.7 * expected_kl)
+
+    out_wrong = compute_tafr_grpo_auxiliary_loss(
+        log_prob=log_prob,
+        response_mask=torch.ones_like(log_prob, dtype=torch.bool),
+        group_reward_mean=torch.tensor([0.0]),
+        beta=0.7,
+        variant="anchor_only",
+        anchor_log_prob=anchor_log_prob,
+    )
+    assert torch.allclose(out_wrong.loss, 0.7 * expected_kl)
 
 
 def test_length_normalization_uses_response_mask_only():

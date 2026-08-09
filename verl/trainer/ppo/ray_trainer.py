@@ -999,17 +999,22 @@ class RayPPOTrainer:
             if any(positives) and not all(positives):
                 selected_group_indices.append(indices)
 
-        target_groups = int(self.config.data.train_batch_size)
-        selected_indices = [idx for group in selected_group_indices[:target_groups] for idx in group]
+        # Keep EVERY qualified group -- do not truncate to train_batch_size here.
+        # Truncation is the caller's job, after accumulation across generation
+        # batches (see _dapo_accumulate). Truncating here would discard qualified
+        # groups that the next short batch needs to reach a full training batch.
+        selected_indices = [idx for group in selected_group_indices for idx in group]
         metrics = {
             "dapo_filter/input_groups": float(len(uid_to_indices)),
-            "dapo_filter/kept_groups": float(min(len(selected_group_indices), target_groups)),
             "dapo_filter/qualified_groups": float(len(selected_group_indices)),
         }
         if not selected_indices:
-            print("DAPO filter_groups found no mixed groups; using unfiltered batch", flush=True)
-            metrics["dapo_filter/fallback_unfiltered"] = 1.0
-            return batch, reward_tensor, reward_extra_infos_dict, metrics
+            # Zero qualified groups is a normal DAPO outcome, not an error: the caller
+            # generates another batch. Returning the unfiltered batch here (the old
+            # behaviour) would train on all-correct and all-wrong groups, whose
+            # advantages are identically zero under GRPO -- a wasted update.
+            metrics["dapo_filter/empty_batch"] = 1.0
+            return batch[:0], reward_tensor[:0], {k: [] for k in reward_extra_infos_dict}, metrics
 
         batch = batch[selected_indices]
         reward_tensor = reward_tensor[selected_indices]
@@ -1020,6 +1025,95 @@ class RayPPOTrainer:
             else:
                 filtered_extra[key] = values
         return batch, reward_tensor, filtered_extra, metrics
+
+    def _dapo_accumulate(self, batch: DataProto, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict):
+        """DAPO dynamic sampling: accumulate qualified groups until a full batch exists.
+
+        Returns the assembled (batch, reward_tensor, extra_infos, metrics) once
+        `train_batch_size` qualified groups have accumulated, or None to signal
+        "generate another batch before updating".
+
+        Why this is needed: filtering to mixed groups typically removes 30-50% of
+        prompts (more as training converges and groups go all-correct), so simply
+        training on whatever survives means the effective batch size silently drifts
+        below the configured one and shrinks over the run. That confounds every
+        comparison against a non-DAPO arm, which keeps its full batch throughout.
+
+        No actor update happens between the accumulated generations, so every group
+        in the assembled batch is on-policy with respect to the same weights -- this
+        is the same guarantee upstream DAPO's inner resample loop provides.
+        """
+        filter_cfg = self.config.algorithm.get("filter_groups", None)
+        if not filter_cfg or not filter_cfg.get("enable", False):
+            return batch, reward_tensor, reward_extra_infos_dict, {}
+
+        batch, reward_tensor, reward_extra_infos_dict, metrics = self._filter_dapo_groups(
+            batch, reward_tensor, reward_extra_infos_dict
+        )
+
+        carry = getattr(self, "_dapo_carry", None)
+        if carry is not None and len(batch) > 0:
+            prev_batch, prev_reward, prev_extra = carry
+            # global_token_num is a per-batch-size list (attention_mask.sum(-1)),
+            # already stamped into meta_info by the caller before reward scoring.
+            # DataProto.concat asserts non-metric meta_info keys are IDENTICAL across
+            # inputs, so two differently-sized carried batches always conflict here.
+            # It is stale the moment batches merge anyway -- the call site recomputes
+            # it from the assembled batch once accumulation completes -- so drop it
+            # from both sides rather than try to reconcile two different lists.
+            prev_batch.meta_info.pop("global_token_num", None)
+            batch.meta_info.pop("global_token_num", None)
+            batch = DataProto.concat([prev_batch, batch])
+            reward_tensor = torch.cat([prev_reward, reward_tensor], dim=0)
+            reward_extra_infos_dict = {
+                k: list(prev_extra.get(k, [])) + list(v) for k, v in reward_extra_infos_dict.items()
+            }
+        elif carry is not None:
+            batch, reward_tensor, reward_extra_infos_dict = carry
+
+        self._dapo_gen_batches = getattr(self, "_dapo_gen_batches", 0) + 1
+
+        # Group boundaries survive the concat because uid is carried in non_tensor_batch.
+        uids = [str(u) for u in batch.non_tensor_batch.get("uid", [])]
+        group_order: list[str] = []
+        uid_to_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            if uid not in uid_to_indices:
+                group_order.append(uid)
+            uid_to_indices[uid].append(idx)
+
+        target_groups = int(self.config.data.train_batch_size)
+        max_gen = int(filter_cfg.get("max_num_gen_batches", 0) or 0)
+        exhausted = 0 < max_gen <= self._dapo_gen_batches
+
+        if len(group_order) < target_groups and not exhausted:
+            self._dapo_carry = (batch, reward_tensor, reward_extra_infos_dict)
+            print(
+                f"DAPO dynamic sampling: {len(group_order)}/{target_groups} qualified groups "
+                f"after {self._dapo_gen_batches} generation batch(es); generating more.",
+                flush=True,
+            )
+            return None
+
+        keep = [i for uid in group_order[:target_groups] for i in uid_to_indices[uid]]
+        metrics.update(
+            {
+                "dapo_filter/kept_groups": float(min(len(group_order), target_groups)),
+                "dapo_filter/num_gen_batches": float(self._dapo_gen_batches),
+                "dapo_filter/gen_budget_exhausted": 1.0 if exhausted and len(group_order) < target_groups else 0.0,
+            }
+        )
+        self._dapo_carry = None
+        self._dapo_gen_batches = 0
+
+        if not keep:
+            # Only reachable when the generation budget ran out with nothing qualified.
+            return batch, reward_tensor, reward_extra_infos_dict, metrics
+
+        extra = {
+            k: ([v[i] for i in keep] if len(v) == len(uids) else v) for k, v in reward_extra_infos_dict.items()
+        }
+        return batch[keep], reward_tensor[keep], extra, metrics
 
     def _compute_train_comparison_metrics(self, batch: DataProto) -> dict[str, float | int]:
         scores = batch.batch["token_level_scores"].sum(-1).detach().cpu().float().tolist()
@@ -2809,7 +2903,23 @@ class RayPPOTrainer:
         if not self.tafr_enabled or self.tafr_failure_collector is None:
             return {}
         did_save = should_checkpoint_and_refresh(self.global_steps, self.tafr_config)
+        # Mean age, in GRPO steps, of the failures the buffer currently holds. The
+        # paper's diagnostics subsection reports it because a learned failure density
+        # is only meaningful if it describes behaviour the actor still exhibits -- a
+        # buffer whose mean age keeps climbing is modelling a policy that no longer
+        # exists, which would explain a replay term that stops helping.
+        replay_age = 0.0
+        try:
+            steps = [
+                float(self.global_steps - r.metadata.get("global_grpo_step", self.global_steps))
+                for r in getattr(self.tafr_failure_collector, "_examples", [])
+                if getattr(r, "metadata", None)
+            ]
+            replay_age = sum(steps) / len(steps) if steps else 0.0
+        except (AttributeError, TypeError):
+            pass
         return {
+            "tafr_grpo/failure_buffer_mean_age_steps": replay_age,
             "tafr_grpo/global_grpo_step": float(self.global_steps),
             "tafr_grpo/did_checkpoint_save_this_step": float(did_save),
             "tafr_grpo/failure_dataset_size": float(len(self.tafr_failure_collector)),
@@ -2898,6 +3008,10 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
+        # DAPO dynamic sampling: qualified groups carried across generation batches
+        # until a full training batch exists, and how many batches that has taken.
+        self._dapo_carry = None
+        self._dapo_gen_batches = 0
 
         prev_step_profile = False
         curr_step_profile = (
@@ -2913,6 +3027,9 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                # Set by the DAPO dynamic-sampling accumulator when this generation
+                # batch did not yield enough qualified groups to update on.
+                needs_more_rollouts = False
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -3026,17 +3143,41 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-                        batch, reward_tensor, reward_extra_infos_dict, dapo_filter_metrics = self._filter_dapo_groups(
-                            batch, reward_tensor, reward_extra_infos_dict
-                        )
-                        metrics.update(dapo_filter_metrics)
-                        if dapo_filter_metrics.get("dapo_filter/kept_groups", 0.0) > 0.0:
-                            batch.meta_info["global_token_num"] = torch.sum(
-                                batch.batch["attention_mask"], dim=-1
-                            ).tolist()
+
+                        # Buffer failures and compute the group difficulty gate on the RAW
+                        # group, BEFORE DAPO filtering. This ordering is required, not
+                        # cosmetic: DAPO discards homogeneous groups, and all-wrong groups
+                        # are exactly the failures FEPO exists to learn from. Filtering
+                        # first would starve the failure buffer of the very signal the
+                        # method is built on, and would compute g on a group whose
+                        # composition the filter had already changed.
                         tafr_wrong_collected = self._tafr_collect_failures(batch, reward_tensor)
-                        # Group difficulty must exist before failure scoring so all-correct rows are skipped.
                         self._tafr_annotate_actor_batch(batch, reward_tensor)
+
+                        # DAPO dynamic sampling. Returns None when too few qualified
+                        # groups have accumulated, meaning "generate another batch before
+                        # updating" -- the actor is untouched in that case, so the groups
+                        # carried forward stay on-policy.
+                        dapo_result = self._dapo_accumulate(batch, reward_tensor, reward_extra_infos_dict)
+                        if dapo_result is None:
+                            needs_more_rollouts = True
+                        else:
+                            batch, reward_tensor, reward_extra_infos_dict, dapo_filter_metrics = dapo_result
+                            metrics.update(dapo_filter_metrics)
+                            if dapo_filter_metrics:
+                                batch.meta_info["global_token_num"] = torch.sum(
+                                    batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+
+                    if needs_more_rollouts:
+                        # DAPO is still short of a full batch of qualified groups. Draw the
+                        # next dataloader batch and generate again WITHOUT updating the
+                        # actor, so the groups already carried stay on-policy. This
+                        # consumes no training step: global_steps is not incremented and
+                        # the progress bar does not advance.
+                        with marked_timer("stop_profile", timing_raw):
+                            self._stop_profiling(curr_step_profile)
+                        continue
 
                     if self.abstract_rl_enabled:
                         # Format bootstrap: graft abstractions into rollouts that emitted

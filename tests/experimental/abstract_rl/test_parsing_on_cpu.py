@@ -176,6 +176,45 @@ def test_scan_window_limits_lookback(tokenizer):
     assert not span.valid  # the opening tag is outside the window -> treated as malformed
 
 
+def test_abstraction_at_cap_is_valid(tokenizer):
+    ids, mask = _row(tokenizer, "x")  # placeholder, real ids built below
+    words = " ".join(["strategy"] * 10)  # well under any reasonable cap
+    text = f"R. \\boxed{{1}}.\n<abstract>{words}</abstract>"
+    span, ids = _parse(tokenizer, text)
+    cap = span.n_abstract
+    span_capped, _ = _parse(tokenizer, text, max_abstract_tokens=cap)
+    assert span_capped.valid and not span_capped.too_long
+
+
+def test_abstraction_over_cap_is_invalid(tokenizer):
+    words = " ".join(["strategy"] * 10)
+    text = f"R. \\boxed{{1}}.\n<abstract>{words}</abstract>"
+    span, _ = _parse(tokenizer, text)
+    cap = span.n_abstract - 1
+    span_capped, _ = _parse(tokenizer, text, max_abstract_tokens=cap)
+    assert not span_capped.valid and span_capped.too_long
+    assert not (span_capped.missing_open or span_capped.missing_close or span_capped.empty_abstract), (
+        "too_long is a distinct failure reason from missing/degenerate"
+    )
+
+
+def test_max_abstract_tokens_disabled_by_default(tokenizer):
+    # max_abstract_tokens=0 (default) never invalidates on length alone.
+    words = " ".join(["strategy"] * 500)
+    text = f"R. \\boxed{{1}}.\n<abstract>{words}</abstract>"
+    span, _ = _parse(tokenizer, text, max_scan_tokens=4096)
+    assert span.valid and not span.too_long
+
+
+def test_cap_interacts_independently_with_scan_window(tokenizer):
+    # max_scan_tokens bounds WHERE the parser looks; max_abstract_tokens bounds
+    # what it accepts once found. A tight scan window that still finds the tags
+    # is unaffected by a generous cap, and vice versa.
+    text = "R. \\boxed{1}.\n<abstract>Use symmetry.</abstract>"
+    span, _ = _parse(tokenizer, text, max_scan_tokens=3, max_abstract_tokens=1000)
+    assert not span.valid and span.missing_open and not span.too_long  # window, not cap, is why
+
+
 def test_masks_are_disjoint_and_within_response(tokenizer):
     texts = [
         "R1. \\boxed{1}.\n<abstract>alpha</abstract>",

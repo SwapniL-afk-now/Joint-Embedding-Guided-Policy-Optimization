@@ -27,8 +27,14 @@ def compute_compression_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compression KL over abstraction tokens of correct, valid rollouts.
 
-        L = sum_i r_i v_i sum_{t in A_i} KL(pi_theta(.|X,Y,A_<t) || pi_bar(.|X,A_<t))
-            / (sum_i r_i v_i |A_i| + eps)
+        L = mean_i [ r_i v_i * mean_{t in A_i} KL(pi_theta(.|X,Y,A_<t) || pi_bar(.|X,A_<t)) ]
+            over rows with r_i v_i |A_i| > 0
+
+    Per-ROW mean-then-mean-of-rows, not one global token-weighted mean (plan
+    section 15): a row's KL cost must not be diluteable by other rows in the same
+    micro-batch having short or empty abstracts, or the marginal cost of a longer
+    `A_i` on THIS row goes to ~0 as the batch grows -- exactly what let
+    `abstractrl-fillgap-strong-20260807-v3` triple its abstract length for free.
 
     ``prior_log_prob`` comes from the frozen scoring pass and carries no grad, so
     the gradient flows only through the current-policy side, and only on
@@ -49,9 +55,11 @@ def compute_compression_loss(
             abstract_gradient_token_fraction only ~0.14 -- a few outliers, not the
             span). 0 disables (falls back to the shared clamp only).
     """
-    weight = (abstract_mask.float() * row_weight.to(log_prob.dtype).unsqueeze(-1)).detach()
-    denom = weight.sum()
-    if denom <= 0:
+    mask = abstract_mask.float()
+    row_tokens = mask.sum(dim=-1)
+    row_qualifies = (row_weight.to(log_prob.dtype) > 0) & (row_tokens > 0)
+    n_rows = row_qualifies.float().sum()
+    if n_rows <= 0:
         # Keep the graph connected so every rank contributes a (zero) gradient.
         zero = (log_prob * 0.0).sum()
         return zero, {
@@ -62,8 +70,14 @@ def compute_compression_loss(
     kld = kl_penalty(logprob=log_prob, ref_logprob=prior_log_prob.detach(), kl_penalty=kl_type)
     if kl_clip > 0:
         kld = kld.clamp(max=kl_clip)
-    loss = (kld * weight).sum() / (denom + EPS)
-    return loss, {"compression_loss": loss.detach(), "abstract_kl_tokens": denom.detach()}
+    per_row_kl = (kld * mask).sum(dim=-1) / row_tokens.clamp(min=1.0)  # mean over each row's own A_i
+    loss = (per_row_kl * row_qualifies.float()).sum() / (n_rows + EPS)
+    qualifying_tokens = (row_tokens * row_qualifies.float()).sum()
+    return loss, {
+        "compression_loss": loss.detach(),
+        "abstract_kl_tokens": qualifying_tokens.detach(),
+        "abstract_kl_rows": n_rows.detach(),
+    }
 
 
 def compute_abstract_sft_loss(

@@ -20,6 +20,8 @@ from verl.experimental.sharpening_grpo.loss import compute_sharpening_grpo_loss
 from verl.experimental.tafr_grpo.tafr_loss import (
     compute_regularization_policy_loss,
     compute_tafr_grpo_auxiliary_loss,
+    replay_gate,
+    response_length_normalized_mean,
 )
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
@@ -491,8 +493,47 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
                 anchor_log_prob=data.get("tafr_anchor_log_probs", None),
                 replay_log_prob=data.get("tafr_replay_log_probs", None),
                 group_ids=tafr_group_ids,
+                gate_mode=str(tafr_config.get("gate_mode", "difficulty")),
+                anchor_kl_direction=str(tafr_config.get("anchor_kl_direction", "forward")),
+                old_log_prob=old_log_prob,
+                use_importance_weight=bool(tafr_config.get("use_importance_weight", True)),
+                importance_weight_clip=float(tafr_config.get("importance_weight_clip", 10.0)),
             )
-            policy_loss += tafr_output.loss
+            if bool(tafr_config.get("diagnostic_only", False)):
+                # Baseline rows: the anchor and failure models were built and their
+                # KLs measured above, but nothing may reach the actor. Multiplying by
+                # zero (rather than skipping) keeps the term in the autograd graph, so
+                # any accidental gradient path shows up as a non-zero grad rather than
+                # silently vanishing.
+                policy_loss = policy_loss + 0.0 * tafr_output.loss
+                metrics["tafr_grpo/diagnostic_only"] = Metric(
+                    value=torch.ones_like(pg_loss), aggregation=metric_aggregation
+                )
+            elif bool(tafr_config.get("negative_ce", False)):
+                # Table 7 control: same failed replay buffer, but the learned failure
+                # density is replaced by uniform negative cross-entropy on the failed
+                # rollouts. Anchor term is untouched, so the only difference from full
+                # FEPO is *what* provides the repulsion direction.
+                gate = replay_gate(
+                    data["tafr_group_reward_mean"].to(log_prob.dtype).clamp(0.0, 1.0),
+                    str(tafr_config.get("gate_mode", "difficulty")),
+                )
+                seq_nll = response_length_normalized_mean(log_prob, response_mask)
+                neg_ce = (gate * seq_nll).mean()
+                coef = float(tafr_config.get("negative_ce_coef", 1.0))
+                b_r = tafr_config.get("beta_replay", None)
+                b_r = float(tafr_config.get("beta", 0.0)) if b_r is None else float(b_r)
+                # tafr_output.loss carries b_a*anchor - b_r*replay; drop the replay half
+                # by re-adding it, then subtract the negative-CE term in its place.
+                # replay_loss is None only for variant=anchor_only, where there is no
+                # replay half to remove.
+                replay_half = tafr_output.replay_loss
+                if replay_half is None:
+                    replay_half = torch.zeros_like(tafr_output.loss)
+                policy_loss += tafr_output.loss + b_r * replay_half + coef * b_r * neg_ce
+                metrics["tafr_grpo/negative_ce"] = Metric(value=neg_ce, aggregation=metric_aggregation)
+            else:
+                policy_loss += tafr_output.loss
             tafr_metrics = Metric.from_dict(tafr_output.metrics, aggregation=AggregationType.MEAN)
             metrics.update(tafr_metrics)
             metrics["tafr_grpo/loss_grpo"] = Metric(value=pg_loss, aggregation=metric_aggregation)

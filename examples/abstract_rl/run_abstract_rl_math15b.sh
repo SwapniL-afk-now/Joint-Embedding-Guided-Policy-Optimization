@@ -36,6 +36,15 @@ ARM=${ARM:-full}
 GPU=${GPU:-0}
 KL_COEF=${KL_COEF:-0.05}
 KL_CLIP=${KL_CLIP:-2.0}   # per-token cap on the compression KL (0 = k3's own +-10 clamp only)
+# Reward-hacking fix (plan section 15): fillgap-strong-20260807-v3 (step 410)
+# learned to dump the ENTIRE solution into <abstract> (~420-430 tokens) and leave
+# Y a one-line stub, because the batch-mean KL loss doesn't scale with |A_i| and
+# Delta is unbounded. MAX_ABSTRACT_TOKENS hard-caps |A_i| (over cap -> invalid,
+# same as missing/degenerate); LENGTH_PENALTY_COEF adds a direct per-row rate
+# cost to U_i even under the cap. Both default ON here (config.py itself defaults
+# LENGTH_PENALTY_COEF=0 for test-suite backward compatibility).
+MAX_ABSTRACT_TOKENS=${MAX_ABSTRACT_TOKENS:-120}
+LENGTH_PENALTY_COEF=${LENGTH_PENALTY_COEF:-0.3}
 MAX_RESPONSE=${MAX_RESPONSE:-3072}
 TOTAL_STEPS=${TOTAL_STEPS:-1000}
 TRAIN_BS=${TRAIN_BS:-64}
@@ -68,6 +77,20 @@ if [[ "$TWO_PASS" == "1" ]]; then
   # would never trigger here -- check the sentinel value explicitly instead.
   [[ "$BOOTSTRAP" == "0" ]] && BOOTSTRAP=$TOTAL_STEPS
   GRAFT_FRACTION=1.0
+fi
+# FILL_GAP=1: pass 1 already asks for abstract+solution together, via a system-
+# message cue (not appended to the user turn). If a valid abstract is missing or
+# degenerate anywhere in the output, pass 2 generates ONLY the abstract from the
+# question alone and the row is reassembled abstract-first regardless of where (or
+# whether) pass 1 put it. Fixes the measured failure mode of TWO_PASS/trailing
+# grafting: native_abstract_rate stayed at 0 because the cue was never in the
+# training context in the shape being tested at inference. Self-latches off via
+# the same BootstrapState native-rate mechanism once compliance holds up.
+FILL_GAP=${FILL_GAP:-0}
+BOOTSTRAP_MODE=trailing
+if [[ "$FILL_GAP" == "1" ]]; then
+  BOOTSTRAP_MODE=fill_gap
+  [[ "$BOOTSTRAP" == "0" ]] && BOOTSTRAP=$TOTAL_STEPS
 fi
 LOGGER=${LOGGER:-'["console","wandb"]'}
 PROJECT=${PROJECT:-tafr-repro-math15b}
@@ -117,6 +140,10 @@ if [[ "$ARM" != "grpo" ]]; then
       data.custom_cls.name=AbstractRLDataset
       +data.abstract_rl_instruction="${INSTRUCTION}"
     )
+    if [[ "$FILL_GAP" == "1" ]]; then
+      DATASET+=(+data.abstract_rl_instruction_placement=system)
+      INJECT=(custom_abstract_rl.instruction_placement=system)
+    fi
   fi
 fi
 
@@ -184,7 +211,10 @@ exec .venv/bin/python -m verl.trainer.main_ppo \
   "${ABSTRACT[@]}" \
   custom_abstract_rl.debug_print_n="${DEBUG_PRINT}" \
   custom_abstract_rl.kl_clip="${KL_CLIP}" \
+  custom_abstract_rl.max_abstract_tokens="${MAX_ABSTRACT_TOKENS}" \
+  custom_abstract_rl.length_penalty_coef="${LENGTH_PENALTY_COEF}" \
   custom_abstract_rl.instruction_variant="${INSTRUCTION}" \
+  custom_abstract_rl.bootstrap_mode="${BOOTSTRAP_MODE}" \
   custom_abstract_rl.bootstrap_steps="${BOOTSTRAP}" \
   custom_abstract_rl.bootstrap_graft_fraction="${GRAFT_FRACTION}" \
   custom_abstract_rl.bootstrap_sft_steps="${SFT_WARMUP}" \

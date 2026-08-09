@@ -6,6 +6,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+echo "REFUSING: dtc-d10 (dose=1.0) is retired -- worst arm on math macro (25.06 vs 26.98 for" >&2
+echo "TAFR-repro b01) and crashed before finishing its 600-step budget. See results comparison" >&2
+echo "in the conversation history. Delete this guard only if you intend to re-run it deliberately." >&2
+exit 1
+
 unset RAY_ADDRESS
 export CUDA_VISIBLE_DEVICES=1
 export PYTHON_BIN=.venv/bin/python

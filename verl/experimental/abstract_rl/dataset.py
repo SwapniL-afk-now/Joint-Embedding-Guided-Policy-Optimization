@@ -29,6 +29,7 @@ Wired via ``data.custom_cls`` and used for both the train and val datasets:
     data.custom_cls.path=verl/experimental/abstract_rl/dataset.py
     data.custom_cls.name=AbstractRLDataset
     +data.abstract_rl_instruction=strong
+    +data.abstract_rl_instruction_placement=system   # or user_turn (default)
 """
 
 from __future__ import annotations
@@ -37,19 +38,17 @@ import datasets
 
 # Absolute imports: data.custom_cls loads this file by path as a standalone module,
 # so a relative import raises "attempted relative import with no known parent package".
-from verl.experimental.abstract_rl.config import INSTRUCTIONS, ROLLOUT_INSTRUCTION
+from verl.experimental.abstract_rl.config import INSTRUCTIONS, ROLLOUT_INSTRUCTION, apply_instruction
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 
 def append_instruction(messages: list[dict], instruction: str) -> list[dict]:
-    """Append the instruction to the last user turn, idempotently."""
-    out = [dict(m) for m in messages]
-    for msg in reversed(out):
-        if msg.get("role") == "user":
-            if instruction not in msg["content"]:
-                msg["content"] = f"{msg['content']}\n\n{instruction}"
-            break
-    return out
+    """Append the instruction to the last user turn, idempotently.
+
+    Kept as a thin alias of ``apply_instruction(..., placement="user_turn")`` for
+    backward compatibility with existing callers/tests.
+    """
+    return apply_instruction(messages, instruction, "user_turn")
 
 
 class AbstractRLDataset(RLHFDataset):
@@ -66,10 +65,11 @@ class AbstractRLDataset(RLHFDataset):
         override = self.config.get("abstract_rl_instruction_override", "")
         variant = self.config.get("abstract_rl_instruction", "spec")
         instruction = override or INSTRUCTIONS.get(variant, ROLLOUT_INSTRUCTION)
+        placement = self.config.get("abstract_rl_instruction_placement", "user_turn")
         prompt_key = self.prompt_key
 
         dataframe = dataframe.map(
-            lambda doc: {prompt_key: append_instruction(doc[prompt_key], instruction)},
+            lambda doc: {prompt_key: apply_instruction(doc[prompt_key], instruction, placement)},
             num_proc=self.num_workers,
             desc="Appending the abstraction instruction",
         )

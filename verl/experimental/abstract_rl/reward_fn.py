@@ -12,9 +12,14 @@ Wired through ``reward.custom_reward_function`` so no reward-manager code has to
 change. Without it, a ``\\boxed{}`` written inside ``<abstract>...</abstract>``
 would become the graded answer, since the math parser takes the *last* boxed span.
 
-The cut is at the **first** opening tag -- strictly more conservative than the
-span parser (which resolves the last well-formed pair), and identical to it
-except in the rare repeated-block case.
+Removes the abstract **block** (open tag through close tag, inclusive) wherever
+it sits, rather than truncating at the open tag -- that used to be equivalent
+under the trailing layout (nothing followed the close tag anyway), but
+``bootstrap_mode=fill_gap`` always reassembles abstract-first, and truncating at
+the first open tag there would zero out the entire response. Block removal is
+correct for both layouts. Only the first well-formed pair is removed; a missing
+close tag falls back to the old truncate-at-open behavior (nothing to remove Y
+from safely).
 """
 
 from __future__ import annotations
@@ -22,12 +27,18 @@ from __future__ import annotations
 from verl.utils.reward_score import default_compute_score
 
 DEFAULT_OPEN_TAG = "<abstract>"
+DEFAULT_CLOSE_TAG = "</abstract>"
 
 
-def strip_abstract(solution_str: str, open_tag: str = DEFAULT_OPEN_TAG) -> str:
+def strip_abstract(solution_str: str, open_tag: str = DEFAULT_OPEN_TAG, close_tag: str = DEFAULT_CLOSE_TAG) -> str:
     """Return the reasoning-and-answer part Y of a response."""
-    cut = solution_str.find(open_tag)
-    return solution_str if cut < 0 else solution_str[:cut]
+    start = solution_str.find(open_tag)
+    if start < 0:
+        return solution_str
+    end = solution_str.find(close_tag, start + len(open_tag))
+    if end < 0:
+        return solution_str[:start]
+    return (solution_str[:start] + solution_str[end + len(close_tag) :]).strip()
 
 
 def compute_score_ignoring_abstract(
@@ -36,11 +47,12 @@ def compute_score_ignoring_abstract(
     ground_truth,
     extra_info=None,
     open_tag: str = DEFAULT_OPEN_TAG,
+    close_tag: str = DEFAULT_CLOSE_TAG,
     **kwargs,
 ):
     return default_compute_score(
         data_source=data_source,
-        solution_str=strip_abstract(solution_str, open_tag),
+        solution_str=strip_abstract(solution_str, open_tag, close_tag),
         ground_truth=ground_truth,
         extra_info=extra_info,
         **kwargs,

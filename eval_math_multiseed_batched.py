@@ -20,7 +20,9 @@ def score_outputs(outputs, meta, n):
     for out, (data_source, ground_truth) in zip(outputs, meta):
         row = []
         for sample in out.outputs[:n]:
-            row.append(bool(default_compute_score(data_source, sample.text, ground_truth)["acc"]))
+            # Most scorers return {"score","acc",...}; gsm8k returns a bare float.
+            res = default_compute_score(data_source, sample.text, ground_truth)
+            row.append(bool(res["acc"] if isinstance(res, dict) else res > 0))
         correct.append(row)
     return np.asarray(correct, dtype=bool)
 

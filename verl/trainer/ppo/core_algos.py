@@ -108,6 +108,8 @@ class AdvantageEstimator(str, Enum):
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
+    NGRPO = "ngrpo"
+    AVSPO = "avspo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -327,6 +329,121 @@ def compute_grpo_outcome_advantage(
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+def _group_scores(scores: torch.Tensor, index: np.ndarray) -> dict[Any, list[int]]:
+    """uid -> row positions, preserving order. Shared by the homogeneous-group baselines."""
+    id2rows: dict[Any, list[int]] = defaultdict(list)
+    for i in range(scores.shape[0]):
+        id2rows[index[i]].append(i)
+    return id2rows
+
+
+@register_adv_est(AdvantageEstimator.NGRPO)
+def compute_ngrpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NGRPO: repair all-negative groups instead of discarding them.
+
+    Table 1 baseline. GRPO gives every response in an all-wrong group an advantage of
+    exactly zero, so the group contributes no gradient at all -- the failure mode FEPO
+    is built to address. NGRPO instead treats the group as if a hypothetical correct
+    response had been observed, restoring a non-zero (uniformly negative) advantage
+    that pushes the whole group down.
+
+    Mixed and all-correct groups are left exactly as GRPO computes them, so the only
+    difference from the GRPO baseline is confined to homogeneous-failure groups.
+
+    Config (`algorithm.ngrpo_virtual_reward`, default 1.0): the reward assigned to the
+    hypothetical correct response.
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    virtual = 1.0
+    if config is not None:
+        virtual = float(config.get("ngrpo_virtual_reward", 1.0) or 1.0)
+
+    with torch.no_grad():
+        out = scores.clone()
+        for rows in _group_scores(scores, index).values():
+            group = scores[rows]
+            if group.numel() == 1:
+                out[rows[0]] = 0.0
+                continue
+            if bool((group > 0).any()):
+                mean, std = group.mean(), group.std()
+            else:
+                # All-wrong: append the virtual success and recompute the group
+                # statistics against it. Every real response then sits below the
+                # mean, so the group yields a uniform negative advantage rather
+                # than the zero GRPO would assign.
+                augmented = torch.cat([group, group.new_tensor([virtual])])
+                mean, std = augmented.mean(), augmented.std()
+            centered = group - mean
+            out[rows] = centered / (std + epsilon) if norm_adv_by_std_in_grpo else centered
+        scores = out.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.AVSPO)
+def compute_avspo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AVSPO: restore advantage variance in homogeneous groups from batch statistics.
+
+    Table 1 baseline, and the paper's closest scalar-collapse competitor. Where NGRPO
+    invents a single virtual response, AVSPO replaces a collapsed group's statistics
+    with the running batch-level reward mean and std, so an all-wrong group is scored
+    against how the rest of the batch is doing rather than against itself.
+
+    This is the sharpest contrast with FEPO: AVSPO repairs the *scalar* advantage and
+    leaves the direction to the base objective, whereas FEPO leaves the scalar
+    advantage untouched and supplies a direction learned from recurrent failures.
+
+    Config (`algorithm.avspo_virtual_std_floor`, default 0.1): lower bound on the
+    substituted std, so a batch that is itself homogeneous cannot produce an
+    unbounded advantage.
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    std_floor = 0.1
+    if config is not None:
+        std_floor = float(config.get("avspo_virtual_std_floor", 0.1) or 0.1)
+
+    with torch.no_grad():
+        batch_mean = scores.mean()
+        batch_std = scores.std() if scores.numel() > 1 else scores.new_tensor(0.0)
+        batch_std = torch.clamp(batch_std, min=std_floor)
+
+        out = scores.clone()
+        for rows in _group_scores(scores, index).values():
+            group = scores[rows]
+            if group.numel() == 1:
+                out[rows[0]] = 0.0
+                continue
+            positives = (group > 0)
+            if bool(positives.any()) and not bool(positives.all()):
+                mean, std = group.mean(), group.std()
+            else:
+                # Collapsed group (all-wrong or all-correct): its own mean carries no
+                # information, so score it against the batch. An all-wrong group lands
+                # below batch_mean and an all-correct group above it, which is the
+                # variance AVSPO exists to restore.
+                mean, std = batch_mean, batch_std
+            centered = group - mean
+            out[rows] = centered / (std + epsilon) if norm_adv_by_std_in_grpo else centered
+        scores = out.unsqueeze(-1) * response_mask
 
     return scores, scores
 

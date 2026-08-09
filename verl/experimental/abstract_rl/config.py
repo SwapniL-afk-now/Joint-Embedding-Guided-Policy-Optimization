@@ -118,6 +118,23 @@ class AbstractRLConfig:
     close_tag: str = "</abstract>"
     # only the last N response tokens are scanned for the tags
     max_scan_tokens: int = 512
+    # Hard cap on |A_i|. Over budget -> v_i=0 (failure_reason="too_long"), same as
+    # missing/degenerate. Fixes reward hacking measured on abstractrl-fillgap-strong-
+    # 20260807-v3 (step 410): with no cap, the model learned to dump the ENTIRE
+    # derivation into <abstract> (~420-430 tokens) and leave Y a one-line stub
+    # ("The final answer is boxed{27}."), since a solver's own question-only prior
+    # already predicts most of a solution's content, so copying it costs little KL.
+    # See plan.md section 15. 0 disables the cap.
+    max_abstract_tokens: int = 120
+    # beta: subtracted from U_i as beta * |A_i| / max_abstract_tokens, BEFORE the
+    # affine map. A direct per-row rate cost so the marginal token is never free
+    # (unlike the KL loss, which without per-row aggregation dilutes across the
+    # batch -- see loss.py). Default 0 -> opt-in explicitly at launch (like
+    # kl_coef's sibling knobs), so every existing Delta/utility arithmetic test
+    # keeps testing exactly the formula it names without also asserting a length
+    # penalty value. Recommended nonzero (e.g. 0.3) whenever max_abstract_tokens
+    # is in play, per plan section 15.
+    length_penalty_coef: float = 0.0
 
     # --- rollout / scoring ---
     inject_instruction: bool = True
@@ -126,6 +143,9 @@ class AbstractRLConfig:
     instruction_variant: str = "spec"
     # free-form override; wins over instruction_variant when non-empty
     instruction_override: str = ""
+    # "user_turn" appends to the last user message (original behavior); "system"
+    # inserts/extends a dedicated system message instead.
+    instruction_placement: str = "user_turn"
     # true -> skip incorrect rollouts in the scoring batch (~2x cheaper, but then
     # delta_mean == delta_correct_mean since incorrect rows have no Delta)
     score_only_correct: bool = False
@@ -134,6 +154,14 @@ class AbstractRLConfig:
     max_score_response_tokens: int = 0
 
     # --- two-phase format bootstrap (see bootstrap.py) ---
+    # "trailing": today's append-to-the-tail graft (PHASE2_TEMPLATE, solution
+    #   already known, target sits after Y).
+    # "fill_gap": pass-1 already asks for abstract+solution together (see
+    #   instruction_placement); if a valid abstract is missing/degenerate anywhere
+    #   in the output, pass 2 generates ONLY the abstract from the question alone
+    #   (PRIOR_TEMPLATE), and the row is reassembled as abstract-then-Y regardless
+    #   of where (or whether) pass 1 put it.
+    bootstrap_mode: str = "trailing"
     # graft abstractions for the first N steps; 0 disables the whole mechanism.
     # This is a SECOND generation stage and makes the update a reward-weighted
     # self-distillation rather than a strict policy gradient, so it must switch off.
@@ -190,6 +218,28 @@ def rollout_instruction(cfg: AbstractRLConfig) -> str:
     return cfg.instruction_override or INSTRUCTIONS[cfg.instruction_variant]
 
 
+def apply_instruction(messages: list[dict], instruction: str, placement: str = "user_turn") -> list[dict]:
+    """Insert ``instruction`` into ``messages``, idempotently. Shared by the dataset
+    (train/val, before prompt-length filtering) and the trainer-side gen-batch hook.
+
+    "system": extend an existing leading system message, or prepend a new one.
+    "user_turn": append to the last user message (original behavior).
+    """
+    out = [dict(m) for m in messages]
+    if placement == "system":
+        if out and out[0].get("role") == "system":
+            if instruction not in out[0]["content"]:
+                out[0] = {**out[0], "content": f"{out[0]['content']}\n\n{instruction}"}
+            return out
+        return [{"role": "system", "content": instruction}, *out]
+    for msg in reversed(out):
+        if msg.get("role") == "user":
+            if instruction not in msg["content"]:
+                msg["content"] = f"{msg['content']}\n\n{instruction}"
+            break
+    return out
+
+
 def abstract_rl_enabled(config: DictConfig | dict) -> bool:
     custom = config.get("custom_abstract_rl", {}) if config is not None else {}
     return bool(custom and custom.get("enable", False))
@@ -216,6 +266,10 @@ def validate_abstract_rl_config(config: DictConfig | dict) -> AbstractRLConfig:
         raise ValueError("custom_abstract_rl.kl_clip must be non-negative (0 disables it).")
     if custom.max_scan_tokens <= 0:
         raise ValueError("custom_abstract_rl.max_scan_tokens must be positive.")
+    if custom.max_abstract_tokens < 0:
+        raise ValueError("custom_abstract_rl.max_abstract_tokens must be non-negative (0 disables the cap).")
+    if custom.length_penalty_coef < 0:
+        raise ValueError("custom_abstract_rl.length_penalty_coef must be non-negative.")
     if custom.delta_baseline not in ("matched", "stored"):
         raise ValueError(
             f"custom_abstract_rl.delta_baseline must be 'matched' or 'stored', got {custom.delta_baseline!r}."
@@ -226,6 +280,15 @@ def validate_abstract_rl_config(config: DictConfig | dict) -> AbstractRLConfig:
         raise ValueError(
             f"custom_abstract_rl.instruction_variant must be one of {sorted(INSTRUCTIONS)}, "
             f"got {custom.instruction_variant!r}."
+        )
+    if custom.instruction_placement not in ("user_turn", "system"):
+        raise ValueError(
+            f"custom_abstract_rl.instruction_placement must be 'user_turn' or 'system', "
+            f"got {custom.instruction_placement!r}."
+        )
+    if custom.bootstrap_mode not in ("trailing", "fill_gap"):
+        raise ValueError(
+            f"custom_abstract_rl.bootstrap_mode must be 'trailing' or 'fill_gap', got {custom.bootstrap_mode!r}."
         )
     if custom.invalid_delta not in ("zero", "penalty"):
         raise ValueError(f"custom_abstract_rl.invalid_delta must be 'zero' or 'penalty', got {custom.invalid_delta!r}.")

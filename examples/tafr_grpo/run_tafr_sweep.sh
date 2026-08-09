@@ -272,10 +272,10 @@ case "${ARM}" in
       # 0.073 at beta 0.1), so replay is inert and only the anchor cost is paid.
       # Anchor stays at the winning 0.1; only the replay weight moves.
       TAFR_BETA=0.1
-      TAFR_BETA_ANCHOR=0.1
-      TAFR_BETA_REPLAY=0.5
+      TAFR_BETA_ANCHOR=${TAFR_BETA_ANCHOR:-0.1}
+      TAFR_BETA_REPLAY=${TAFR_BETA_REPLAY:-0.5}
       export TAFR_BETA_ANCHOR TAFR_BETA_REPLAY
-      run_arm repro-split "beta split: anchor=0.1, replay=0.5 (repro baseline is 0.1/0.1)"
+      run_arm repro-split "beta split: anchor=${TAFR_BETA_ANCHOR}, replay=${TAFR_BETA_REPLAY} (repro baseline is 0.1/0.1)"
     else
       run_arm repro "xdl0kb1c config, full-finetune Math model, dsr+MATH345, greedy eval, 1000 steps"
     fi

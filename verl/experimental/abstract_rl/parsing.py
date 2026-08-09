@@ -24,7 +24,7 @@ and the tags themselves are pure ASCII and never straddle a replacement char.
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -51,6 +51,11 @@ class AbstractSpan:
     empty_abstract: bool
     abstract_text: str = ""
     y_start: int = 0
+    # |A_i| > max_abstract_tokens (config.py). Distinct from empty/missing so
+    # metrics can tell "wrote too much" apart from "wrote nothing" -- see plan
+    # section 15 (the model learned to dump the whole solution into A when
+    # nothing capped its length).
+    too_long: bool = False
 
     @property
     def n_reasoning(self) -> int:
@@ -75,6 +80,22 @@ def parse_one(
     close_tag: str = "</abstract>",
     max_scan_tokens: int = 512,
     leading: bool = False,
+    max_abstract_tokens: int = 0,
+) -> AbstractSpan:
+    span = _parse_one_raw(tokenizer, response_ids_row, response_mask_row, open_tag, close_tag, max_scan_tokens, leading)
+    if max_abstract_tokens > 0 and span.n_abstract > max_abstract_tokens:
+        return replace(span, valid=False, too_long=True)
+    return span
+
+
+def _parse_one_raw(
+    tokenizer,
+    response_ids_row: torch.Tensor,
+    response_mask_row: torch.Tensor,
+    open_tag: str,
+    close_tag: str,
+    max_scan_tokens: int,
+    leading: bool,
 ) -> AbstractSpan:
     length = _valid_length(response_mask_row)
     if length == 0:
@@ -234,9 +255,19 @@ def parse_batch(
     close_tag: str = "</abstract>",
     max_scan_tokens: int = 512,
     leading: bool = False,
+    max_abstract_tokens: int = 0,
 ) -> list[AbstractSpan]:
     return [
-        parse_one(tokenizer, response_ids[i], response_mask[i], open_tag, close_tag, max_scan_tokens, leading)
+        parse_one(
+            tokenizer,
+            response_ids[i],
+            response_mask[i],
+            open_tag,
+            close_tag,
+            max_scan_tokens,
+            leading,
+            max_abstract_tokens,
+        )
         for i in range(response_ids.shape[0])
     ]
 

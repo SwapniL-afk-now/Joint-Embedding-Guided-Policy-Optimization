@@ -3,6 +3,7 @@
 # Do not modify this file directly.
 # The file is usually only for reference and never used.
 
+model_engine: dp
 actor_rollout_ref:
   actor:
     optim:
@@ -897,12 +898,16 @@ custom_abstract_rl:
   open_tag: <abstract>
   close_tag: </abstract>
   max_scan_tokens: 512
+  max_abstract_tokens: 120
+  length_penalty_coef: 0.0
   inject_instruction: true
   instruction_variant: spec
   instruction_override: ''
+  instruction_placement: user_turn
   score_only_correct: false
   scoring_max_token_len_per_gpu: 24576
   max_score_response_tokens: 0
+  bootstrap_mode: trailing
   bootstrap_steps: 0
   bootstrap_graft_fraction: 0.5
   bootstrap_native_threshold: 0.3
@@ -911,7 +916,7 @@ custom_abstract_rl:
   bootstrap_sft_steps: 0
   bootstrap_sft_lr: 0.0
   bootstrap_sft_clip_grad: 0.0
-  bootstrap_sft_accuracy_drop: 0.10
+  bootstrap_sft_accuracy_drop: 0.1
   bootstrap_sft_min_length_fraction: 0.6
   bootstrap_abstract_cache: ''
   debug_print_n: 0

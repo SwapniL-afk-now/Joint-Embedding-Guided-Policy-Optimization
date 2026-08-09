@@ -150,3 +150,6 @@ analysis/
 logs_*.log
 *.oom.log
 .env
+
+# per-run validation dumps (155M+, Table 2 source, kept local)
+val_dumps/

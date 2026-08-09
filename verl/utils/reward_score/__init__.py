@@ -41,7 +41,16 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
-    if data_source == "openai/gsm8k":
+    if data_source in ("ifeval", "followbench"):
+        # Rule-verifiable instruction following, FEPO cross-domain check (Table 5).
+        from . import instruction_following
+
+        res = instruction_following.compute_score(solution_str, ground_truth, extra_info)
+    elif data_source == "mmlu":
+        from . import instruction_following
+
+        res = instruction_following.compute_score_mmlu(solution_str, ground_truth, extra_info)
+    elif data_source == "openai/gsm8k":
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)

@@ -255,6 +255,35 @@ def test_use_utility_false_reduces_to_task_reward(tokenizer):
     assert torch.equal(res.utility, torch.tensor([1.0, 0.0]))
 
 
+def test_length_penalty_decreases_utility_monotonically_with_abstract_length(tokenizer):
+    """plan section 15: U_i must strictly decrease in |A_i| at fixed Delta, or the
+    marginal abstraction token is still free."""
+    short = "Reasoning here. Therefore \\boxed{7}.\n<abstract>Use symmetry.</abstract>"
+    long_ = "Reasoning here. Therefore \\boxed{7}.\n<abstract>" + ("Use symmetry. " * 20) + "</abstract>"
+    cfg = AbstractRLConfig(enable=True, length_penalty_coef=0.3, max_abstract_tokens=1000, valid_bonus=0.0)
+    batch = make_batch(tokenizer, [short, long_], [True, True])
+    spans = _spans(tokenizer, batch, cfg)
+    assert spans[1].n_abstract > spans[0].n_abstract
+    n_y = spans[0].n_reasoning
+    res = _fake_result(spans, torch.ones(2), {0: 0.0, 1: 0.0}, {0: 0.0, 1: 0.0}, -0.1, cfg, batch.batch["responses"].shape[1])
+    assert res.utility[1] < res.utility[0], "the longer abstract must score strictly lower at equal Delta"
+    expected_gap = cfg.length_penalty_coef * (spans[1].n_abstract - spans[0].n_abstract) / cfg.max_abstract_tokens
+    assert float(res.utility[0] - res.utility[1]) == pytest.approx(expected_gap, abs=1e-4)
+
+
+def test_length_penalty_coef_zero_reproduces_pre_section15_utility(tokenizer):
+    """beta=0 is a regression guard: identical U_i to before the length penalty existed."""
+    cfg_off = AbstractRLConfig(enable=True, length_penalty_coef=0.0)
+    cfg_on = AbstractRLConfig(enable=True, length_penalty_coef=0.3, max_abstract_tokens=1000)
+    batch = make_batch(tokenizer, [GOOD, GOOD], [True, True])
+    spans_off = _spans(tokenizer, batch, cfg_off)
+    spans_on = _spans(tokenizer, batch, cfg_on)
+    res_off = _fake_result(spans_off, torch.ones(2), {0: 0.1, 1: 0.1}, {0: 0.0, 1: 0.0}, -0.1, cfg_off, batch.batch["responses"].shape[1])
+    res_on = _fake_result(spans_on, torch.ones(2), {0: 0.1, 1: 0.1}, {0: 0.0, 1: 0.0}, -0.1, cfg_on, batch.batch["responses"].shape[1])
+    assert not torch.equal(res_off.utility, res_on.utility), "sanity: the two configs must actually differ"
+    assert res_off.utility[0] > res_on.utility[0], "coef=0 must be the unpenalized (higher) utility"
+
+
 def test_stored_baseline_uses_the_masked_rollout_logprobs(tokenizer):
     """log pi(Y|X) is the stored old_log_probs summed over the Y mask."""
     cfg = AbstractRLConfig(enable=True, delta_baseline="stored")

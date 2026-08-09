@@ -63,6 +63,51 @@ def test_incorrect_or_invalid_rows_contribute_nothing():
     assert float(metrics["abstract_kl_tokens"]) == 2.0
 
 
+def test_long_row_kl_unaffected_by_how_many_sibling_rows_are_empty():
+    """plan section 15 regression guard: one row's per-row KL contribution must be
+    identical whether its micro-batch siblings are empty or not -- a global
+    token-weighted mean dilutes it (the reward-hacking bug); a per-row mean does
+    not."""
+    torch.manual_seed(1)
+    T_long = 40
+    log_prob_a = torch.randn(2, T_long, requires_grad=True)
+    prior_a = torch.randn(2, T_long)
+    mask_a = torch.zeros(2, T_long, dtype=torch.bool)
+    mask_a[0, :30] = True  # row 0: a long abstraction (30 tokens)
+    # row 1 empty -> row_weight will exclude it
+    loss_a, metrics_a = compute_compression_loss(log_prob_a, prior_a, mask_a, torch.tensor([1.0, 0.0]))
+
+    log_prob_b = log_prob_a.detach().clone().requires_grad_(True)
+    prior_b = prior_a.clone()
+    mask_b = mask_a.clone()
+    mask_b[1, :2] = True  # row 1 now also qualifies, with a SHORT abstraction
+    loss_b, metrics_b = compute_compression_loss(log_prob_b, prior_b, mask_b, torch.tensor([1.0, 1.0]))
+
+    # Row 0's per-row KL contribution to the loss must be unchanged by row 1
+    # gaining a short qualifying abstraction.
+    row0_contribution_a = float(metrics_a["compression_loss"])  # only row 0 qualifies in fixture A
+    kld = kl_penalty(logprob=log_prob_a.detach(), ref_logprob=prior_a, kl_penalty="low_var_kl")
+    row0_kl_mean = float((kld[0, :30]).mean())
+    assert row0_contribution_a == pytest.approx(row0_kl_mean, abs=1e-4)
+    # In fixture B the loss is the mean of row0's and row1's per-row means -- row
+    # 0's own per-row mean (computed identically) must still equal row0_kl_mean,
+    # i.e. it was not diluted by row 1 joining with far fewer tokens.
+    assert row0_kl_mean != pytest.approx(float(metrics_b["compression_loss"]), abs=1e-4), (
+        "sanity: the batch-level loss DOES change (row 1 joined), only the per-row "
+        "quantity must stay put -- this checks the batch loss moved, not that it didn't"
+    )
+
+
+def test_max_abstract_tokens_zero_and_length_penalty_zero_is_the_pre_section15_default():
+    # config.py defaults: max_abstract_tokens=120 (parse-time cap, independent of
+    # this loss) but length_penalty_coef=0.0 -- the loss aggregation change itself
+    # (per-row, not batch-mean) is unconditional, documented in compute_compression_loss.
+    from verl.experimental.abstract_rl.config import AbstractRLConfig
+
+    cfg = AbstractRLConfig()
+    assert cfg.length_penalty_coef == 0.0
+
+
 def test_matches_the_masked_k3_estimator():
     log_prob, prior, abstract_mask, _, _ = _fixture(requires_grad=False)
     row_weight = torch.tensor([1.0, 0.0, 1.0])

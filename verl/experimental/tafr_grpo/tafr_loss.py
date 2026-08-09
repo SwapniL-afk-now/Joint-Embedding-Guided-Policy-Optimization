@@ -14,6 +14,11 @@ import torch
 class TAFRLossOutput:
     loss: torch.Tensor
     metrics: dict[str, float]
+    # The two halves, already group-averaged but NOT yet weighted by b_a/b_r. Exposed
+    # so a caller can substitute one half (the Table 7 negative-CE control swaps out
+    # the replay push) without recomputing the other.
+    anchor_loss: Optional[torch.Tensor] = None
+    replay_loss: Optional[torch.Tensor] = None
 
 
 def response_length_normalized_mean(values: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
@@ -22,7 +27,16 @@ def response_length_normalized_mean(values: torch.Tensor, response_mask: torch.T
     return (values * mask).sum(dim=-1) / lengths
 
 
-def replay_gate(group_reward_mean: torch.Tensor) -> torch.Tensor:
+def replay_gate(group_reward_mean: torch.Tensor, gate_mode: str = "difficulty") -> torch.Tensor:
+    """g_x, the weight on the replay push.
+
+    "difficulty" is the paper's gate g_x = 1 - p_x, making the push proportional to
+    observed failure. "constant" pins g = 1 for every group: the Table 3 ablation
+    that tests whether conditioning on empirical failure frequency is necessary at
+    all, or whether an always-on push does just as well.
+    """
+    if gate_mode == "constant":
+        return torch.ones_like(group_reward_mean)
     return 1.0 - group_reward_mean
 
 
@@ -251,14 +265,30 @@ def compute_tafr_grpo_auxiliary_loss(
     anchor_log_prob: Optional[torch.Tensor] = None,
     replay_log_prob: Optional[torch.Tensor] = None,
     group_ids: Optional[Iterable[object]] = None,
+    gate_mode: str = "difficulty",
+    anchor_kl_direction: str = "forward",
+    old_log_prob: Optional[torch.Tensor] = None,
+    use_importance_weight: bool = True,
+    importance_weight_clip: float = 10.0,
 ) -> TAFRLossOutput:
     """Compute TAFR-GRPO KL terms on the pi_old rollout samples.
 
     All rows are actor (pi_old) rollout samples — no separate replay rows.
     Both anchor and replay log-probs are evaluated on the same y_i ~ pi_old.
 
-    Anchor KL:   D_KL(pi_theta || pi_anchor)  = log pi_theta(y_i) - log pi_anchor(y_i)
-    Replay KL:   D_KL(pi_replay || pi_theta)  = log pi_replay(y_i) - log pi_theta(y_i)
+    Both terms are FORWARD KLs from the actor to a fixed reference, matching
+    Eq. (state_kls) of the paper:
+
+        Anchor KL:   D_KL(pi_theta || pi_anchor)
+        Replay KL:   D_KL(pi_theta || pi_failure)
+
+    The k3 estimator (rho - 1 - log rho) recovers D_KL(p || q) from samples of p
+    only when rho = q/p, i.e. the log-ratio is (reference - actor). The replay term
+    always used that form. The anchor term historically used its inverse
+    (actor - reference), which is not a KL in either direction -- it evaluates to
+    chi^2 - KL, measured at 4.65 against a true KL of 1.03. anchor_kl_direction
+    ="legacy" reproduces that older behaviour for A/B comparison against runs made
+    before the fix; "forward" is correct and is the default.
 
     Actor loss adds:
         + b_a * anchor_kl   (stay close to stable anchor)
@@ -276,7 +306,7 @@ def compute_tafr_grpo_auxiliary_loss(
         raise ValueError("variant must be 'full', 'anchor_only', or 'replay_only'.")
 
     group_reward_mean = group_reward_mean.to(device=log_prob.device, dtype=log_prob.dtype).clamp(0.0, 1.0)
-    gate = replay_gate(group_reward_mean)
+    gate = replay_gate(group_reward_mean, gate_mode)
 
     zero = log_prob.sum() * 0.0
     anchor_loss = zero
@@ -288,29 +318,102 @@ def compute_tafr_grpo_auxiliary_loss(
     anchor_lp_metric = 0.0
     replay_lp_metric = 0.0
     actor_lp_on_replay_metric = 0.0
+    kl_var_metric = 0.0
+    iw_clip_fraction = 0.0
+    clamp_fraction = 0.0
+    iw_mean_metric = 1.0
 
-    if variant in {"full", "anchor_only"} and anchor_log_prob is not None:
+    # Importance weight w = pi_theta(a)/pi_old(a) for Eq. (iwk3) of the paper. The
+    # actions were drawn from pi_old, so without w the k3 estimator is biased for
+    # D_KL(pi_theta || r) as soon as the actor moves off pi_old -- which it does within
+    # every PPO epoch. Gradients are deliberately retained through w (Cor. iwk3_gradient).
+    if use_importance_weight and old_log_prob is not None:
+        old_lp = old_log_prob.to(device=log_prob.device, dtype=log_prob.dtype).detach()
+        iw_log_ratio = log_prob - old_lp
+        iw = torch.exp(iw_log_ratio.clamp(min=-20, max=20))
+        if importance_weight_clip and importance_weight_clip > 0:
+            clipped = iw.clamp(max=float(importance_weight_clip))
+            iw_clip_fraction = float(
+                (((iw > float(importance_weight_clip)).to(response_mask.dtype) * response_mask).sum()
+                 / response_mask.sum().clamp_min(1.0)).detach().cpu()
+            )
+            iw = clipped
+        iw_mean_metric = float(
+            ((iw.detach() * response_mask).sum() / response_mask.sum().clamp_min(1.0)).cpu()
+        )
+    else:
+        iw = torch.ones_like(log_prob)
+
+    def _k3(log_ratio: torch.Tensor) -> tuple[torch.Tensor, float]:
+        """IW-weighted k3: w * (e^u - 1 - u), u = log r(a) - log pi_theta(a).
+
+        Returns the per-sequence estimate and the fraction of tokens whose log-ratio
+        hit the numerical clamp. Clamping is a safeguard and biases the estimator
+        relative to Prop. (iwk3), so its activation rate is reported rather than
+        assumed negligible.
+        """
+        clamped = log_ratio.clamp(min=-20, max=20)
+        frac = float(
+            (((log_ratio != clamped).to(response_mask.dtype) * response_mask).sum()
+             / response_mask.sum().clamp_min(1.0)).detach().cpu()
+        )
+        per_token = (iw * ((torch.exp(clamped) - 1) - clamped)).clamp(min=-10, max=10)
+        return response_length_normalized_mean(per_token, response_mask), frac
+
+    # Both KLs are MEASURED whenever their reference log-probs exist; `variant` only
+    # decides which enters the loss. Otherwise the Table 3 "failure repulsion only"
+    # row (variant=replay_only) would report KL(actor, anchor) = 0 and leave that
+    # column of the ablation empty.
+    if anchor_log_prob is not None:
         frozen_anchor = anchor_log_prob.to(device=log_prob.device, dtype=log_prob.dtype).detach()
-        # k3 estimator: (r-1) - log(r), lower variance than k1 log(r)
-        log_ratio_anchor = (log_prob - frozen_anchor).clamp(min=-20, max=20)
-        r_anchor = torch.exp(log_ratio_anchor)
-        anchor_seq_kl = response_length_normalized_mean(((r_anchor - 1) - log_ratio_anchor).clamp(min=-10, max=10), response_mask)
-        anchor_loss = _group_mean(anchor_seq_kl, group_ids)
+        # rho = pi_anchor/pi_theta gives D_KL(pi_theta || pi_anchor) -- the same
+        # orientation the replay term below uses. See the docstring for why the
+        # inverted "legacy" form is not a KL.
+        if anchor_kl_direction == "legacy":
+            log_ratio_anchor = log_prob - frozen_anchor
+        else:
+            log_ratio_anchor = frozen_anchor - log_prob
+        anchor_seq_kl, anchor_clamp = _k3(log_ratio_anchor)
+        clamp_fraction = max(clamp_fraction, anchor_clamp)
         anchor_kl_metric = float(anchor_seq_kl.detach().mean().cpu())
+        kl_var_metric = float(anchor_seq_kl.detach().var(unbiased=False).cpu()) if anchor_seq_kl.numel() > 1 else 0.0
         actor_lp_metric = float(response_length_normalized_mean(log_prob.detach(), response_mask).mean().cpu())
         anchor_lp_metric = float(response_length_normalized_mean(frozen_anchor, response_mask).mean().cpu())
+        if variant in {"full", "anchor_only"}:
+            # REVERTED: tried gating this symmetrically with replay_loss (theory:
+            # anchor's full-strength pull was unopposed on all-correct groups). It
+            # matched GRPO's mean val over steps 100-190 (0.6567 vs 0.6568) but ran
+            # much noisier than either GRPO or the old gated baseline -- val range
+            # 0.076 over steps 250-260 vs ~0.02-0.026 for those two -- and the
+            # instability wasn't damping between checkpoints. Reverting to
+            # ungated: only replay_loss (the failure/repulsion term) is gated by
+            # difficulty; anchor_loss stays full-strength always, as in every
+            # prior stable run.
+            anchor_loss = _group_mean(anchor_seq_kl, group_ids)
 
-    if variant in {"full", "replay_only"} and replay_log_prob is not None:
+    if replay_log_prob is not None:
         frozen_replay = replay_log_prob.to(device=log_prob.device, dtype=log_prob.dtype).detach()
-        # k3 estimator for D_KL(pi_replay || pi_theta): log ratio is frozen_replay - log_prob
-        log_ratio_replay = (frozen_replay - log_prob).clamp(min=-20, max=20)
-        r_replay = torch.exp(log_ratio_replay)
-        replay_seq_kl = response_length_normalized_mean(((r_replay - 1) - log_ratio_replay).clamp(min=-10, max=10), response_mask)
-        gated_replay_seq_kl = gate * replay_seq_kl
-        replay_loss = _group_mean(gated_replay_seq_kl, group_ids)
+        replay_seq_kl, replay_clamp = _k3(frozen_replay - log_prob)
+        clamp_fraction = max(clamp_fraction, replay_clamp)
         replay_kl_metric = float(replay_seq_kl.detach().mean().cpu())
         replay_lp_metric = float(response_length_normalized_mean(frozen_replay, response_mask).mean().cpu())
         actor_lp_on_replay_metric = float(response_length_normalized_mean(log_prob.detach(), response_mask).mean().cpu())
+        if variant in {"full", "replay_only"}:
+            # REVERTED (measured regression): ungating this made replay_loss fire at
+            # full strength on all-correct groups too, on the theory that it would
+            # self-cancel against anchor_loss per-token wherever pi_anchor(t) ~=
+            # pi_failure(t). That assumption isn't enforced anywhere -- the failure
+            # clone can diverge from the anchor model broadly, not just at error
+            # tokens -- so ungating added an uncorrelated, ungated gradient source
+            # even on the model's best groups. Measured effect on GPU1 (42r70off):
+            # val/math500/pass_at_1 dropped to 0.498 at step 160 and never recovered
+            # to the 0.63-0.68 band both the GRPO baseline and the gated runs held
+            # steady in over the same span. gate = 1 - r_bar_x concentrates the
+            # replay/repulsion signal on groups that are actually failing, which is
+            # where repulsion-from-failure-model should matter; that concentration,
+            # not an oversight, is what the group-level gate was doing.
+            gated_replay_seq_kl = gate * replay_seq_kl
+            replay_loss = _group_mean(gated_replay_seq_kl, group_ids)
 
     b_a = float(beta if beta_anchor is None else beta_anchor)
     b_r = float(beta if beta_replay is None else beta_replay)
@@ -341,11 +444,18 @@ def compute_tafr_grpo_auxiliary_loss(
         "tafr_grpo/replay_term": b_r * replay_kl_metric,
         "tafr_grpo/tafr_advantage": -float(loss.detach().cpu()),
         "tafr_grpo/tafr_advantage_abs": abs(float(loss.detach().cpu())),
+        # Estimator diagnostics. The paper reports these rather than claiming the
+        # numerical safeguards are free: both clipping paths bias the estimator
+        # relative to Prop. (iwk3), so their activation rates must be visible.
+        "tafr_grpo/iwk3_variance": kl_var_metric,
+        "tafr_grpo/iw_clip_fraction": iw_clip_fraction,
+        "tafr_grpo/logratio_clamp_fraction": clamp_fraction,
+        "tafr_grpo/iw_mean": iw_mean_metric,
     }
-    if variant in {"full", "anchor_only"}:
+    if anchor_log_prob is not None:
         metrics["tafr_grpo/actor_logprob"] = actor_lp_metric
         metrics["tafr_grpo/anchor_logprob"] = anchor_lp_metric
-    if variant in {"full", "replay_only"}:
+    if replay_log_prob is not None:
         metrics["tafr_grpo/replay_logprob"] = replay_lp_metric
         metrics["tafr_grpo/actor_logprob_on_replay_samples"] = actor_lp_on_replay_metric
-    return TAFRLossOutput(loss=loss, metrics=metrics)
+    return TAFRLossOutput(loss=loss, metrics=metrics, anchor_loss=anchor_loss, replay_loss=replay_loss)

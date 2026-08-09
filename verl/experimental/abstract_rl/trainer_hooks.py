@@ -23,7 +23,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.core_algos import kl_penalty
 from verl.utils.profiler import marked_timer
 
-from .config import AbstractRLConfig, rollout_instruction
+from .config import AbstractRLConfig, apply_instruction, rollout_instruction
 from .parsing import build_masks, parse_batch
 from .scoring import build_scoring_batch, compute_delta_utility, run_scoring
 
@@ -93,10 +93,12 @@ def sft_warmup_optimizer(engine, abstract_config):
 
 
 def inject_instruction(cfg: AbstractRLConfig, gen_batch) -> None:
-    """Append the abstraction instruction to the last user turn, in place.
+    """Insert the abstraction instruction into the prompt, in place (placement per
+    ``cfg.instruction_placement``: append to the last user turn, or a system message).
 
     Applied in ``_get_gen_batch``, which serves both training and validation, so
-    the policy is evaluated on the prompt format it was trained on.
+    the policy is evaluated on the prompt format it was trained on. A no-op when
+    ``AbstractRLDataset`` already injected it at load time (idempotent match).
     """
     if not cfg.inject_instruction:
         return
@@ -106,13 +108,7 @@ def inject_instruction(cfg: AbstractRLConfig, gen_batch) -> None:
     instruction = rollout_instruction(cfg)
     out = np.empty(len(raw_prompt), dtype=object)
     for i, messages in enumerate(raw_prompt):
-        messages = [dict(m) for m in messages]
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                if instruction not in msg["content"]:
-                    msg["content"] = f"{msg['content']}\n\n{instruction}"
-                break
-        out[i] = messages
+        out[i] = apply_instruction(list(messages), instruction, cfg.instruction_placement)
     gen_batch.non_tensor_batch["raw_prompt"] = out
 
 
@@ -123,7 +119,13 @@ def bootstrap_graft(trainer, batch, timing_raw: dict) -> dict[str, float]:
     before ``old_log_prob``, so the recomputed log-probs cover the grafted tokens.
     Off unless ``bootstrap_steps > 0``; latches off once the policy emits
     abstractions natively. See bootstrap.py for why only a fraction is grafted.
+
+    Dispatches on ``cfg.bootstrap_mode``: "trailing" is this function's original
+    append-to-the-tail graft; "fill_gap" is ``_fill_missing_abstract`` below.
     """
+    if trainer.abstract_rl_config.bootstrap_mode == "fill_gap":
+        return _fill_missing_abstract(trainer, batch, timing_raw)
+
     from .bootstrap import build_phase2_batch, graft, select_rows
 
     cfg: AbstractRLConfig = trainer.abstract_rl_config
@@ -140,6 +142,7 @@ def bootstrap_graft(trainer, batch, timing_raw: dict) -> dict[str, float]:
         cfg.close_tag,
         cfg.max_scan_tokens,
         leading=cfg.instruction_variant == "leading",
+        max_abstract_tokens=cfg.max_abstract_tokens,
     )
     native_rate = sum(s.valid for s in spans) / max(n, 1)
     state.observe(native_rate)
@@ -204,6 +207,98 @@ def bootstrap_graft(trainer, batch, timing_raw: dict) -> dict[str, float]:
     return metrics
 
 
+def _fill_missing_abstract(trainer, batch, timing_raw: dict) -> dict[str, float]:
+    """``bootstrap_mode=fill_gap``: pass 1 already asked for abstract+solution
+    together (system-prompt cue). Check the whole output for a valid abstract
+    ANYWHERE; if missing/degenerate, pass 2 generates only the abstract from the
+    question alone (``PRIOR_TEMPLATE``). Either way, reposition to the canonical
+    ``abstract, then Y`` sequence -- relocating an already-valid-but-misplaced
+    abstract is free (no generation); only the missing/degenerate rows cost a
+    second generation call, thinned and latched exactly like ``bootstrap_graft``.
+    """
+    from .bootstrap import build_prior_batch, clean_abstract, find_abstract_text, is_degenerate, reposition_responses, thin_rows
+    from .parsing import _valid_length
+
+    cfg: AbstractRLConfig = trainer.abstract_rl_config
+    state = trainer.abstract_rl_bootstrap
+    tokenizer = trainer.tokenizer
+    responses = batch.batch["responses"]
+    response_mask = batch.batch["response_mask"]
+    n, resp_len = responses.shape
+
+    texts = [
+        tokenizer.decode(responses[i, : _valid_length(response_mask[i])], skip_special_tokens=True) for i in range(n)
+    ]
+    parsed = [find_abstract_text(t, cfg.open_tag, cfg.close_tag) for t in texts]
+
+    def _pass1_valid(p) -> bool:
+        if p is None:
+            return False
+        cleaned = clean_abstract(p[0])
+        if not cleaned or is_degenerate(cleaned):
+            return False
+        # A too-long pass-1 abstract must trigger pass 2 (a fresh, capped attempt),
+        # not get relocated as-is -- otherwise it reaches scoring, is invalidated
+        # there (v_i=0, too_long), and the row wasted a "native" slot for nothing.
+        # See plan section 15.
+        if cfg.max_abstract_tokens > 0 and len(tokenizer(cleaned, add_special_tokens=False)["input_ids"]) > cfg.max_abstract_tokens:
+            return False
+        return True
+
+    valid_flags = [_pass1_valid(p) for p in parsed]
+    native_rate = sum(valid_flags) / max(n, 1)
+    state.observe(native_rate)
+
+    metrics = {
+        "abstract_rl/native_abstract_rate": native_rate,
+        "abstract_rl/bootstrap_active": 0.0,
+        "abstract_rl/fill_rate": 0.0,
+        "abstract_rl/fill_rejected_rate": 0.0,
+    }
+
+    # Free: relocate already-valid abstracts to the front, no second generation.
+    assignments: dict[int, tuple[str, str]] = {i: parsed[i] for i in range(n) if valid_flags[i]}
+
+    if state.active(trainer.global_steps):
+        metrics["abstract_rl/bootstrap_active"] = 1.0
+        need_fill = [i for i in range(n) if not valid_flags[i]]
+        rows = thin_rows(need_fill, cfg.bootstrap_graft_fraction, seed=trainer.global_steps)
+        if rows:
+            with marked_timer("abstract_bootstrap", timing_raw, color="magenta"):
+                gen_batch, kept = build_prior_batch(tokenizer, batch, rows, int(trainer.config.data.max_prompt_length))
+                if gen_batch is not None:
+                    gen_batch.meta_info = {
+                        "eos_token_id": tokenizer.eos_token_id,
+                        "pad_token_id": tokenizer.pad_token_id,
+                        "recompute_log_prob": False,
+                        "global_steps": trainer.global_steps,
+                        # Greedy: same rationale as the trailing-graft phase-2 call.
+                        "validate": True,
+                    }
+                    size_divisor = max(1, trainer.config.actor_rollout_ref.rollout.agent.num_workers)
+                    padded, pad_size = pad_dataproto_to_divisor(gen_batch, size_divisor)
+                    phase2 = trainer.async_rollout_manager.generate_sequences(padded)
+                    phase2 = unpad_dataproto(phase2, pad_size=pad_size)
+                    out_responses = phase2.batch["responses"]
+                    out_mask = phase2.batch["response_mask"]
+                    for k, i in enumerate(kept):
+                        valid_len = int(out_mask[k].sum())
+                        abstract_text = (
+                            tokenizer.decode(out_responses[k, :valid_len], skip_special_tokens=True)
+                            if valid_len
+                            else ""
+                        )
+                        y_text = parsed[i][1] if parsed[i] is not None else texts[i]
+                        assignments[i] = (abstract_text, y_text)
+
+    if assignments:
+        with marked_timer("abstract_bootstrap", timing_raw, color="magenta"):
+            repositioned, rejected = reposition_responses(tokenizer, batch, assignments, cfg)
+        metrics["abstract_rl/fill_rate"] = repositioned / max(n, 1)
+        metrics["abstract_rl/fill_rejected_rate"] = rejected / max(n, 1)
+    return metrics
+
+
 def _task_reward(batch) -> torch.Tensor:
     """r_i in {0,1}. Prefers the verifier's ``acc`` over the sign of the score,
     which is unsafe under the dapo overlong-buffer penalty."""
@@ -255,7 +350,10 @@ def score_and_shape(trainer, batch, timing_raw: dict) -> dict[str, float]:
         cfg.open_tag,
         cfg.close_tag,
         cfg.max_scan_tokens,
-        leading=cfg.instruction_variant == "leading",
+        # fill_gap always reassembles to abstract-first, regardless of the wording
+        # of instruction_variant -- the layout is canonical by construction.
+        leading=cfg.instruction_variant == "leading" or cfg.bootstrap_mode == "fill_gap",
+        max_abstract_tokens=cfg.max_abstract_tokens,
     )
     reasoning_mask, abstract_mask = build_masks(spans, response_mask)
     reward = _task_reward(batch)

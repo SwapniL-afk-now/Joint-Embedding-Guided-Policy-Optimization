@@ -274,6 +274,19 @@ def compute_delta_utility(
         delta_tilde = torch.zeros_like(delta_tilde)
     utility = task_reward.float() * (1.0 + delta_tilde)
 
+    # Length penalty (plan section 15): a per-row rate cost, beta * |A_i| /
+    # max_abstract_tokens, subtracted directly from U on VALID rows only --
+    # invalid (incl. too_long) rows already lost delta_tilde/valid_bonus above,
+    # so this only needs to bite while a row is still under the hard cap, making
+    # the marginal abstraction token cost something even before it trips the cap.
+    # Without this the compression KL loss was the only length pressure, and it's
+    # a batch-wide mean (loss.py) that dilutes to ~free -- see the fillgap-strong-
+    # 20260807-v3 measurement (|A| tripled, KL stayed flat).
+    if cfg.length_penalty_coef > 0 and cfg.max_abstract_tokens > 0:
+        n_abstract = torch.tensor([float(s.n_abstract) for s in spans], device=device)
+        penalty = cfg.length_penalty_coef * (n_abstract / cfg.max_abstract_tokens)
+        utility = utility - torch.where(valid, penalty, torch.zeros_like(penalty))
+
     return ScoringResult(
         delta=delta,
         delta_stored=delta_stored,
