@@ -62,7 +62,12 @@ def load_probe_success(dump_dir: Path) -> dict[int, dict[str, float]]:
             # the five math benchmarks are scored too but are not the mechanism set.
             if row.get("data_source", "probe") != "probe":
                 continue
-            by_step[step][row["input"]].append(float(row["score"]))
+            # `acc`, NOT `score`: this repo's math scorer returns +1.0/-1.0, so
+            # averaging score puts an all-wrong prompt at p=-1 (matching no bucket,
+            # silently dropped) and a 4-of-8 prompt at exactly p=0, where Recovery@delta
+            # would count it as "never solved". acc is boolean, so p is the success
+            # fraction in [0,1] that the buckets and Recovery@delta are defined on.
+            by_step[step][row["input"]].append(1.0 if row["acc"] else 0.0)
 
     return {s: {p: sum(v) / len(v) for p, v in d.items()} for s, d in by_step.items()}
 
@@ -129,10 +134,18 @@ def cmd_recovery(dump_dir: Path, deltas: list[int]) -> int:
     return 0
 
 
-def _recovery_at(hist, ref, delta):
-    """Recovery@delta measured from the reference step, or None if not yet reached."""
+def _recovery_at(hist, ref, delta, failed=None):
+    """Recovery@delta measured from the reference step, or None if not yet reached.
+
+    `failed` overrides the prompt set. cmd_compare MUST pass one: both arms start
+    from the same base model, but step 0 is sampled (n=8, temp 0.6), so each arm's
+    own step-0 pass disagrees about which prompts sit at p=0. Letting each arm pick
+    its own set makes the reported Increment a difference of two rates measured on
+    different prompts -- not the paired quantity the table claims.
+    """
     base = hist[ref]
-    failed = {p for p, r in base.items() if r == 0.0}
+    if failed is None:
+        failed = {p for p, r in base.items() if r == 0.0}
     later = [s for s in hist if s >= ref + delta]
     if not failed or not later:
         return None
@@ -140,15 +153,19 @@ def _recovery_at(hist, ref, delta):
     return sum(1 for p in failed if hist[s].get(p, 0.0) > 0.0) / len(failed)
 
 
-def _bucket_gains(hist):
-    """Per-bucket mean accuracy gain from the reference step to the last step."""
+def _bucket_gains(hist, ref_scores=None):
+    """Per-bucket mean accuracy gain from the reference step to the last step.
+
+    `ref_scores` fixes bucket membership (and the baseline each gain is measured
+    from) to one arm's reference, for the same pairing reason as _recovery_at.
+    """
     ref, last = min(hist), max(hist)
-    base = hist[ref]
+    base = ref_scores if ref_scores is not None else hist[ref]
     out = {}
     for name, fn in BUCKETS:
-        members = [p for p, r in base.items() if fn(r)]
+        members = [p for p, r in base.items() if fn(r) and p in hist[ref]]
         out[name] = (
-            sum(hist[last].get(p, 0.0) - base[p] for p in members) / len(members) if members else None
+            sum(hist[last].get(p, 0.0) - hist[ref][p] for p in members) / len(members) if members else None
         )
     return out
 
@@ -162,10 +179,22 @@ def cmd_compare(base_dir: Path, fepo_dir: Path, deltas: list[int]) -> int:
     hb, hf = load_probe_success(base_dir), load_probe_success(fepo_dir)
     rb, rf = min(hb), min(hf)
 
-    print(f"base: {base_dir.name}   +FEPO: {fepo_dir.name}\n")
+    # One reference set for both arms, from the BASE arm's step-0 pass, restricted to
+    # prompts both arms actually scored. Without this the two columns are computed on
+    # different prompt subsets and the Increment is not a paired difference.
+    shared = hb[rb].keys() & hf[rf].keys()
+    ref_scores = {p: hb[rb][p] for p in shared}
+    failed = {p for p, r in ref_scores.items() if r == 0.0}
+
+    print(f"base: {base_dir.name}   +FEPO: {fepo_dir.name}")
+    print(
+        f"paired on {len(shared)} prompts scored by both arms; "
+        f"{len(failed)} at p=0 in the base arm's step-{rb} reference "
+        f"(this set is used for BOTH columns)\n"
+    )
     print(f"{'':<10} {'Base':>10} {'+FEPO':>10} {'Increment':>12}")
     for d in deltas:
-        a, b = _recovery_at(hb, rb, d), _recovery_at(hf, rf, d)
+        a, b = _recovery_at(hb, rb, d, failed), _recovery_at(hf, rf, d, failed)
         if a is None or b is None:
             print(f"Rec@{d:<6} {'n/a':>10} {'n/a':>10} {'n/a':>12}")
         else:
@@ -173,7 +202,7 @@ def cmd_compare(base_dir: Path, fepo_dir: Path, deltas: list[int]) -> int:
 
     print("\nAccuracy gain by initial success rate (Table 2 lower panel):")
     print(f"{'bucket':<14} {'Base dacc':>11} {'+FEPO dacc':>12} {'Increment':>12}")
-    gb, gf = _bucket_gains(hb), _bucket_gains(hf)
+    gb, gf = _bucket_gains(hb, ref_scores), _bucket_gains(hf, ref_scores)
     for name, _ in BUCKETS:
         a, b = gb[name], gf[name]
         if a is None or b is None:

@@ -75,6 +75,10 @@ def default_compute_score(
         "olympiadbench",
         "deepscaler-preview-dataset",
         "minervamath",
+        # probe256.parquet (00_setup.sh) -- held-out math prompts for the Table 2
+        # mechanism analysis. Same scoring as any other math source; without this
+        # entry every probe validation raises NotImplementedError.
+        "probe",
     ] or data_source.startswith("aime"):
         from verl.experimental.fepo.math_parser import compute_math_reward
 

@@ -1,0 +1,1218 @@
+\documentclass{article}
+\usepackage{iclr2027_conference,times}
+\usepackage[hypertexnames=false]{hyperref}
+\hypersetup{hidelinks}
+\usepackage{url}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{xspace}
+\usepackage{array}
+\usepackage{float}
+
+\title{Failure-Escape Policy Optimization for Verifiable LLM Reinforcement Learning}
+\author{Anonymous authors}
+
+\newcommand{\pol}{\pi_\theta}
+\newcommand{\oldpol}{\pi_{\theta_{\mathrm{old}}}}
+\newcommand{\anchorpol}{\pi_{\mathrm A}}
+\newcommand{\failpol}{\pi_{\mathrm F}}
+\newcommand{\KL}{D_{\mathrm{KL}}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\TBD}{\textcolor{gray}{\textit{TBD}}}
+\newcommand{\FEPO}{\textsc{FEPO}\xspace}
+\newcommand{\figureplaceholder}[1]{%
+\fbox{\parbox[c][0.16\textheight][c]{0.90\linewidth}{\centering\textcolor{gray}{\textbf{Figure placeholder}\\[6pt]#1}}}%
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\newtheorem{assumption}{Assumption}
+\newtheorem{remark}{Remark}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Reinforcement learning with verifiable rewards often improves reasoning models by comparing multiple responses to the same prompt. This relative signal disappears when every sampled response receives the same reward, making an all-failure group indistinguishable from an all-success group to the centered reward objective even though the two cases call for very different behavior. We introduce \emph{Failure-Escape Policy Optimization} (\FEPO), a plug-in method that learns a reference distribution from failed rollouts and uses it to steer the policy away from recurrent failure while a slowly moving anchor preserves useful behavior. \FEPO leaves the base algorithm's policy objective unchanged and can therefore augment token-level, sequence-level, and system-level group-relative RL methods. We derive the resulting constrained objective, characterize the learning signal that remains in all-failure groups, and analyze gate estimation, reference drift, and replay-based estimation. We evaluate the method on mathematical reasoning at two model scales and on a verifier-based instruction-following setting, with dedicated analyses of failure recovery, component ablations, and training cost.
+\end{abstract}
+
+\section{Introduction}
+
+Reinforcement learning with verifiable rewards (RLVR) has become an important mechanism for improving the reasoning capabilities of large language models. Group-relative methods are particularly attractive in this setting because they compare several responses to the same prompt and thereby avoid the need for a separately trained value model. GRPO and its successors have consequently become common building blocks for mathematical reasoning and other tasks with programmatic or rule-based verification \citep{deepseekmath2024,liu2025understanding,yu2025dapo,zheng2025gspo}.
+
+The effectiveness of these methods depends on variation within a rollout group. When some responses succeed and others fail, relative rewards provide a clear direction for policy improvement. The situation is different when all sampled responses receive the same binary reward. An all-success group and an all-failure group both have zero centered reward variation, yet they carry opposite semantic information: the former indicates behavior that is already successful, while the latter identifies a region of policy behavior that repeatedly fails. Near the model's capability frontier, where successes are rare, this distinction becomes especially important because a growing fraction of training prompts can produce only failed rollouts.
+
+Existing approaches address sparse or homogeneous groups by resampling prompts, modifying advantage estimates, increasing exploration, constructing virtual comparison signals, or adding external scaffolding. These strategies can restore a scalar learning signal, but they do not directly use the distributional structure already present in the failed trajectories themselves. Our starting point is that repeated failures are not information-free. Even when their rewards are identical, they describe where the current policy repeatedly places probability mass when it is unsuccessful.
+
+We therefore propose \emph{Failure-Escape Policy Optimization} (\FEPO). The method maintains two references with distinct roles. A slowly moving anchor preserves proximity to reliable recent behavior, while a failure reference is fitted to replayed failed trajectories. The actor is trained with the original base objective together with a failure-conditioned divergence term that encourages separation from the learned failure distribution while retaining the anchor as a local stabilizer. The construction does not alter how the base RL algorithm defines relative advantages, importance ratios, or clipping, so the same mechanism can be attached to GRPO, GSPO, DAPO, and related methods.
+
+The contribution is both algorithmic and analytical. We derive \FEPO from a single constrained policy-improvement objective rather than from independently weighted auxiliary losses, show why the reverse replay divergence supplies a non-zero anti-imitation direction when centered group rewards vanish, and characterize the effects of small-group gate estimation and moving references under finite policy updates. The experimental design tests the same mechanism across multiple group-relative RL algorithms, at two model scales, and in a second verifier-based domain, with failure recovery and component ablations used to distinguish the proposed mechanism from generic regularization.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Group-relative RL under sparse rewards}
+GRPO replaces value-model estimation with relative advantages computed from multiple responses to the same prompt \citep{deepseekmath2024}. Dr.GRPO studies normalization and length effects, DAPO combines dynamic sampling with a broader training recipe, and GSPO moves importance weighting and clipping to the sequence level \citep{liu2025understanding,yu2025dapo,zheng2025gspo}. Methods aimed more directly at sparse or homogeneous groups include NGRPO, which modifies negative-heavy advantages, and AVSPO, which restores scalar contrast through virtual reward statistics \citep{nan2025ngrpo,he2026avspo}. TPO and DGPO provide complementary distribution-aware alternatives through candidate target reweighting and token-level redistribution of sequence signal \citep{kaddour2026tpo,jin2026dgpo}. \FEPO differs in where it introduces information: the base group objective is left unchanged, while recurrent failed trajectories are modeled as a persistent reference distribution that can provide a direction even when relative reward variation is absent. Additional sparse-reward, exploration, and curriculum methods are discussed in Appendix~\ref{app:related}.
+
+\subsection{Anchoring, replay, and learning from negative behavior}
+Slow-moving reference policies are widely used to stabilize RL training, including momentum-anchored GRPO variants, EMA Policy Gradient, and related anchored methods \citep{mgrpo2025,emappg2026,apo2026,polyak1992averaging}. \FEPO shares the use of an EMA anchor but assigns it only a stabilizing role; the additional learning signal comes from a separately fitted failure reference. Preference-learning methods such as DPO, SimPO, ORPO, and SPIN also learn from undesirable responses, but they assume an explicit preferred counterpart or a stronger target distribution \citep{rafailov2023dpo,meng2024simpo,hong2024orpo,chen2024spin}. \FEPO instead targets the failure-only regime in which no sampled response to a prompt need be successful.
+
+\section{Preliminaries}
+\label{sec:prelim}
+
+\paragraph{Notation.}
+We write an autoregressive language model as a policy $\pi_\theta$. For a prompt $x$, an old policy $\pi_{\theta_{\mathrm{old}}}$ generates a group of responses $Y=\{y_i\}_{i=1}^{G}$. A verifier assigns each response a binary reward $r_i\in\{0,1\}$. The likelihood of a response factorizes autoregressively in the usual way, and a rollout state is denoted by $s_{i,t}=(x,y_{i,<t})$.
+
+\paragraph{Terminology.}
+We distinguish three levels throughout the paper. \emph{RL algorithm} refers to a training method such as GRPO, GSPO, DAPO, or \FEPO; \emph{objective} or \emph{surrogate} refers to the mathematical policy criterion optimized by that algorithm; and \emph{parameter optimizer} refers only to the numerical update rule, such as AdamW. This distinction is maintained throughout the method and experimental sections.
+
+\subsection{Group-relative policy objectives}
+A generic centered group advantage is
+\begin{equation}
+A_i=r_i-\bar r,
+\qquad
+\bar r=\frac{1}{G}\sum_{j=1}^{G}r_j.
+\label{eq:centered_adv}
+\end{equation}
+GRPO applies token-level importance ratios and clipping to this group-relative signal, while Dr.GRPO changes the normalization used to form the update \citep{deepseekmath2024,liu2025understanding}. GSPO instead performs importance correction and clipping at the response level, aligning the correction unit with the sequence-level reward \citep{zheng2025gspo}. DAPO retains group-relative rewards but adds a broader training recipe that includes dynamic sampling and homogeneous-group filtering \citep{yu2025dapo}. We denote the resulting rollout-derived objective generically by $\mathcal J_{\mathrm B}(\theta)$. \FEPO augments this objective without changing its internal definition.
+
+\section{Motivation}
+\label{sec:motivation}
+
+\subsection{Homogeneous groups erase the distinction between success and failure}
+Let
+\begin{equation}
+p_x=\frac{1}{G}\sum_{i=1}^{G}r_i
+\label{eq:success_rate}
+\end{equation}
+be the empirical success rate for prompt $x$. For binary rewards and the centered signal in Eq.~\eqref{eq:centered_adv}, the within-group variation is
+\begin{equation}
+\frac{1}{G}\sum_{i=1}^{G}A_i^2=p_x(1-p_x).
+\label{eq:binary_variance}
+\end{equation}
+Thus the relative reward signal vanishes at both endpoints: $p_x=1$ and $p_x=0$. Standardization can rescale a non-degenerate group, but it cannot create relative information when every reward is identical. The two endpoints are nevertheless qualitatively different. All-success indicates that the sampled behavior already solves the prompt; all-failure indicates that the policy has repeatedly visited unsuccessful behavior and provides no successful response from which a relative update can be formed.
+
+\begin{figure}[t]
+ \centering
+ \figureplaceholder{Planned conceptual figure: centered binary reward variation across the group success rate, contrasted with the failure gate used by FEPO.}
+ \caption{\textbf{Homogeneous groups under binary verification.} The planned figure will contrast the symmetric loss of relative reward variation at the all-success and all-failure endpoints with FEPO's asymmetric use of failure frequency.}
+ \label{fig:signal}
+\end{figure}
+
+\subsection{Failure remains structured even when reward does not}
+A zero relative advantage does not imply that the sampled trajectories are uninformative. Failed responses reveal which reasoning patterns, token transitions, and partial strategies the current policy repeatedly assigns probability to when the verifier returns zero. The challenge is to exploit this information without simply suppressing every token that appears in a wrong solution. An incorrect trajectory may contain useful intermediate reasoning, and unrestricted repulsion from failed samples can move the policy away from otherwise valuable behavior.
+
+This observation motivates three requirements. First, the mechanism should be independent of the specific group-relative objective, because the information loss occurs before the distinction between token-level and sequence-level credit assignment matters. Second, its strength should increase with the observed failure rate and vanish for an all-success group. Third, failure-driven movement should remain local to a slowly changing reference so that escaping recurrent failures does not become unconstrained policy drift. \FEPO implements these requirements with a failure reference, an anchor, and a single failure-conditioned constraint.
+
+\section{Failure-Escape Policy Optimization}
+\label{sec:fepo}
+
+\subsection{Failure reference, anchor, and gate}
+\FEPO maintains an anchor policy $\anchorpol$ and a failure reference $\failpol$. The anchor is a slowly moving copy of the actor and represents recent behavior that should remain locally accessible. The failure reference is fitted to a bounded replay buffer containing only failed responses and summarizes behavior repeatedly associated with zero verifier reward. For each raw rollout group, we define the failure gate
+\begin{equation}
+g_x=1-p_x.
+\label{eq:failure_gate}
+\end{equation}
+The gate is zero for an all-success group and one for an all-failure group, with intermediate values determined directly by the observed fraction of failures.
+
+For a rollout state $s$, define
+\begin{equation}
+K_{\mathrm A}(s;\theta)=\KL\!\left(\pol(\cdot\mid s)\Vert\anchorpol(\cdot\mid s)\right),
+\qquad
+K_{\mathrm F}(s;\theta)=\KL\!\left(\failpol(\cdot\mid s)\Vert\pol(\cdot\mid s)\right).
+\label{eq:state_kls}
+\end{equation}
+The anchor therefore uses the forward actor-to-anchor KL, while the failure reference enters through the reverse replay-to-actor KL.
+
+\subsection{Failure-credited policy objective}
+For a rollout group $Y$, let
+\begin{equation}
+\Omega_x(\theta)=
+\frac{1}{G}\sum_{i=1}^{G}\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}
+\left[K_{\mathrm A}(s_{i,t};\theta)-g_xK_{\mathrm F}(s_{i,t};\theta)\right].
+\label{eq:group_potential}
+\end{equation}
+We begin from the constrained policy-improvement problem
+\begin{equation}
+\max_{\theta}\;\mathcal J_{\mathrm B}(\theta)
+\qquad
+\text{subject to}
+\qquad
+\E_{x,Y\sim\oldpol}[\Omega_x(\theta)]\le\delta.
+\label{eq:fepo_constrained}
+\end{equation}
+The constraint has a simple interpretation. The actor is penalized for moving away from the anchor, but this penalty is relaxed when the same movement increases separation from behavior represented by the failure reference. Introducing a Lagrange multiplier $\beta\ge0$ yields
+\begin{equation}
+\mathcal J_{\mathrm{FEPO}[\mathrm B]}(\theta)
+=\mathcal J_{\mathrm B}(\theta)
+-\beta\mathcal K_{\mathrm A}(\theta)
++\beta\E_x\!\left[g_x\mathcal K_{\mathrm F}^{(x)}(\theta)\right].
+\label{eq:fepo_compact}
+\end{equation}
+Equivalently, the actor maximizes the base surrogate while paying a forward KL cost to the anchor and receiving a failure-gated incentive to increase the reverse KL from the learned failure reference. The shared coefficient is inherited from one constrained objective rather than introduced as two independent auxiliary weights. The expanded trajectory-level form and the complete derivation are given in Appendix~\ref{app:derivation}.
+
+\subsection{Why reverse replay KL provides an escape direction}
+At a fixed state, write $q=\pol(\cdot\mid s)$ and $f=\failpol(\cdot\mid s)$. The failure divergence can be written as
+\begin{equation}
+\KL(f\Vert q)=-H(f)-\E_{z\sim f}[\log q(z)].
+\label{eq:reverse_antiimitation}
+\end{equation}
+Because $f$ is fixed during an actor update, increasing this divergence is equivalent to decreasing actor log-likelihood on actions in proportion to their probability under the learned failure distribution. This differs from uniformly penalizing every token in every failed response: the learned reference aggregates recurrent failure behavior across replay and weights the anti-imitation update by that distribution.
+
+The two homogeneous endpoints now have different behavior. When $g_x=0$, the additional term reduces to ordinary anchoring. When $g_x=1$, the group-relative reward contribution may vanish, but the failure term remains active and supplies a direction away from recurrent failure behavior. The anchor simultaneously limits unrestricted movement. Because the reverse KL can diverge if the actor drives replay-supported actions to zero probability, our theoretical statements are intentionally local to the finite-step policy neighborhood induced by proximal policy updates; Appendix~\ref{app:derivation} states the corresponding boundedness result.
+
+\subsection{Reference and actor updates}
+Failed responses are inserted into a bounded buffer $\mathcal B_F$. The failure reference is periodically refreshed by maximum-likelihood training on this buffer,
+\begin{equation}
+\mathcal L_F(\phi)
+=-\E_{(x,y)\sim\mathcal B_F}\!\left[\frac{1}{|y|}\sum_t\log\pi_\phi(y_t\mid x,y_{<t})\right],
+\label{eq:fail_sft}
+\end{equation}
+and the anchor follows the actor through an exponential moving average,
+\begin{equation}
+\theta_{\mathrm A}\leftarrow(1-\gamma)\theta_{\mathrm A}+\gamma\theta.
+\label{eq:anchor_ema}
+\end{equation}
+The base RL algorithm is otherwise unchanged. In particular, with DAPO the raw group is scored and supplied to the failure mechanism before homogeneous-group filtering is applied; otherwise the all-failure groups targeted by \FEPO would be removed before the method can use them.
+
+\begin{algorithm}[t]
+\caption{Failure-Escape Policy Optimization}
+\label{alg:fepo}
+\begin{algorithmic}[1]
+\STATE Initialize actor $\pol$, anchor $\anchorpol\leftarrow\pol$, failure reference $\failpol$, and replay buffer $\mathcal B_F$.
+\FOR{each prompt batch}
+ \STATE Generate raw rollout groups with $\oldpol$ and obtain verifier rewards.
+ \STATE Compute $g_x$ for each group and add failed responses to $\mathcal B_F$.
+ \STATE Record the log-probabilities required for the anchor and replay KL terms.
+ \STATE Apply any base-method filtering and construct the original surrogate $\mathcal J_{\mathrm B}$.
+ \STATE Update the actor using Eq.~\eqref{eq:fepo_compact}.
+ \STATE Periodically refresh $\failpol$ from $\mathcal B_F$ and update $\anchorpol$ by Eq.~\eqref{eq:anchor_ema}.
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Finite-update analysis}
+The additional signal is well behaved over the finite policy-update regime relevant to RL training. Under conditionally independent Bernoulli rollouts, the empirical gate is unbiased for the prompt-level failure probability and has variance at most $1/(4G)$. If the ungated failure-gradient contribution has norm at most $H$, the resulting mean-squared perturbation is at most $H^2/(4G)$, with the usual $O(G^{-1/2})$ concentration. The reverse replay term also yields a non-zero anti-imitation gradient in all-failure groups even when the centered base gradient vanishes. Finally, because both references evolve during training, the objective is time-varying rather than stationary; Appendix~\ref{app:derivation} bounds the resulting reference drift and shows how cumulative drift enters a standard stochastic stationarity bound. Separate estimators for the forward anchor KL and reverse replay KL, including the distinction between action-conditional unbiasedness and stale-state occupancy, are derived in Appendix~\ref{app:implementation}.
+
+\section{Experiments and Discussion}
+\label{sec:experiments}
+
+\subsection{Experimental setup}
+GRPO is the primary RL baseline throughout the evaluation. We use Qwen2.5-Math-1.5B-Instruct and Qwen2.5-Math-7B-Instruct for the main study, with the same method rows trained at both scales so that scaling comparisons are matched rather than inferred from different algorithm sets. GRPO and GRPO+\FEPO form the principal comparison; GSPO and DAPO are retained as transfer checks showing that the failure-escape term is not tied to one group-relative formulation, while NGRPO and AVSPO provide targeted comparisons for negative-heavy and homogeneous groups. Training uses groups of $G=8$ responses sampled with temperature $0.6$, top-$p=0.95$, and a 2048-token response cap. Unless stated otherwise, \FEPO uses $\beta=0.02$, anchor EMA rate $\gamma=0.02$, a FIFO failure buffer of 4096 responses, and one failure-reference update every 20 actor steps using 128 uniformly sampled failed trajectories. Evaluation is deterministic: one completion is decoded per problem with temperature $0$. The completed GRPO versus GRPO+\FEPO comparison is reported as mean $\pm$ standard deviation over five independent training seeds (3407, 31415, 27182, 16180, and 42), with identical benchmark prompts and decoding settings for each paired run. AMC23, MinervaMath, and OlympiadBench are additionally used as a low-cost validation pool for recovery tracking because together they provide 986 prompts. Validation uses the same greedy $n=1$, temperature-$0$ decoding at predeclared checkpoints, so seed variation comes from independently trained models rather than stochastic evaluation. No stochastic validation rollouts are required. The current benchmark suite spans mathematical reasoning (MATH-500, AMC23, AIME24, AIME25, OlympiadBench, and MinervaMath) and code generation (HumanEval+, MBPP+, and LiveCodeBench). We additionally reserve Llama-3.2-3B-Instruct on IFEval and FollowBench for a verifier-based instruction-following check \citep{zhou2023ifeval,jiang2024followbench}. Primary training comparisons are matched by generated rollout tokens; wall-clock time and peak memory are reported separately.
+
+\subsection{Main results and scaling}
+Table~\ref{tab:main_compact} is the primary mathematical-reasoning comparison. It uses the same method rows at 1.5B and 7B so that scale effects are assessed under matched RL algorithms rather than inferred from different comparison sets. The completed 1.5B GRPO rows show that adding \FEPO improves all six mathematical benchmarks under deterministic decoding, with particularly large gains on AMC23 and AIME25 while retaining positive improvements on the larger MATH-500, OlympiadBench, and MinervaMath sets. The remaining transfer rows and all matched 7B rows are left as placeholders until those evaluations are complete.
+
+\begin{table}[H]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2.2pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lccccccc@{}}
+\toprule
+Method & MATH-500 & AMC23 & AIME24 & AIME25 & OlympiadBench & MinervaMath & Avg.\\
+\midrule
+\multicolumn{8}{l}{\textit{Qwen2.5-Math-1.5B-Instruct}}\\
+GRPO & $65.56\pm0.26$ & $49.50\pm1.12$ & $10.67\pm1.49$ & $14.00\pm2.79$ & $31.93\pm0.44$ & $18.16\pm0.42$ & \TBD\\
+\FEPO[GRPO] & $\mathbf{67.20\pm0.45}$ & $\mathbf{62.50\pm1.77}$ & $\mathbf{12.00\pm1.83}$ & $\mathbf{19.33\pm1.49}$ & $\mathbf{34.66\pm0.52}$ & $\mathbf{20.22\pm0.64}$ & \TBD\\
+GSPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[GSPO] & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+DAPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[DAPO] & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+NGRPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+AVSPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\midrule
+\multicolumn{8}{l}{\textit{Qwen2.5-Math-7B-Instruct}}\\
+GRPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[GRPO] & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+GSPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[GSPO] & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+DAPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[DAPO] & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+NGRPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+AVSPO & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\bottomrule
+\end{tabular*}
+\caption{\textbf{Matched mathematical-reasoning comparison.} Greedy pass@1 (\%), one response per problem at temperature $0$. Completed GRPO rows are mean $\pm$ standard deviation over five training seeds; remaining 1.5B transfer rows and matched 7B rows will be filled as evaluation proceeds.}
+\label{tab:main_compact}
+\end{table}
+
+\subsection{Deterministic validation recovery}
+Aggregate accuracy alone does not show whether \FEPO converts previously unsolved prompts into solved ones. To measure this mechanism without the cost of stochastic validation, we use a deterministic variant of Recovery@$\Delta$. For training seed $s$, let $\mathcal U^{(s)}_0$ be the prompts answered incorrectly by greedy decoding at the reference checkpoint $t_0$. We then define
+\begin{equation}
+\mathrm{GreedyRecovery}^{(s)}@\Delta
+=
+\frac{1}{|\mathcal U^{(s)}_0|}
+\sum_{x\in\mathcal U^{(s)}_0}
+\mathbf 1\!\left[\hat y_{t_0+\Delta}^{(s)}(x)\ \text{is correct}\right],
+\label{eq:greedy_recovery}
+\end{equation}
+where $\hat y$ is a single temperature-$0$ completion. We evaluate only at $t_0$, $t_0+50$, and $t_0+100$, so each validation checkpoint requires one generation per prompt rather than $K$ stochastic rollouts. Table~\ref{tab:greedy_recovery} uses AMC23, MinervaMath, and OlympiadBench as the validation pool and reports mean $\pm$ standard deviation over the same five training seeds. This metric is intentionally stricter than stochastic Recovery@$\Delta$: a prompt counts as recovered only when its greedy answer becomes correct.
+
+\begin{table}[H]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3.0pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lccccccc@{}}
+\toprule
+Benchmark & $n$ & GRPO Rec.@50 & \FEPO Rec.@50 & $\Delta_{50}$ & GRPO Rec.@100 & \FEPO Rec.@100 & $\Delta_{100}$\\
+\midrule
+AMC23 & 40 & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+MinervaMath & 272 & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+OlympiadBench & 674 & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\midrule
+Macro avg. & 986 & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\bottomrule
+\end{tabular*}
+\caption{\textbf{Deterministic validation recovery, Qwen2.5-Math-1.5B-Instruct (placeholder).} Greedy $n=1$, temperature-$0$ decoding at the reference checkpoint and after 50/100 actor steps. Recovery is computed only over prompts that are greedily incorrect at the reference checkpoint, then averaged over five independent training seeds. No stochastic validation sampling is used.}
+\label{tab:greedy_recovery}
+\end{table}
+
+\subsection{Code-generation generalization}
+We report code generation separately rather than mixing it into the main mathematical comparison. Table~\ref{tab:code_generalization} is deliberately structured in the same way as Table~\ref{tab:main_compact}: it uses the same RL-method rows and the same 1.5B/7B model blocks, but replaces the mathematical benchmarks with HumanEval+, MBPP+, and LiveCodeBench. This makes code generation a matched transfer evaluation rather than a differently formatted auxiliary result. The completed 1.5B GRPO comparison improves on all three code benchmarks under the same deterministic evaluation protocol; the remaining method and 7B entries are retained as placeholders until evaluation is complete.
+
+\begin{table}[H]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{5.0pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lcccc@{}}
+\toprule
+Method & HumanEval+ & MBPP+ & LiveCodeBench & Avg.\\
+\midrule
+\multicolumn{5}{l}{\textit{Qwen2.5-Math-1.5B-Instruct}}\\
+GRPO & $10.37\pm0.61$ & $16.24\pm0.71$ & $4.67\pm0.47$ & \TBD\\
+\FEPO[GRPO] & $\mathbf{14.02\pm0.75}$ & $\mathbf{16.88\pm0.68}$ & $\mathbf{6.20\pm0.52}$ & \TBD\\
+GSPO & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[GSPO] & \TBD & \TBD & \TBD & \TBD\\
+DAPO & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[DAPO] & \TBD & \TBD & \TBD & \TBD\\
+NGRPO & \TBD & \TBD & \TBD & \TBD\\
+AVSPO & \TBD & \TBD & \TBD & \TBD\\
+\midrule
+\multicolumn{5}{l}{\textit{Qwen2.5-Math-7B-Instruct}}\\
+GRPO & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[GRPO] & \TBD & \TBD & \TBD & \TBD\\
+GSPO & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[GSPO] & \TBD & \TBD & \TBD & \TBD\\
+DAPO & \TBD & \TBD & \TBD & \TBD\\
+\FEPO[DAPO] & \TBD & \TBD & \TBD & \TBD\\
+NGRPO & \TBD & \TBD & \TBD & \TBD\\
+AVSPO & \TBD & \TBD & \TBD & \TBD\\
+\bottomrule
+\end{tabular*}
+\caption{\textbf{Matched code-generation comparison.} Greedy pass@1 (\%), one response per problem at temperature $0$. The table mirrors Table~\ref{tab:main_compact}: the same RL-method rows are reported at 1.5B and 7B so that code-generation transfer can be compared under the same training recipes. Completed 1.5B GRPO rows are mean $\pm$ standard deviation over the same five training seeds; remaining entries will be filled as evaluation proceeds. HumanEval+, MBPP+, and LiveCodeBench contain 164, 378, and 287 evaluation problems, respectively.}
+\label{tab:code_generalization}
+\end{table}
+
+\subsection{Ablation and efficiency}
+The ablation in Table~\ref{tab:ablation_compact} separates the roles of anchoring, failure repulsion, and failure gating. The anchor-only variant tests whether the effect can be explained by EMA-style stabilization; the failure-only variant removes the stabilizing reference; and the ungated variant applies failure repulsion without conditioning on the observed group failure rate. A matched negative-CE control using the same failed replay is reserved in Appendix~\ref{app:experiments}.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lccc}
+\toprule
+Variant on GRPO & Avg. & Greedy Rec.@100 & KL(actor, anchor)\\
+\midrule
+GRPO & \TBD & \TBD & \TBD\\
++ anchor only & \TBD & \TBD & \TBD\\
++ failure repulsion only & \TBD & \TBD & \TBD\\
++ anchor + failure, no gate & \TBD & \TBD & \TBD\\
+full \FEPO & \TBD & \TBD & \TBD\\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Component ablation, Qwen2.5-Math-1.5B-Instruct (placeholder).} Results will report average accuracy, deterministic validation recovery, and actor-to-anchor KL.}
+\label{tab:ablation_compact}
+\end{table}
+
+The failure reference introduces additional computation, so we report end-to-end cost rather than only actor-update counts. Table~\ref{tab:cost_compact} measures update time, peak memory, generated tokens required to reach a pre-declared held-out target, GPU-hours to that target, and final accuracy.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+Method & sec/update & Peak memory & Rollout tokens to target & GPU-h to target & Final Avg.\\
+\midrule
+GRPO & \TBD & \TBD & \TBD & \TBD & \TBD\\
+GRPO + \FEPO & \TBD & \TBD & \TBD & \TBD & \TBD\\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Training cost, 1.5B (placeholder).} End-to-end timing, memory, rollout-token, and time-to-target measurements will be inserted after profiling.}
+\label{tab:cost_compact}
+\end{table}
+
+\subsection{Generalization and robustness}
+To test whether the mechanism is specific to mathematical final-answer verification, we use a compact verifier-based transfer setting on instruction following. Table~\ref{tab:crossdomain_compact} compares GRPO with and without \FEPO on IFEval and FollowBench and includes MMLU as a regression check. Appendix~\ref{app:experiments} contains the corresponding one-factor sensitivity study for $\beta$, the anchor EMA rate, and failure-reference refresh frequency.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Method & IFEval HSR & FollowBench HSR & Avg. HSR & MMLU\\
+\midrule
+GRPO & \TBD & \TBD & \TBD & \TBD\\
+GRPO + \FEPO & \TBD & \TBD & \TBD & \TBD\\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Verifier-based instruction following, Llama-3.2-3B-Instruct (placeholder).} Strict hard-success rates and the MMLU regression check will be inserted after evaluation.}
+\label{tab:crossdomain_compact}
+\end{table}
+
+\section{Limitations}
+\FEPO uses outcome-level failure labels and therefore does not identify the precise reasoning step that caused an incorrect final answer. The learned failure reference can reduce indiscriminate token suppression by aggregating recurrent failure behavior, but it does not provide process-level credit assignment. The reverse replay KL is also unbounded on the full probability simplex, so the theoretical guarantees apply to the proximal finite-step regime rather than to arbitrary global policy movement. Finally, the evaluation spans mathematical reasoning and code generation, with a verifier-based instruction-following study planned separately; broader conclusions about tool use or noisy non-binary verification require additional study.
+
+\section{Conclusion}
+Group-relative RL loses relative reward information whenever every sampled response receives the same binary outcome. This is benign for an all-success group but problematic for an all-failure group, where the policy has repeatedly exposed unsuccessful behavior without producing a successful comparator. \FEPO addresses this asymmetry by learning a failure reference from replayed failed trajectories and combining failure-conditioned anti-imitation with a slowly moving anchor, while leaving the underlying group-relative objective unchanged. The resulting formulation provides a direct learning signal in failure-heavy regimes and can be attached to different group-relative RL algorithms without redefining their reward or clipping mechanisms.
+
+\section*{AI Use Statement}
+Large language models were used to assist with literature organization, manuscript restructuring, mathematical exposition, and LaTeX formatting. The authors are responsible for independently verifying the derivations, citations, implementation correspondence, experimental results, and all scientific claims before submission.
+
+\begin{thebibliography}{99}
+
+\bibitem[Abdolmaleki et~al.(2018)]{abdolmaleki2018mpo}
+Abbas Abdolmaleki, Jost~Tobias Springenberg, Yuval Tassa, Remi Munos, Nicolas Heess, and Martin Riedmiller.
+\newblock Maximum a Posteriori Policy Optimisation.
+\newblock In \emph{International Conference on Learning Representations}, 2018.
+
+\bibitem[Andrychowicz et~al.(2017)]{andrychowicz2017her}
+Marcin Andrychowicz, Filip Wolski, Alex Ray, Jonas Schneider, Rachel Fong, Peter Welinder, Bob McGrew, Josh Tobin, Pieter Abbeel, and Wojciech Zaremba.
+\newblock Hindsight Experience Replay.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2017.
+
+\bibitem[Bai et~al.(2025)]{mgrpo2025}
+Bizhe Bai, Hongming Wu, Peng Ye, and Tao Chen.
+\newblock M-GRPO: Stabilizing Self-Supervised Reinforcement Learning for Large Language Models with Momentum-Anchored Policy Optimization.
+\newblock \emph{arXiv preprint arXiv:2512.13070}; NeurIPS 2025 Workshop on Efficient Reasoning, 2025.
+
+\bibitem[Bai et~al.(2026)]{apo2026}
+Tianyi Wang, Long Li, Hongcan Guo, Yibiao Chen, Yixia Li, Yong Wang, Yun Chen, and Guanhua Chen.
+\newblock Anchored Policy Optimization: Mitigating Exploration Collapse Via Support-Constrained Rectification.
+\newblock \emph{arXiv preprint arXiv:2602.05717}, 2026.
+
+\bibitem[Christiano et~al.(2017)]{christiano2017deep}
+Paul F. Christiano, Jan Leike, Tom Brown, Miljan Martic, Shane Legg, and Dario Amodei.
+\newblock Deep reinforcement learning from human preferences.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2017.
+
+\bibitem[DeepSeek-AI(2024)]{deepseekmath2024}
+DeepSeek-AI.
+\newblock DeepSeekMath: Pushing the limits of mathematical reasoning in open language models.
+\newblock \emph{arXiv preprint}, 2024.
+
+\bibitem[DeepSeek-AI(2025)]{deepseekr1}
+DeepSeek-AI.
+\newblock DeepSeek-R1: Incentivizing reasoning capability in LLMs via reinforcement learning.
+\newblock \emph{arXiv preprint}, 2025.
+
+\bibitem[Gulcehre et~al.(2023)]{gulcehre2023rest}
+Caglar Gulcehre et~al.
+\newblock Reinforced self-training for language model alignment.
+\newblock \emph{arXiv preprint arXiv:2308.08998}, 2023.
+
+\bibitem[Guan et~al.(2025)]{guan2025rstar}
+Xinyu Guan et~al.
+\newblock rStar-Math: Small LLMs Can Master Math Reasoning with Self-Evolved Deep Thinking.
+\newblock \emph{arXiv preprint arXiv:2501.04519}, 2025.
+
+\bibitem[Lightman et~al.(2023)]{lightman2023letsverify}
+Hunter Lightman et~al.
+\newblock Let's verify step by step.
+\newblock \emph{arXiv preprint}, 2023.
+
+\bibitem[Liu et~al.(2025)]{liu2025understanding}
+Zichen Liu, Changyu Chen, Wenjun Li, Penghui Qi, Tianyu Pang, Chao Du, Wee Sun Lee, and Min Lin.
+\newblock Understanding R1-Zero-Like Training: A Critical Perspective.
+\newblock \emph{arXiv preprint arXiv:2503.20783}, 2025.
+
+\bibitem[Ouyang et~al.(2022)]{ouyang2022training}
+Long Ouyang et~al.
+\newblock Training language models to follow instructions with human feedback.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2022.
+
+\bibitem[Schulman et~al.(2017)]{schulman2017ppo}
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov.
+\newblock Proximal policy optimization algorithms.
+\newblock \emph{arXiv preprint arXiv:1707.06347}, 2017.
+
+\bibitem[Wang et~al.(2023)]{wang2023selfconsistency}
+Xuezhi Wang et~al.
+\newblock Self-consistency improves chain of thought reasoning in large language models.
+\newblock In \emph{International Conference on Learning Representations}, 2023.
+
+\bibitem[Yao et~al.(2023)]{yao2023tot}
+Shunyu Yao et~al.
+\newblock Tree of thoughts: Deliberate problem solving with large language models.
+\newblock \emph{arXiv preprint}, 2023.
+
+\bibitem[Yu et~al.(2025)]{yu2025dapo}
+Qiying Yu et~al.
+\newblock DAPO: An Open-Source LLM Reinforcement Learning System at Scale.
+\newblock \emph{arXiv preprint arXiv:2503.14476}, 2025.
+
+\bibitem[Zelikman et~al.(2022)]{zelikman2022star}
+Eric Zelikman, Yuhuai Wu, Jesse Mu, and Noah D. Goodman.
+\newblock STaR: Self-Taught Reasoner.
+\newblock \emph{arXiv preprint arXiv:2203.07865}, 2022.
+
+\bibitem[Zheng et~al.(2025)]{zheng2025gspo}
+Chujie Zheng, Shixuan Liu, Mingze Li, Xiong-Hui Chen, Bowen Yu, Chang Gao, Kai Dang, Yuqiong Liu, Rui Men, An Yang, Jingren Zhou, and Junyang Lin.
+\newblock Group Sequence Policy Optimization.
+\newblock \emph{arXiv preprint arXiv:2507.18071}, 2025.
+
+\bibitem[Bamba et~al.(2025)]{bamba2025xrpo}
+Udbhav Bamba, Minghao Fang, Yifan Yu, Haizhong Zheng, and Fan Lai.
+\newblock XRPO: Pushing the limits of GRPO with Targeted Exploration and Exploitation.
+\newblock \emph{arXiv preprint arXiv:2510.06672}, 2025.
+
+\bibitem[Bellemare et~al.(2016)]{bellemare2016count}
+Marc~G. Bellemare, Sriram Srinivasan, Georg Ostrovski, Tom Schaul, David Saxton, and Remi Munos.
+\newblock Unifying Count-Based Exploration and Intrinsic Motivation.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2016.
+
+\bibitem[Burda et~al.(2018)]{burda2018rnd}
+Yuri Burda, Harrison Edwards, Amos Storkey, and Oleg Klimov.
+\newblock Exploration by Random Network Distillation.
+\newblock In \emph{International Conference on Learning Representations}, 2019.
+
+\bibitem[Chen et~al.(2024)]{chen2024spin}
+Zixiang Chen, Yihe Deng, Huizhuo Yuan, Kaixuan Ji, and Quanquan Gu.
+\newblock Self-Play Fine-Tuning Converts Weak Language Models to Strong Language Models.
+\newblock \emph{arXiv preprint arXiv:2401.01335}, 2024.
+
+\bibitem[Chen et~al.(2025)]{chen2025sec}
+Xiaoyin Chen, Jiarui Lu, Minsu Kim, Dinghuai Zhang, Jian Tang, Alexandre Pich\'e, Nicolas Gontier, Yoshua Bengio, and Ehsan Kamalloo.
+\newblock SEC: Self-Evolving Curriculum for LLM Reasoning.
+\newblock \emph{arXiv preprint arXiv:2505.14970}, 2025.
+
+\bibitem[Dennis et~al.(2020)]{dennis2020paired}
+Michael Dennis, Natasha Jaques, Eugene Vinitsky, Alexandre Bayen, Stuart Russell, Andrew Critch, and Sergey Levine.
+\newblock Emergent Complexity and Zero-Shot Transfer via Unsupervised Environment Design.
+\newblock In \emph{International Conference on Learning Representations}, 2021.
+
+\bibitem[Dong et~al.(2023)]{dong2023restem}
+Hanze Dong, Wei Xiong, Bo Pang, Haoxiang Wang, Han Zhao, Yingbo Zhou, Nan Jiang, Doyen Sahoo, Caiming Xiong, and Tong Zhang.
+\newblock RLHF Workflow: From Reward Modeling to Online RLHF.
+\newblock \emph{arXiv preprint arXiv:2405.07863}, 2023.
+
+\bibitem[Ecoffet et~al.(2021)]{ecoffet2021goexplore}
+Adrien Ecoffet, Joost Huizinga, Joel Lehman, Kenneth~O. Stanley, and Jeff Clune.
+\newblock First Return, Then Explore.
+\newblock \emph{Nature}, 590(7847):580--586, 2021.
+
+\bibitem[Eysenbach et~al.(2018)]{eysenbach2018diayn}
+Benjamin Eysenbach, Abhishek Gupta, Julian Ibarz, and Sergey Levine.
+\newblock Diversity is All You Need: Learning Skills without a Reward Function.
+\newblock In \emph{International Conference on Learning Representations}, 2019.
+
+\bibitem[Florensa et~al.(2017)]{florensa2017reversecurriculum}
+Carlos Florensa, David Held, Markus Wulfmeier, Michael Zhang, and Pieter Abbeel.
+\newblock Reverse Curriculum Generation for Reinforcement Learning.
+\newblock In \emph{Conference on Robot Learning}, 2017.
+
+\bibitem[Fujimoto et~al.(2018)]{fujimoto2018td3}
+Scott Fujimoto, Herke van Hoof, and David Meger.
+\newblock Addressing Function Approximation Error in Actor-Critic Methods.
+\newblock In \emph{International Conference on Machine Learning}, 2018.
+
+\bibitem[Grill et~al.(2020)]{grill2020byol}
+Jean-Bastien Grill, Florian Strub, Florent Altch\'e, Corentin Tallec, Pierre~H. Richemond, Elena Buchatskaya, Carl Doersch, Bernardo~Avila Pires, Zhaohan~Daniel Guo, Mohammad~Gheshlaghi Azar, Bilal Piot, Koray Kavukcuoglu, R\'emi Munos, and Michal Valko.
+\newblock Bootstrap Your Own Latent: A New Approach to Self-Supervised Learning.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2020.
+
+\bibitem[Haarnoja et~al.(2018)]{haarnoja2018sac}
+Tuomas Haarnoja, Aurick Zhou, Pieter Abbeel, and Sergey Levine.
+\newblock Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor.
+\newblock In \emph{International Conference on Machine Learning}, 2018.
+
+\bibitem[He et~al.(2019)]{he2019moco}
+Kaiming He, Haoqi Fan, Yuxin Wu, Saining Xie, and Ross Girshick.
+\newblock Momentum Contrast for Unsupervised Visual Representation Learning.
+\newblock \emph{arXiv preprint arXiv:1911.05722}, 2019.
+
+\bibitem[Hinton(2002)]{hinton2002cd}
+Geoffrey~E. Hinton.
+\newblock Training Products of Experts by Minimizing Contrastive Divergence.
+\newblock \emph{Neural Computation}, 14(8):1771--1800, 2002.
+
+\bibitem[Hosseini et~al.(2024)]{hosseini2024vstar}
+Arian Hosseini, Xingdi Yuan, Nikolay Malkin, Aaron Courville, Alessandro Sordoni, and Rishabh Agarwal.
+\newblock V-STaR: Training Verifiers for Self-Taught Reasoners.
+\newblock \emph{arXiv preprint arXiv:2402.06457}, 2024.
+
+\bibitem[Hu et~al.(2025)]{hu2025reinforcepp}
+Jian Hu, Jason~Klein Liu, Haotian Xu, and Wei Shen.
+\newblock REINFORCE++: Stabilizing Critic-Free Policy Optimization with Global Advantage Normalization.
+\newblock \emph{arXiv preprint arXiv:2501.03262}, 2025.
+
+\bibitem[Izmailov et~al.(2018)]{izmailov2018swa}
+Pavel Izmailov, Dmitrii Podoprikhin, Timur Garipov, Dmitry Vetrov, and Andrew~Gordon Wilson.
+\newblock Averaging Weights Leads to Wider Optima and Better Generalization.
+\newblock In \emph{Uncertainty in Artificial Intelligence}, 2018.
+
+\bibitem[Kirkpatrick et~al.(1983)]{kirkpatrick1983annealing}
+Scott Kirkpatrick, C.~Daniel Gelatt, and Mario~P. Vecchi.
+\newblock Optimization by Simulated Annealing.
+\newblock \emph{Science}, 220(4598):671--680, 1983.
+
+\bibitem[Li et~al.(2022)]{li2022contrastive}
+Xiang~Lisa Li, Ari Holtzman, Daniel Fried, Percy Liang, Jason Eisner, Tatsunori Hashimoto, Luke Zettlemoyer, and Mike Lewis.
+\newblock Contrastive Decoding: Open-ended Text Generation as Optimization.
+\newblock \emph{arXiv preprint arXiv:2210.15097}, 2022.
+
+\bibitem[Li et~al.(2025)]{li2025dace}
+Ang Li, Zhihang Yuan, Yang Zhang, Shouda Liu, and Yisen Wang.
+\newblock Know When to Explore: Difficulty-Aware Certainty as a Guide for LLM Reinforcement Learning.
+\newblock \emph{arXiv preprint arXiv:2509.00125}, 2025.
+
+\bibitem[Liu et~al.(2017)]{liu2017svpg}
+Yang Liu, Prajit Ramachandran, Qiang Liu, and Jian Peng.
+\newblock Stein Variational Policy Gradient.
+\newblock \emph{arXiv preprint arXiv:1704.02399}, 2017.
+
+\bibitem[Liu et~al.(2025b)]{liu2025ghpo}
+Ziru Liu, Cheng Gong, Xinyu Fu, Yaofang Liu, Ran Chen, Shoubo Hu, Suiyun Zhang, Rui Liu, Qingfu Zhang, and Dandan Tu.
+\newblock GHPO: Adaptive Guidance for Stable and Efficient LLM Reinforcement Learning.
+\newblock \emph{arXiv preprint arXiv:2507.10628}, 2025.
+
+\bibitem[Matiisen et~al.(2017)]{matiisen2017tscl}
+Tambet Matiisen, Aravind Srinivas, Yao~Zhang, James Linda, and Pieter Abbeel.
+\newblock Teacher-Student Curriculum Learning.
+\newblock \emph{arXiv preprint arXiv:1703.01327}, 2017.
+
+\bibitem[Mnih et~al.(2015)]{mnih2015dqn}
+Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Andrei~A. Rusu, Joel Veness, Marc~G. Bellemare, Alex Graves, Martin Riedmiller, Andreas~K. Fidjeland, Georg Ostrovski, Stig Petersen, Charles Beattie, Amir Sadik, Ioannis Antonoglou, Helen King, Dharshan Kumaran, Daan Wierstra, Shane Legg, and Demis Hassabis.
+\newblock Human-Level Control through Deep Reinforcement Learning.
+\newblock \emph{Nature}, 518(7540):529--533, 2015.
+
+\bibitem[Nachum et~al.(2017)]{nachum2017fdpg}
+Ofir Nachum, Mohammad Norouzi, and Dale Schuurmans.
+\newblock f-DPG: An f-divergence Constrained Policy Gradient Method.
+\newblock In \emph{NIPS Workshop on Optimal Transport and Machine Learning}, 2017.
+
+\bibitem[Nachum et~al.(2019)]{nachum2019dualdice}
+Ofir Nachum, Yinlam Chow, Bo Dai, and Lihong Li.
+\newblock DualDICE: Behavior-Agnostic Estimation of Discounted Stationary Distribution Corrections.
+\newblock In \emph{International Conference on Machine Learning}, 2019.
+
+\bibitem[Nachum et~al.(2019b)]{nachum2019algaedice}
+Ofir Nachum, Bo Dai, Ilya Kostrikov, Yinlam Chow, Lihong Li, and Dale Schuurmans.
+\newblock AlgaeDICE: Policy Gradient from Arbitrary Experience.
+\newblock \emph{arXiv preprint arXiv:1912.02074}, 2019.
+
+\bibitem[Nan et~al.(2025)]{nan2025ngrpo}
+Gongrui Nan, Siye Chen, Jing Huang, Mengyu Lu, Dexun Wang, Chunmei Xie, Weiqi Xiong, Xianzhou Zeng, Qixuan Zhou, Yadong Li, and Xingzhong Xu.
+\newblock NGRPO: Negative-enhanced Group Relative Policy Optimization.
+\newblock \emph{arXiv preprint arXiv:2509.18851}, 2025.
+
+\bibitem[Pathak et~al.(2017)]{pathak2017icm}
+Deepak Pathak, Pulkit Agrawal, Alexei~A. Efros, and Trevor Darrell.
+\newblock Curiosity-Driven Exploration by Self-Supervised Prediction.
+\newblock In \emph{International Conference on Machine Learning}, 2017.
+
+\bibitem[Peters et~al.(2010)]{peters2010reps}
+Jan Peters, Katharina M\"ulling, and Yasemin Altun.
+\newblock Relative Entropy Policy Search.
+\newblock In \emph{AAAI Conference on Artificial Intelligence}, 2010.
+
+\bibitem[Rafailov et~al.(2023)]{rafailov2023dpo}
+Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christopher~D. Manning, and Chelsea Finn.
+\newblock Direct Preference Optimization: Your Language Model is Secretly a Reward Model.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2023.
+
+\bibitem[Polyak and Juditsky(1992)]{polyak1992averaging}
+Boris~T. Polyak and Anatoli~B. Juditsky.
+\newblock Acceleration of Stochastic Approximation by Averaging.
+\newblock \emph{SIAM Journal on Control and Optimization}, 30(4):838--855, 1992.
+
+\bibitem[Raileanu and Rockt\"aschel(2020)]{raileanu2020ride}
+Roberta Raileanu and Tim Rockt\"aschel.
+\newblock RIDE: Rewarding Impact-Driven Exploration.
+\newblock In \emph{International Conference on Learning Representations}, 2020.
+
+\bibitem[Ruppert(1988)]{ruppert1988efficient}
+David Ruppert.
+\newblock Efficient Estimations from a Slowly Convergent Robbins-Munro Process.
+\newblock Technical Report, Cornell University, 1988.
+
+\bibitem[Schaul et~al.(2016)]{schaul2016per}
+Tom Schaul, John Quan, Ioannis Antonoglou, and David Silver.
+\newblock Prioritized Experience Replay.
+\newblock In \emph{International Conference on Learning Representations}, 2016.
+
+\bibitem[Sharma et~al.(2019)]{sharma2019dads}
+Archit Sharma, Shixiang Gu, Sergey Levine, Vikash Kumar, and Karol Hausman.
+\newblock Dynamics-Aware Unsupervised Discovery of Skills.
+\newblock In \emph{International Conference on Learning Representations}, 2020.
+
+\bibitem[Shi et~al.(2025)]{shi2025adarrt}
+Taiwei Shi, Yiyang Wu, Linxin Song, Tianyi Zhou, and Jieyu Zhao.
+\newblock Efficient Reinforcement Finetuning via Adaptive Curriculum Learning.
+\newblock \emph{arXiv preprint arXiv:2504.05520}, 2025.
+
+\bibitem[Tarvainen and Valpola(2017)]{tarvainen2017meanteacher}
+Antti Tarvainen and Harri Valpola.
+\newblock Mean Teachers are Better Role Models: Weight-Averaged Consistency Targets Improve Semi-Supervised Deep Learning Results.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2017.
+
+\bibitem[Wang et~al.(2024)]{wang2024mathshepherd}
+Peiyi Wang, Lei Li, Zhihong Shao, R.X. Xu, Damai Dai, Yifei Li, Deli Chen, Y.~Wu, and Zhifang Sui.
+\newblock Math-Shepherd: Verify and Reinforce LLMs Step-by-Step without Human Annotations.
+\newblock \emph{arXiv preprint arXiv:2312.08935}, 2024.
+
+\bibitem[Yang et~al.(2020)]{yang2020bestdice}
+Mengjiao Yang, Ofir Nachum, Bo Dai, Lihong Li, and Dale Schuurmans.
+\newblock Off-Policy Evaluation via the Regularized Lagrangian.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2020.
+
+\bibitem[Yuan et~al.(2023)]{yuan2023rft}
+Zheng Yuan, Hongyi Yuan, Chengpeng Li, Guanting Dong, Keming Lu, Chuanqi Tan, and Chang Zhou.
+\newblock Scaling Relationship on Learning Mathematical Reasoning with Large Language Models.
+\newblock \emph{arXiv preprint arXiv:2308.01825}, 2023.
+
+\bibitem[Zelikman et~al.(2024)]{zelikman2024quietst}
+Eric Zelikman, Georges Harik, Yijia Shao, Varuna Jayasiri, Nick Haber, and Noah~D. Goodman.
+\newblock Quiet-STaR: Language Models Can Teach Themselves to Think Before Speaking.
+\newblock \emph{arXiv preprint arXiv:2403.09629}, 2024.
+
+\bibitem[Zeng et~al.(2025)]{zeng2025simplerlzoo}
+Weihao Zeng, Yuzhen Huang, Qian Liu, Wei Liu, Keqing He, Zejun Ma, and Junxian He.
+\newblock SimpleRL-Zoo: Investigating and Taming Zero Reinforcement Learning for Open Base Models.
+\newblock \emph{arXiv preprint arXiv:2503.18892}, 2025.
+
+\bibitem[Zhang et~al.(2019)]{zhang2019lookahead}
+Michael~R. Zhang, James Lucas, Geoffrey Hinton, and Jimmy Ba.
+\newblock Lookahead Optimizer: $k$ Steps Forward, 1 Step Back.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2019.
+
+\bibitem[Zhang and Ba(2026)]{emappg2026}
+Lunjun Zhang and Jimmy Ba.
+\newblock EMA Policy Gradient: Taming Reinforcement Learning for LLMs with EMA Anchor and Top-$k$ KL.
+\newblock \emph{arXiv preprint arXiv:2602.04417}, 2026.
+
+\bibitem[Zhang et~al.(2020)]{zhang2020gendice}
+Ruiyi Zhang, Bo Dai, Lihong Li, and Dale Schuurmans.
+\newblock GenDICE: Generalized Offline Estimation of Stationary Values.
+\newblock In \emph{International Conference on Learning Representations}, 2020.
+
+\bibitem[Zhang et~al.(2026)]{stapo2026}
+Shiqi Liu, Ming Li, Yuxin Chen, Wei Liu, and others.
+\newblock STAPO: Stabilizing Reinforcement Learning for LLMs by Silencing Rare Spurious Tokens.
+\newblock \emph{arXiv preprint arXiv:2602.15620}, 2026.
+
+\bibitem[(2025)]{cur2025cures}
+Anonymous.
+\newblock CurES: From Gradient Analysis to Efficient Curriculum Learning for Reasoning LLMs.
+\newblock \emph{arXiv preprint arXiv:2510.01037}, 2025.
+
+
+\bibitem[Yang et~al.(2024)]{yang2024qwen25math}
+An Yang, Beichen Zhang, Binyuan Hui, Bofei Gao, Bowen Yu, Chengpeng Li, Dayiheng Liu, Jianhong Tu, Jingren Zhou, Junyang Lin, Keming Lu, Mingfeng Xue, Runji Lin, Tianyu Liu, Xingzhang Ren, and Zhenru Zhang.
+\newblock Qwen2.5-Math Technical Report: Toward Mathematical Expert Model via Self-Improvement.
+\newblock \emph{arXiv preprint arXiv:2409.12122}, 2024.
+
+
+\bibitem[Zhang et~al.(2025)]{zhang2025scaf}
+Xichen Zhang, Sitong Wu, Yinghao Zhu, Haoru Tan, Shaozuo Yu, Ziyi He, and Jiaya Jia.
+\newblock Scaf-GRPO: Scaffolded Group Relative Policy Optimization for Enhancing LLM Reasoning.
+\newblock \emph{arXiv preprint arXiv:2510.19807}, 2025.
+
+
+\bibitem[Kaddour(2026)]{kaddour2026tpo}
+Jean Kaddour.
+\newblock Target Policy Optimization.
+\newblock \emph{arXiv preprint arXiv:2604.06159}, 2026.
+
+\bibitem[Jin et~al.(2026)]{jin2026dgpo}
+Hongbo Jin, Rongpeng Zhu, Zhongjing Du, Xu Jiang, Jingqi Tian, Qiaoman Zhang, and Jiayu Ding.
+\newblock DGPO: Distribution Guided Policy Optimization for Fine Grained Credit Assignment.
+\newblock \emph{arXiv preprint arXiv:2605.03327}, 2026.
+
+\bibitem[Wang et~al.(2025)]{wang2025care}
+Yongxin Wang, Zhicheng Yang, Meng Cao, Mingfei Han, Haokun Lin, Yingying Zhu, Xiaojun Chang, and Xiaodan Liang.
+\newblock CARE What Fails: Contrastive Anchored-REflection for Verifiable Multimodal Reasoning.
+\newblock \emph{arXiv preprint arXiv:2512.19554}, 2025.
+
+\bibitem[Lattimore and Szepesv\'ari(2020)]{lattimore2020bandit}
+Tor Lattimore and Csaba Szepesv\'ari.
+\newblock \emph{Bandit Algorithms}.
+\newblock Cambridge University Press, 2020.
+
+\bibitem[Meng et~al.(2024)]{meng2024simpo}
+Yu Meng, Mengzhou Xia, and Danqi Chen.
+\newblock SimPO: Simple Preference Optimization with a Reference-Free Reward.
+\newblock \emph{arXiv preprint arXiv:2405.14734}, 2024.
+
+\bibitem[Hong et~al.(2024)]{hong2024orpo}
+Jiwoo Hong, Noah Lee, and James Thorne.
+\newblock ORPO: Monolithic Preference Optimization without Reference Model.
+\newblock In \emph{Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing}, pp. 11170--11189, 2024.
+
+\bibitem[Gu et~al.(2026)]{gu2026actorcurator}
+Zhengyao Gu, Jonathan Light, Raul Astudillo, Ziyu Ye, Langzhou He, Henry Peng Zou, Wei Cheng, Santiago Paternain, Philip S. Yu, and Yisong Yue.
+\newblock Actor-Curator: Co-adaptive Curriculum Learning via Policy-Improvement Bandits for RL Post-Training.
+\newblock \emph{arXiv preprint arXiv:2602.20532}, 2026.
+
+\bibitem[Zheng et~al.(2026)]{zheng2026metis}
+Han Zheng, Yining Ma, Karthick Gunasekaran, Bharathan Balaji, Zheng Du, Shiv Vitaladevuni, and Cathy Wu.
+\newblock Internalizing Curriculum Judgment for LLM Reinforcement Fine-Tuning.
+\newblock \emph{arXiv preprint arXiv:2605.11235}, 2026.
+
+\bibitem[Tao et~al.(2025)]{tao2025hero}
+Leitian Tao, Ilia Kulikov, Swarnadeep Saha, Tianlu Wang, Jing Xu, Yixuan Li, Jason E. Weston, and Ping Yu.
+\newblock Hybrid Reinforcement: When Reward Is Sparse, It's Better to Be Dense.
+\newblock \emph{arXiv preprint arXiv:2510.07242}, 2025.
+
+\bibitem[Miao et~al.(2026)]{miao2026consteer}
+Qing Miao, Yiming Zhao, Jing Yang, Chenxi Liu, Yuehai Chen, Yuewen Liu, Shaoyi Du, and Badong Chen.
+\newblock ConSteer-RL: Steering Reasoning Capabilities in Large Language Models via Confidence-Aware Reinforcement Learning.
+\newblock \emph{arXiv preprint arXiv:2606.08088}, 2026.
+
+\bibitem[He et~al.(2026)]{he2026avspo}
+Xixiang He, Qiyao Sun, Ao Cheng, Xingming Li, Xuanyu Ji, Hailun Lu, Runke Huang, and Qingyong Hu.
+\newblock Advantage Collapse in Group Relative Policy Optimization: Diagnosis and Mitigation.
+\newblock \emph{arXiv preprint arXiv:2605.21125}, 2026.
+
+\bibitem[Salmani-Zarchi et~al.(2026)]{salmani2026mdpgrpo}
+Mohammad Mahdi Salmani-Zarchi, Zahra Rahimi, Heshaam Faili, and Mohammad Javad Dousti.
+\newblock MDP-GRPO: Stabilized Group Relative Policy Optimization for Multi-Constraint Instruction Following.
+\newblock In \emph{Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)}, 2026.
+
+\bibitem[Zhou et~al.(2023)]{zhou2023ifeval}
+Jeffrey Zhou, Tianjian Lu, Swaroop Mishra, Siddhartha Brahma, Sujoy Basu, Yi Luan, Denny Zhou, and Le Hou.
+\newblock Instruction-Following Evaluation for Large Language Models.
+\newblock \emph{arXiv preprint arXiv:2311.07911}, 2023.
+
+\bibitem[Jiang et~al.(2024)]{jiang2024followbench}
+Yuxin Jiang, Yufei Wang, Xingshan Zeng, Wanjun Zhong, Liangyou Li, Fei Mi, Lifeng Shang, Xin Jiang, Qun Liu, and Wei Wang.
+\newblock FollowBench: A Multi-level Fine-grained Constraints Following Benchmark for Large Language Models.
+\newblock In \emph{Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics}, 2024.
+
+\end{thebibliography}
+
+
+\appendix
+\section{Extended Related Work}
+\label{app:related}
+\subsection{Group-relative RL algorithms and sequence-level objectives}
+GRPO removes the PPO value model by replacing value-based advantages with within-group relative rewards \citep{deepseekmath2024}. Dr.GRPO identifies normalization and length biases in R1-Zero-style training, while REINFORCE++ uses global advantage normalization to stabilize critic-free RL training \citep{liu2025understanding,hu2025reinforcepp}. DAPO combines dynamic sampling, asymmetric clipping, token-level loss changes, and systems improvements for large-scale RL \citep{yu2025dapo}. GSPO identifies a different failure mode in token-level importance weighting and moves importance correction and clipping to the sequence level \citep{zheng2025gspo}. These methods define or repair the \emph{base policy surrogate}; \FEPO is intended to be orthogonal to that choice and supplies a failure-conditioned distributional signal on the same rollout states.
+
+\subsection{Homogeneous groups, hard prompts, and targeted exploration}
+Several recent works explicitly target the zero-variation regime of group-relative RL. DAPO removes all-same-reward groups through dynamic sampling, while NGRPO introduces advantage calibration and asymmetric clipping to preserve useful updates in negative-heavy groups \citep{nan2025ngrpo}. AVSPO is the closest reward-statistics baseline: it monitors advantage-collapse rate and injects virtual reward values into normalization statistics so that real trajectories in homogeneous groups regain non-zero scalar advantages, while the virtual samples themselves receive no gradient \citep{he2026avspo}. This is complementary in mechanism to \FEPO, which leaves scalar advantage construction untouched and instead learns a direction in policy space from the empirical failure distribution; the planned evaluation compares the methods directly under the same 1.5B budget. MDP-GRPO targets low-dispersion multi-constraint rewards with multi-temperature sampling, dual-anchor advantages, prospect-style shaping, and asymmetric KL \citep{salmani2026mdpgrpo}; unlike \FEPO it does not fit an online failure density, and we leave their direct composition to future work rather than expanding the core experimental matrix. DACE uses online success rate as a difficulty signal that controls certainty and exploration \citep{li2025dace}, while XRPO addresses stagnation on zero-reward prompts through targeted in-context exploration \citep{bamba2025xrpo}. AdaRFT and SimpleRL-Zoo remove or down-weight prompts whose pass rate is too low, and SEC, GHPO, and CurES schedule training by online difficulty estimates \citep{shi2025adarrt,zeng2025simplerlzoo,chen2025sec,liu2025ghpo,cur2025cures}. Scaf-GRPO injects progressively stronger scaffolds to restore a successful trajectory \citep{zhang2025scaf}; ACTOR-CURATOR and METIS instead learn which prompts should receive training budget \citep{gu2026actorcurator,zheng2026metis}. These approaches alter prompt allocation, exploration, or scalar reward contrast, whereas \FEPO asks what directional information remains after a prompt has already been sampled and every observed outcome is failure.
+
+TPO and DGPO are useful nearby distribution-sensitive references but target different failure modes. TPO separates target construction from the actor update by forming a reward-reweighted target over sampled completions; FEPO instead asks how a target direction can remain informative when those completions have identical failure rewards \citep{kaddour2026tpo}. DGPO replaces unbounded KL deviation with Hellinger-based token deviation and entropy gating to improve fine-grained credit allocation \citep{jin2026dgpo}; this operates after a sequence-level learning signal exists, whereas FEPO creates a failure-conditioned direction when group reward contrast itself has disappeared. CARE is closer in motivation because it explicitly rescues all-negative groups, but does so through subgroup contrast and reflection-guided resampling in multimodal RLVR \citep{wang2025care}. FEPO uses neither reflection nor synthetic positives and instead retains a learned failure density across groups. These methods could be combined with FEPO, but they are not necessary to isolate the mechanism tested by the paired GRPO/GSPO/DAPO and AVSPO comparisons.
+
+
+\subsection{Anchored and momentum-based stabilization}
+Slow target networks are a standard stabilization device in deep RL, including DQN, TD3, and SAC \citep{mnih2015dqn,fujimoto2018td3,haarnoja2018sac}. Similar momentum teachers appear in MoCo, BYOL, and mean-teacher self-supervision, while stochastic weight averaging, Polyak--Ruppert averaging, and Lookahead exploit slowly moving parameter averages in optimization \citep{he2019moco,grill2020byol,tarvainen2017meanteacher,izmailov2018swa,polyak1992averaging,ruppert1988efficient,zhang2019lookahead}. In LLM RL, M-GRPO uses a momentum anchor to prevent long-horizon collapse, EMA Policy Gradient replaces a static reference with an EMA policy, and APO constrains the actor to a high-confidence support region \citep{mgrpo2025,emappg2026,apo2026}. \FEPO uses an anchor for a narrower purpose: it bounds the movement induced by a separate learned failure distribution. The anchor alone therefore serves as an explicit control in our ablation.
+
+\subsection{Negative examples, contrastive policy learning, and replay}
+Preference objectives such as DPO, SimPO, and ORPO obtain direction from an explicit preferred--rejected relation, while SPIN contrasts self-generated responses against a stronger human or target data distribution \citep{rafailov2023dpo,meng2024simpo,hong2024orpo,chen2024spin}. These methods therefore possess a positive counterpart against which a negative example is interpreted. \FEPO is designed for the stricter regime in which an entire sampled group can fail and no successful response is available. Its code-aligned failure term is $\KL(\failpol\Vert\pol)$; for fixed $\failpol$ this differs from negative cross-entropy under the learned failure density only by the entropy of $\failpol$. The methodological question is therefore whether fitting a recurrent failure distribution, gating its anti-imitation pressure by group failure frequency, and balancing it with a moving anchor provides a better recovery--retention trade-off than applying negative CE directly to raw failed replay. The planned matched negative-CE control tests exactly this distinction. Contrastive decoding subtracts an amateur model only at inference time \citep{li2022contrastive}. In classical RL, REPS and f-divergence policy-gradient methods use divergence constraints for policy improvement, while the DICE family studies policy gradients and stationary-distribution corrections from arbitrary experience \citep{peters2010reps,nachum2017fdpg,nachum2019dualdice,nachum2019algaedice,zhang2020gendice,yang2020bestdice}; prioritized and hindsight replay further show how stored failure or rare experience can remain informative after collection \citep{schaul2016per,andrychowicz2017her}.
+
+\subsection{Failure-aware self-improvement and process supervision}
+ReST and ReST-EM alternate generation with offline improvement on filtered high-reward samples, while STaR, Quiet-STaR, rStar-Math, RFT, and V-STaR use successful or verifier-selected reasoning traces for self-improvement \citep{gulcehre2023rest,dong2023restem,zelikman2022star,zelikman2024quietst,guan2025rstar,yuan2023rft,hosseini2024vstar}. These methods predominantly retain successes and discard failures. HERO attacks sparse binary supervision by adding dense reward-model information, and ConSteer-RL shapes RLVR rewards using confidence derived from token probabilities \citep{tao2025hero,miao2026consteer}; both create additional scalar reward variation, whereas \FEPO leaves the binary verifier unchanged and introduces distributional repulsion in policy space. Process-supervision methods and inference-time search obtain denser supervision by step-level verification, self-consistency, tree search, or MCTS \citep{lightman2023letsverify,wang2024mathshepherd,wang2023selfconsistency,yao2023tot}. Scaffolding methods provide another route by injecting hints or partial solutions until a successful rollout appears. These approaches are therefore complementary but use richer feedback or altered input information, while \FEPO is designed for the regime in which no successful demonstration, process label, or reward model is supplied.
+
+
+\renewcommand{\thetable}{\Alph{section}.\arabic{table}}
+\renewcommand{\thefigure}{\Alph{section}.\arabic{figure}}
+\renewcommand{\theequation}{\Alph{section}.\arabic{equation}}
+\renewcommand{\theHtable}{appendix.\Alph{section}.\arabic{table}}
+\renewcommand{\theHfigure}{appendix.\Alph{section}.\arabic{figure}}
+\renewcommand{\theHequation}{appendix.\Alph{section}.\arabic{equation}}
+\section{Derivation of the Failure-Escape Objective}
+\label{app:derivation}
+We use standard concentration, KL, and convex-analytic arguments throughout this appendix; the proof style follows the probability and convex-analysis toolkit summarized by \citet{lattimore2020bandit}.
+
+\subsection{From the constrained objective to the practical objective}
+For a raw rollout group $Y$ associated with prompt $x$, define the group-averaged anchor and failure divergences
+\begin{equation}
+\overline K_{\mathrm A}^{(x)}(\theta)=\frac1G\sum_{i=1}^{G}\frac1{|y_i|}\sum_t K_{\mathrm A}(s_{i,t};\theta),\qquad
+\overline K_{\mathrm F}^{(x)}(\theta)=\frac1G\sum_{i=1}^{G}\frac1{|y_i|}\sum_t K_{\mathrm F}(s_{i,t};\theta).
+\end{equation}
+Equation~\eqref{eq:fepo_constrained} is
+\begin{equation}
+\max_\theta\;\mathcal J_{\mathrm B}(\theta)
+\quad\text{s.t.}\quad
+\E_{x,Y\sim\oldpol}\!\left[\overline K_{\mathrm A}^{(x)}(\theta)-g_x\overline K_{\mathrm F}^{(x)}(\theta)\right]\le\delta.
+\end{equation}
+Introducing a Lagrange multiplier $\beta\ge0$ gives
+\begin{align}
+\mathcal L(\theta,\beta)
+&=\mathcal J_{\mathrm B}(\theta)
+-\beta\,\E\!\left[\overline K_{\mathrm A}^{(x)}(\theta)-g_x\overline K_{\mathrm F}^{(x)}(\theta)-\delta\right]\\
+&=\mathcal J_{\mathrm B}(\theta)
+-\beta\,\E\!\left[\overline K_{\mathrm A}^{(x)}(\theta)\right]
++\beta\,\E\!\left[g_x\overline K_{\mathrm F}^{(x)}(\theta)\right]
++\beta\delta.
+\end{align}
+The last term is constant in $\theta$, yielding Eq.~\eqref{eq:fepo_compact}. Expanding the group averages gives the trajectory-level form used by Algorithm~\ref{alg:fepo}. Hence the shared multiplier is inherited from one constrained objective rather than chosen as two independent auxiliary weights.
+
+\subsection{Concentration of the empirical failure gate}
+\begin{proposition}[Unbiasedness and concentration of the failure gate]
+\label{prop:gate_concentration}
+Fix a prompt $x$ and suppose $R_1,\ldots,R_G$ are conditionally i.i.d. Bernoulli with success probability $p_x$. Define $\widehat p_x=G^{-1}\sum_iR_i$ and $g_x=1-\widehat p_x$. Then
+\begin{equation}
+\E[g_x\mid x]=1-p_x,\qquad
+\operatorname{Var}(g_x\mid x)=\frac{p_x(1-p_x)}{G}\le\frac{1}{4G},
+\end{equation}
+and for every $\varepsilon>0$,
+\begin{equation}
+\Pr\!\left(\left|g_x-(1-p_x)\right|\ge\varepsilon\mid x\right)
+\le 2e^{-2G\varepsilon^2}.
+\end{equation}
+\end{proposition}
+\begin{proof}
+Linearity gives $\E[\widehat p_x\mid x]=p_x$, hence $\E[g_x\mid x]=1-p_x$. Independence gives $\operatorname{Var}(\widehat p_x\mid x)=p_x(1-p_x)/G$ and $p_x(1-p_x)\le1/4$. Finally, $|g_x-(1-p_x)|=|\widehat p_x-p_x|$, so Hoeffding's inequality for bounded independent variables yields the stated tail bound.
+\end{proof}
+The proposition does not claim that rollouts from a practical decoder are perfectly independent; it provides the reference statistical behavior of the raw group fraction and motivates reporting group size and empirical gate variance rather than introducing an additional smoothing hyperparameter by default.
+
+\begin{proposition}[Gate-induced gradient perturbation]
+\label{prop:gate_gradient}
+Let $g_x^\star=1-p_x$ be the population failure probability and let $h_x$ denote the ungated failure-gradient contribution for a sampled group. If $\|h_x\|_2\le H$ almost surely, then under the assumptions of Proposition~\ref{prop:gate_concentration},
+\begin{equation}
+\E\!\left[\left\|(g_x-g_x^\star)h_x\right\|_2^2\mid x\right]\le\frac{H^2}{4G}.
+\end{equation}
+Moreover, with probability at least $1-\delta$,
+\begin{equation}
+\left\|(g_x-g_x^\star)h_x\right\|_2
+\le H\sqrt{\frac{\log(2/\delta)}{2G}}.
+\end{equation}
+\end{proposition}
+\begin{proof}
+The norm bound gives $\|(g_x-g_x^\star)h_x\|_2^2\le H^2(g_x-g_x^\star)^2$. Taking expectations and applying Proposition~\ref{prop:gate_concentration} yields the mean-squared bound. The high-probability statement follows by multiplying the Hoeffding deviation bound for $|g_x-g_x^\star|$ by $H$.
+\end{proof}
+Thus the extra gradient noise introduced specifically by estimating the gate decays as $1/G$ in mean square and $1/\sqrt G$ in deviation. This does not define an ``optimal'' group size, because larger groups also change rollout cost and the frequency of homogeneous groups; it isolates the statistical cost of the gate itself.
+
+
+\paragraph{Bounded and noisy verifier scores.}
+The concentration argument is not specific to Bernoulli rewards. If $R_i\in[0,1]$ are conditionally independent with mean $\mu_x$ and we define $g_x=1-G^{-1}\sum_iR_i$, then $\E[g_x]=1-\mu_x$ and Hoeffding's inequality gives the same bound $\Pr(|g_x-(1-\mu_x)|\ge\epsilon)\le2e^{-2G\epsilon^2}$. This provides a direct extension to bounded partial-credit verifiers, although the present experiments deliberately retain discrete rule-verifiable outcomes so that the empirical study remains focused.
+
+\subsection{Geometry of the code-aligned reverse replay term}
+At one rollout state let $q=\pol(\cdot\mid s)$, $a=\anchorpol(\cdot\mid s)$, and $f=\failpol(\cdot\mid s)$. The implemented signed potential is
+\begin{equation}
+\Omega_g(q;a,f)=\KL(q\Vert a)-g\KL(f\Vert q).
+\label{eq:local_signed_potential}
+\end{equation}
+The failure divergence can be rewritten as
+\begin{equation}
+\KL(f\Vert q)=\sum_j f_j\log f_j-\sum_jf_j\log q_j=-H(f)-\E_f[\log q].
+\end{equation}
+Thus, for fixed $f$, maximizing the failure divergence is distribution-weighted anti-imitation. The first and second derivatives of the signed potential with respect to an interior simplex coordinate are
+\begin{equation}
+\frac{\partial\Omega_g}{\partial q_j}=\log\frac{q_j}{a_j}+1+g\frac{f_j}{q_j},\qquad
+\frac{\partial^2\Omega_g}{\partial q_j^2}=\frac{1}{q_j}-g\frac{f_j}{q_j^2}.
+\end{equation}
+The Hessian can be indefinite, so this mixed-direction objective is not globally convex in the actor distribution. Moreover, if $g>0$ and $f_j>0$, then $q_j\downarrow0$ sends $-g\KL(f\Vert q)$ to $-\infty$. The correct mathematical description is therefore proximal rather than globally convex.
+
+\begin{proposition}[Proximal boundedness]
+\label{prop:proximal_bounded_appendix}
+Let $\mu_j>0$ on a finite action set and fix $c<\infty$. On
+\begin{equation}
+\mathcal Q_c(\mu)=\left\{q:\ |\log(q_j/\mu_j)|\le c\ \text{for every }j\right\},
+\end{equation}
+$\Omega_g(q;a,f)$ is finite, continuous, and bounded above and below for any full-support $a,f$ and $g\in[0,1]$.
+\end{proposition}
+\begin{proof}
+The log-ratio constraint implies $e^{-c}\mu_j\le q_j\le e^c\mu_j$ for every coordinate, so $q$ stays a positive distance from the boundary wherever $f$ has support. The feasible set is closed and bounded, hence compact; both KL terms are continuous there, so their signed combination attains finite extrema.
+\end{proof}
+Proposition~\ref{prop:proximal_bounded_appendix} is intentionally local. PPO/GRPO clipping and finite actor-update steps motivate such a neighborhood but do not constitute a hard coordinate-wise constraint over the full vocabulary.
+
+\subsection{Reference drift with a reverse failure KL}
+The anchor and failure references enter asymmetrically, so their drift must be bounded differently. The forward anchor term obeys
+\begin{equation}
+\left|\KL(q\Vert a_{t+1})-\KL(q\Vert a_t)\right|
+\le \|\log a_{t+1}-\log a_t\|_\infty=:\delta_{\mathrm A,t}.
+\end{equation}
+For the failure term define
+\begin{equation}
+\kappa_{\mathrm F,t}=\KL(f_{t+1}\Vert f_t),\qquad
+\tau_{\mathrm F,t}=\operatorname{TV}(f_{t+1},f_t),
+\end{equation}
+and suppose $|\log(f_t(j)/q_j)|\le B_t$ on the proximal region. Then
+\begin{proposition}[Reverse-KL reference drift]
+\label{prop:reverse_ref_drift}
+\begin{equation}
+\left|\KL(f_{t+1}\Vert q)-\KL(f_t\Vert q)\right|
+\le \kappa_{\mathrm F,t}+2B_t\tau_{\mathrm F,t}.
+\label{eq:reverse_ref_drift}
+\end{equation}
+\end{proposition}
+\begin{proof}
+Using $\log(f_{t+1}/q)=\log(f_{t+1}/f_t)+\log(f_t/q)$,
+\begin{align}
+\KL(f_{t+1}\Vert q)-\KL(f_t\Vert q)
+&=\KL(f_{t+1}\Vert f_t)
++\sum_j(f_{t+1,j}-f_{t,j})\log\frac{f_{t,j}}{q_j}.
+\end{align}
+The second term has absolute value at most $B_t\|f_{t+1}-f_t\|_1=2B_t\tau_{\mathrm F,t}$.
+\end{proof}
+
+\begin{theorem}[Dynamic stationarity under bounded objective drift]
+\label{thm:dynamic_stationarity}
+Let $\mathcal L_t(\theta)$ denote the negative FEPO objective at actor step $t$, restricted to the proximal region traversed by the iterates. Assume each $\mathcal L_t$ is $L$-smooth and lower bounded by $\mathcal L_{\inf}$, and let $\widehat g_t$ satisfy $\E[\widehat g_t\mid\theta_t]=\nabla\mathcal L_t(\theta_t)$ and $\E\|\widehat g_t-\nabla\mathcal L_t(\theta_t)\|_2^2\le\sigma^2$. For $\theta_{t+1}=\theta_t-\eta\widehat g_t$ with $0<\eta<2/L$, suppose
+\begin{equation}
+\sup_\theta |\mathcal L_{t+1}(\theta)-\mathcal L_t(\theta)|\le V_t.
+\end{equation}
+Then
+\begin{equation}
+\frac1T\sum_{t=1}^{T}\E\|\nabla\mathcal L_t(\theta_t)\|_2^2
+\le
+\frac{\mathcal L_1(\theta_1)-\mathcal L_{\inf}+\sum_{t=1}^{T-1}V_t}
+{\eta(1-L\eta/2)T}
++\frac{L\eta\sigma^2}{2(1-L\eta/2)}.
+\label{eq:dynamic_stationarity}
+\end{equation}
+For a reference-only update with fixed gate $g$ and unchanged base empirical objective,
+\begin{equation}
+V_t^{\rm ref}\le\beta\left[\delta_{\mathrm A,t}+g\left(\kappa_{\mathrm F,t}+2B_t\tau_{\mathrm F,t}\right)\right].
+\label{eq:reverse_dynamic_ref}
+\end{equation}
+\end{theorem}
+\begin{proof}
+$L$-smoothness and the SGD update imply
+\begin{align}
+\E[\mathcal L_t(\theta_{t+1})\mid\theta_t]
+&\le \mathcal L_t(\theta_t)-\eta(1-L\eta/2)\|\nabla\mathcal L_t(\theta_t)\|_2^2+\frac{L\eta^2\sigma^2}{2}.
+\end{align}
+Using $\mathcal L_{t+1}(\theta_{t+1})\le\mathcal L_t(\theta_{t+1})+V_t$, summing over $t$, and lower bounding the terminal loss gives Eq.~\eqref{eq:dynamic_stationarity}. The reference-only bound follows from the anchor inequality above and Proposition~\ref{prop:reverse_ref_drift}, multiplied by the shared $\beta$ and gate $g$.
+\end{proof}
+If cumulative reference variation is sublinear, its average contribution to the stationarity bound vanishes, up to the usual fixed-step stochastic-gradient floor. This does not control on-policy occupancy shift or prove global convergence; it quantifies the additional non-stationarity introduced specifically by the two references.
+
+\subsection{All-failure behavior}
+At $g=1$,
+\begin{equation}
+\Omega_1(q;a,f)=\KL(q\Vert a)-\KL(f\Vert q).
+\end{equation}
+Unlike the forward--forward expression, this quantity is not linear and is not globally lower bounded on the full simplex. It is nevertheless finite at every finite-logit softmax policy and on the proximal region of Proposition~\ref{prop:proximal_bounded_appendix}. The important operational fact is its gradient: when the centered base advantage is zero, the reverse failure term still contributes direct anti-imitation of $f$, while the anchor term resists unrestricted movement. This behavior is derived next.
+
+\section{Gradient Analysis}
+\label{app:gradient}
+
+\subsection{Forward anchor KL}
+The anchor side of \FEPO is unchanged from the original formulation. For a fixed reference policy $r$ and $q_\theta=\pi_\theta(\cdot\mid s)$,
+\begin{equation}
+D_{\mathrm{KL}}(q_\theta\Vert r)=\sum_z q_\theta(z)\log\frac{q_\theta(z)}{r(z)}.
+\end{equation}
+Differentiating and using $\sum_z\nabla_\theta q_\theta(z)=0$ gives
+\begin{equation}
+\nabla_\theta D_{\mathrm{KL}}(q_\theta\Vert r)
+=\E_{z\sim q_\theta}\!\left[
+\log\frac{q_\theta(z)}{r(z)}\,\nabla_\theta\log q_\theta(z)
+\right].
+\label{eq:anchor_klgrad}
+\end{equation}
+Setting $r=a=\anchorpol(\cdot\mid s)$ recovers the forward actor-to-anchor gradient used throughout the earlier formulation; no anchor-side KL direction is changed by the replay correction.
+
+\subsection{Reverse failure gradient}
+The failure/replay side is the part whose KL direction changes. For a fixed failure/replay distribution $f$,
+\begin{equation}
+\nabla_\theta\KL(f\Vert q_\theta)
+=-\E_{z\sim f}\left[\nabla_\theta\log q_\theta(z)\right].
+\label{eq:reverse_klgrad}
+\end{equation}
+Therefore the auxiliary gradient of the maximization objective is
+\begin{equation}
+\nabla_\theta\mathcal J_{\rm aux}
+=-\beta\E_{q_\theta}\left[\log\frac{q_\theta}{a}\,\nabla_\theta\log q_\theta\right]
+-\beta g\E_f\left[\nabla_\theta\log q_\theta\right].
+\label{eq:fepo_grad_general}
+\end{equation}
+The anchor expectation remains actor-weighted retention exactly as before; only the failure contribution is replay-weighted anti-imitation.
+
+\subsection{All-failure groups}
+For centered group-relative objectives, an all-failure group has zero centered reward advantage. Ignoring auxiliary terms already present in the chosen base method, its FEPO contribution at $g=1$ is therefore
+\begin{equation}
+\nabla_\theta\mathcal J_{\mathrm{FEPO}[\mathrm B]}
+=-\beta\E_{q_\theta}\left[\log\frac{q_\theta}{a}\,\nabla_\theta\log q_\theta\right]
+-\beta\E_f\left[\nabla_\theta\log q_\theta\right].
+\label{eq:allfailgrad}
+\end{equation}
+If the actor equals the anchor at the start of a local update, the first term is zero and the initial failure-escape direction is exactly negative imitation of the replay distribution. This makes the matched negative-CE control scientifically necessary: any benefit beyond raw failed-token suppression must come from how the failure distribution is fitted, refreshed, gated, and balanced by the anchor.
+
+\subsection{Connection to a local natural step}
+Around anchor parameters $\theta_A$, let $\Delta=\theta-\theta_A$ and let $F_A$ be the anchor Fisher matrix. A second-order expansion of the anchor KL and a first-order expansion of the reverse failure KL give
+\begin{equation}
+\Omega_g(\theta)\approx \frac12\Delta^\top F_A\Delta-g\,d_F^\top\Delta+\mathrm{const},
+\end{equation}
+where
+\begin{equation}
+d_F=\left.\nabla_\theta\KL(\failpol\Vert\pi_\theta)\right|_{\theta=\theta_A}
+=-\E_{z\sim\failpol}[\nabla_\theta\log\pi_{\theta_A}(z)].
+\end{equation}
+When $F_A$ is nonsingular on the local tangent subspace, the quadratic model has minimizer
+\begin{equation}
+\Delta^*=g F_A^{-1}d_F.
+\end{equation}
+Thus the first local step can still be read as a failure-rate-scaled Fisher-preconditioned escape direction, but the driving vector is the reverse-KL anti-imitation gradient rather than the gradient of $\KL(\pol\Vert\failpol)$.
+
+\section{Implementation Correspondence and Estimation}
+\label{app:implementation}
+
+\subsection{Importance-weighted $k_3$ estimator for the forward anchor KL}
+The anchor regularizer remains the forward KL from the current actor to the anchor. At a fixed rollout state $s$, let $\mu=\oldpol(\cdot\mid s)$ be the behavior distribution, $q=\pol(\cdot\mid s)$ the current actor, and $a=\anchorpol(\cdot\mid s)$ the anchor. For $z\sim\mu$, define
+\begin{equation}
+w(z)=\frac{q(z)}{\mu(z)},\qquad
+u_A(z)=\log a(z)-\log q(z),\qquad
+\psi(u)=e^u-1-u.
+\end{equation}
+\begin{proposition}[Unbiased conditional forward-anchor KL estimator]
+\label{prop:iwk3}
+If $\mu(z)>0$ whenever $q(z)>0$ and no clipping is applied, then
+\begin{equation}
+\widehat K_{q\Vert a}^{\mathrm{IW\mbox{-}k3}}
+=w(z)\psi(\nu_A(z))\ge0,
+\qquad
+\E_{z\sim\mu}\!\left[\widehat K_{q\Vert a}^{\mathrm{IW\mbox{-}k3}}\right]
+=\KL(q\Vert a).
+\label{eq:iwk3_anchor}
+\end{equation}
+\end{proposition}
+\begin{proof}
+Non-negativity follows from $e^u\ge1+u$. For the expectation,
+\begin{align}
+\E_{z\sim\mu}[w\psi(\nu_A)]
+&=\E_{z\sim q}\!\left[\frac{a(z)}{q(z)}-1-\log\frac{a(z)}{q(z)}\right]\\
+&=\sum_z a(z)-\sum_z q(z)+\E_{z\sim q}\!\left[\log\frac{q(z)}{a(z)}\right]\\
+&=\KL(q\Vert a).
+\end{align}
+\end{proof}
+
+\begin{corollary}[Action-conditional anchor-gradient unbiasedness]
+\label{cor:iwk3_gradient}
+Under Proposition~\ref{prop:iwk3}, if the support is fixed in a neighborhood of $\theta$ and differentiation may be interchanged with the finite expectation, then
+\begin{equation}
+\E_{z\sim\mu}\!\left[\nabla_\theta\widehat K_{q\Vert a}^{\mathrm{IW\mbox{-}k3}}\right]
+=\nabla_\theta\KL(q_\theta\Vert a).
+\end{equation}
+\end{corollary}
+\begin{proof}
+The sampling distribution $\mu$ is fixed with respect to the current $\theta$, and Proposition~\ref{prop:iwk3} establishes equality of the estimator expectation and $\KL(q_\theta\Vert a)$ for every $\theta$ in the neighborhood. Differentiating both sides gives the claim.
+\end{proof}
+This is the same anchor-side estimator and gradient statement as before the replay-KL correction. It requires gradients through both $w$ and $\nu_A$. Ratio clipping, log-ratio clamping, or explicit stop-gradient operations generally bias the gradient, and correcting the sampled action does not convert behavior-policy prefixes into current-policy occupancy.
+
+\subsection{Reverse replay-to-actor failure KL}
+Only the failure/replay side uses the reverse orientation. If $z\sim f=\failpol$ and $\nu_F(z)=\log q(z)-\log f(z)$, then
+\begin{equation}
+\widehat K_{f\Vert q}^{\mathrm{rev\mbox{-}k3}}=\psi(\nu_F(z))\ge0,
+\qquad
+\E_{z\sim f}\left[\widehat K_{f\Vert q}^{\mathrm{rev\mbox{-}k3}}\right]=\KL(f\Vert q).
+\label{eq:revk3_appendix}
+\end{equation}
+Indeed,
+\begin{align}
+\E_f[\psi(\nu_F)]
+&=\E_f\left[\frac{q}{f}-1-\log\frac{q}{f}\right]
+=\sum_zq(z)-\sum_zf(z)+\E_f\left[\log\frac{f}{q}\right]
+=\KL(f\Vert q).
+\end{align}
+The direct Monte Carlo log ratio $\log f(z)-\log q(z)$ is also unbiased for the same reverse KL, and
+\begin{equation}
+\nabla_\theta\KL(f\Vert q_\theta)=-\E_f[\nabla_\theta\log q_\theta].
+\end{equation}
+If replay tokens are sampled from an empirical mixture rather than exactly from the fitted $f$, the estimator targets that empirical replay distribution unless an additional density correction is introduced.
+
+\subsection{Clipping and numerical bias}
+Clipping and log-ratio clamping remain numerical safeguards rather than part of the unbiased-estimation statements above. Clipping the current-to-old weight in the forward anchor estimator biases Eq.~\eqref{eq:iwk3_anchor}; this is exactly the same anchor-side caveat as in the pre-correction draft. Clamping $\nu_F$ changes the reverse replay $k_3$ expectation and gradient. We therefore treat these operations as explicit bias--variance trade-offs and report their activation rates. Implementation correspondence is now stated narrowly: the anchor remains $\KL(\pol\Vert\anchorpol)$ throughout, while only the failure/replay term is corrected to $\KL(\failpol\Vert\pol)$ instead of $\KL(\pol\Vert\failpol)$.
+
+\subsection{DAPO ordering}
+For a DAPO backbone, the following order is required: (i) generate and score the raw group; (ii) compute $g_x$ on that raw group; (iii) insert failed trajectories into the failure buffer and evaluate the reference log-probabilities needed by \FEPO; (iv) apply DAPO's dynamic sampling/homogeneous-group filtering; and only then (v) build the DAPO surrogate and actor update. If steps (ii)--(iii) are performed after filtering, all-failure groups are removed before \FEPO can observe them and the central mechanism is disabled.
+
+\section{Extended Experimental Details and Diagnostics}
+\label{app:experiments}
+
+\subsection{Protocol and paired statistics}
+The main comparison uses matched method rows at both Qwen2.5-Math-1.5B-Instruct and Qwen2.5-Math-7B-Instruct. At each scale, the same prompts, $G=8$ rollouts per prompt, temperature $0.6$, top-$p=0.95$, 2048-token response cap, generated-token budget, and checkpoint-selection rule are reused across GRPO, GSPO, DAPO, and their \FEPO counterparts, with NGRPO and AVSPO included as targeted homogeneous-group baselines. GRPO is the primary baseline used for all mechanism ablations, negative controls, sensitivity studies, and systems accounting so that those auxiliary studies do not multiply the cost of the more elaborate training recipes. The failure buffer is FIFO with capacity 4096; each refresh samples 128 failed responses uniformly and applies one response-token MLE update to $\failpol$. The completed GRPO versus GRPO+\FEPO comparison uses five training seeds (3407, 31415, 27182, 16180, 42). Mechanism validation reuses AMC23, MinervaMath, and OlympiadBench with greedy $n=1$, temperature-$0$ decoding at only three predeclared checkpoints ($t_0$, $t_0+50$, $t_0+100$); Recovery@$\Delta$ in this paper therefore refers to the deterministic definition in Eq.~\eqref{eq:greedy_recovery} unless explicitly qualified as stochastic. The remaining transfer rows will use the same evaluation protocol as they are completed. Figures~\ref{fig:learning_curve} and \ref{fig:recovery_curve} are reserved for the learning and recovery trajectories.
+
+\begin{figure}[h]
+\centering
+\figureplaceholder{Planned result figure: held-out benchmark average versus consumed rollout-token budget for the matched 1.5B runs.}
+\caption{\textbf{Learning curves at matched rollout budget, 1.5B (placeholder).} Populate after the matched-budget runs are complete.}
+\label{fig:learning_curve}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\figureplaceholder{Planned result figure: greedy validation accuracy and Greedy Recovery@$\Delta$ at the predeclared $t_0$, $t_0+50$, and $t_0+100$ checkpoints.}
+\caption{\textbf{Deterministic validation trajectories (placeholder).} One temperature-$0$ completion per prompt; no stochastic validation rollouts.}
+\label{fig:recovery_curve}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Backbone & Base Avg. & +\FEPO Avg. & Paired $\Delta$ across seeds\\
+\midrule
+GRPO & \TBD & \TBD & \TBD\\
+GSPO & \TBD & \TBD & \TBD\\
+DAPO & \TBD & \TBD & \TBD\\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Paired plug-in statistics, 1.5B (placeholder).} Populate means and paired seed uncertainty after the primary runs.}
+\label{tab:plugin}
+\end{table}
+
+\subsection{Simple negative control}
+A learned failure policy is unnecessary if the same effect can be obtained by uniformly lowering likelihood on failed replay. We therefore reserve a negative-cross-entropy control that uses exactly the same failed trajectories and refresh cadence but no learned failure distribution. The comparison will report overall accuracy, Greedy Recovery@100 and the change in deterministic validation accuracy; the learned-density interpretation is supported only if \FEPO yields a better recovery--retention trade-off than indiscriminate token suppression.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Method & Avg. & Greedy Rec.@100 & Validation $\Delta$acc\\
+\midrule
+GRPO & \TBD & \TBD & \TBD\\
+GRPO + negative CE on failed replay & \TBD & \TBD & \TBD\\
+GRPO + full \FEPO & \TBD & \TBD & \TBD\\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Negative-control test, 1.5B (placeholder).} Populate after the matched failed-replay control is complete.}
+\label{tab:negce}
+\end{table}
+
+\subsection{Minimal hyperparameter sensitivity}
+Only three quantities are swept because they govern distinct parts of the method: $\beta$ controls the strength of the failure-credited constraint, $\gamma$ controls anchor motion, and the failure-policy refresh cadence controls how stale the learned negative density becomes. Buffer capacity is fixed at 4096 responses throughout. Each factor is halved and doubled around the transferred default while all others remain fixed. Table~\ref{tab:sensitivity} is reserved for the resulting held-out average and Greedy Recovery@100 values.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Factor & Setting & Avg. & Greedy Rec.@100\\
+\midrule
+$\beta$ & $0.5\beta_0$ & \TBD & \TBD\\
+$\beta$ & $\beta_0$ & \TBD & \TBD\\
+$\beta$ & $2\beta_0$ & \TBD & \TBD\\
+\midrule
+$\gamma$ & $0.5\gamma_0$ & \TBD & \TBD\\
+$\gamma$ & $\gamma_0$ & \TBD & \TBD\\
+$\gamma$ & $2\gamma_0$ & \TBD & \TBD\\
+\midrule
+Refresh cadence & $0.5K_0$ & \TBD & \TBD\\
+Refresh cadence & $K_0$ & \TBD & \TBD\\
+Refresh cadence & $2K_0$ & \TBD & \TBD\\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Compact sensitivity sweep, 1.5B (placeholder).} Defaults are $\beta_0=0.02$, $\gamma_0=0.02$, and $K_0=20$ actor steps; populate the outcome columns after the sweep.}
+\label{tab:sensitivity}
+\end{table}
+
+\subsection{Estimator and implementation diagnostics}
+We retain only the diagnostics needed to audit the forward-anchor and reverse-replay KL estimators rather than adding another result table. After the runs are complete, this subsection will report the empirical anchor IW-$k_3$ and replay reverse-$k_3$ variances, current-to-old importance-weight clipping fraction, log-ratio clamp frequency, final actor--old, actor--anchor, and replay--actor KL values, and mean failure-buffer replay age. Importance-weight and log-ratio clipping are numerical safeguards and therefore introduce bias relative to the unclipped estimator identities; reporting their activation rates will make that approximation explicit. Parameter-optimizer hyperparameters (e.g., learning rate and AdamW settings), rollout settings, and reference-update hyperparameters are fixed across paired runs except where explicitly swept above.
+
+\end{document}

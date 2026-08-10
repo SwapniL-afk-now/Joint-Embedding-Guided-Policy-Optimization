@@ -764,13 +764,17 @@ class RayPPOTrainer:
                 label="validation",
                 sample_count=self.config.trainer.log_val_generations or 3,
             )
+            # Preserve each validation seed.  Without a seed-specific directory,
+            # repeated _validate_once calls overwrite the same ``{step}.jsonl`` and
+            # only the last evaluation seed survives on disk.
+            dump_dir = val_data_dir if seed is None else os.path.join(val_data_dir, f"seed_{seed}")
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=val_data_dir,
+                dump_path=dump_dir,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
