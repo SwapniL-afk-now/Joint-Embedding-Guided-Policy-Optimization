@@ -70,13 +70,13 @@ export VAL_TEMPERATURE=0
 export VAL_TOP_P=0.95
 export VALIDATION_SEEDS='[3407]'  # single seed: greedy is deterministic, more seeds
                                   # would just repeat the identical number
-export TEST_FREQ=10               # matches the reference GRPO run's cadence
+export TEST_FREQ=10               # evaluate every 10 training steps
 export VAL_BEFORE_TRAIN=false     # matches the reference GRPO run
 export VAL_BATCH_SIZE=128
 
 # Exactly the reference GRPO run's val_files -- no probe set.
-export VAL_FILES="[${EVAL_DATA_DIR}/math500.parquet,${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet,${EVAL_DATA_DIR}/aime26.parquet]"
-export BEST_CKPT_SOURCES='["math500","amc23","aime24","aime25","aime26"]'
+export VAL_FILES="[${EVAL_DATA_DIR}/math500.parquet,${EVAL_DATA_DIR}/amc23.parquet,${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet]"
+export BEST_CKPT_SOURCES='["math500","amc23","aime24","aime25"]'
 # pass@1 is EXACT under greedy n=1 (the single deterministic sample, not a 1-of-8
 # coin flip) -- explicitly requested as the reporting metric.
 export BEST_CKPT_METRICS='["pass@1"]'
@@ -181,7 +181,14 @@ launch() {
   echo "    steps=${TOTAL_TRAINING_STEPS} tafr=${TAFR_ENABLE} variant=${TAFR_VARIANT}" \
        "beta_a=${TAFR_BETA_ANCHOR} beta_r=${TAFR_BETA_REPLAY} gamma=${TAFR_EMA_GAMMA} K=${TAFR_SFT_UPDATE_INTERVAL}"
   [[ $# -gt 0 ]] && echo "    extra: $*"
+  echo "    model=${MODEL_PATH} devices=${CUDA_VISIBLE_DEVICES} ndev=${NDEVICES_PER_NODE} lora=${DRGRPO_USE_LORA}"
+  echo "    train_file=${TRAIN_FILE}"
+  echo "    rollout_mem=${ROLLOUT_GPU_MEM_UTIL} mini_batch=${PPO_MINI_BATCH_SIZE} train_seed=${TRAIN_SEED}"
   echo "    val dumps -> ${VALIDATION_DATA_DIR} (this is what analyze.py reads)"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "    DRY_RUN=1: launch suppressed"
+    return 0
+  fi
 
   # A stale WANDB_RUN_ID exported in the launching shell makes wandb RESUME that run,
   # so the arm silently appends into a different arm's history (m03_gspo landed in

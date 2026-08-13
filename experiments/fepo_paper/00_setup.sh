@@ -50,6 +50,29 @@ fetch meta-llama/Llama-3.2-3B-Instruct "${MODELS}/Llama-3.2-3B-Instruct" || {
   echo "  Llama download failed (gated repo?). x01/x02 stay blocked; everything else runs." >&2
 }
 
+# --- DeepSeek-Math-7B compact study ------------------------------------------
+# The compact plan uses this model for every retained experiment. Prefer an
+# existing HF snapshot to avoid copying a second 7B checkpoint into /workspace.
+echo
+ echo "== DeepSeek-Math-7B =="
+deepseek_snapshot="$("${PY}" - <<'PY'
+from huggingface_hub import snapshot_download
+try:
+    print(snapshot_download("deepseek-ai/deepseek-math-7b-instruct", local_files_only=True))
+except Exception:
+    print("")
+PY
+)"
+if [[ -n "${deepseek_snapshot}" && -f "${deepseek_snapshot}/config.json" ]]; then
+  echo "using cached DeepSeek snapshot: ${deepseek_snapshot}"
+else
+  echo "downloading deepseek-ai/deepseek-math-7b-instruct"
+  "${PY}" - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download("deepseek-ai/deepseek-math-7b-instruct")
+PY
+fi
+
 # --- cross-domain data (Table 5) ----------------------------------------------
 echo
 echo "== cross-domain data =="
@@ -63,4 +86,4 @@ fi
 
 echo
 echo "== ready =="
-echo "Next: ARM_GPU=1 bash experiments/fepo_paper/m06_dapo_fepo.sh   (canary -- see GUIDE.md)"
+echo "Next: experiments/fepo_paper/run_deepseek7b_compact.sh --dry-run"

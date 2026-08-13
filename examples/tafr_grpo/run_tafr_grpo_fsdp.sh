@@ -159,6 +159,8 @@ PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 # Failure-SFT token budget mirrors the actor-update budget unless overridden above.
 TAFR_SFT_MAX_TOKEN_LEN_PER_GPU=${TAFR_SFT_MAX_TOKEN_LEN_PER_GPU:-${PPO_MAX_TOKEN_LEN_PER_GPU}}
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
+# Load HF actors in bf16; fp32 is incompatible with FlashAttention 2 on Llama/DeepSeek.
+MODEL_DTYPE=${MODEL_DTYPE:-bf16}
 DRGRPO_USE_LORA=${DRGRPO_USE_LORA:-false}
 LORA_RANK=${LORA_RANK:-512}
 LORA_ALPHA=${LORA_ALPHA:-1024}
@@ -295,6 +297,7 @@ ACTOR=(
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    actor_rollout_ref.actor.fsdp_config.model_dtype=${MODEL_DTYPE}
     actor_rollout_ref.actor.data_loader_seed=${TRAIN_SEED}
 )
 
@@ -331,6 +334,7 @@ REF=(
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.ref.fsdp_config.param_offload=True
+    actor_rollout_ref.ref.fsdp_config.model_dtype=${MODEL_DTYPE}
 )
 
 TRAINER=(

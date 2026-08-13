@@ -663,7 +663,8 @@ class FSDPEngine(BaseEngine):
 
     def _tafr_actor_state_cpu(self) -> dict[str, torch.Tensor]:
         def _to_full_cpu(v: torch.Tensor) -> torch.Tensor:
-            return v.full_tensor().detach().cpu() if hasattr(v, "full_tensor") else v.detach().cpu().clone()
+            full = v.full_tensor() if hasattr(v, "full_tensor") else v
+            return full.detach().to(device="cpu", copy=True)
 
         if (
             fsdp_version(self.module) == 1
@@ -671,9 +672,18 @@ class FSDPEngine(BaseEngine):
             and torch.distributed.get_world_size() > 1
         ):
             peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+            # Materialize/copy while full parameters are still summoned.  Keeping
+            # state_dict tensor views past this context is unsafe: FSDP resharding
+            # invalidates their CUDA storage, which can surface as
+            # CUDA_ERROR_INVALID_VALUE during the later CPU copy (notably for
+            # DeepSeek/Llama full-finetuning).
             with FSDP.summon_full_params(self.module, writeback=False):
-                raw = peft_model.state_dict()
-            return {k: _to_full_cpu(v) for k, v in raw.items() if torch.is_tensor(v)}
+                raw = {
+                    k: _to_full_cpu(v)
+                    for k, v in peft_model.state_dict().items()
+                    if torch.is_tensor(v)
+                }
+            return raw
 
         return {k: _to_full_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
 
@@ -688,7 +698,13 @@ class FSDPEngine(BaseEngine):
         # Cast PARAMETERS only. FSDP's MixedPrecision keeps buffer_dtype=fp32, so
         # casting buffers here would give the clone bf16 RoPE inv_freq while the
         # actor uses fp32 -- a systematic log-prob gap that A_reg reads as signal.
-        module.to(device=device)
+        # Untied models (e.g. DeepSeek-Math) are built on meta tensors by
+        # get_init_weight_context_manager.  Materialize those tensors before
+        # loading the captured CPU state; Module.to() cannot move meta tensors.
+        if any(param.is_meta for param in module.parameters()):
+            module.to_empty(device=device)
+        else:
+            module.to(device=device)
         for param in module.parameters():
             param.data = param.data.to(target_dtype)
         return module
@@ -1856,7 +1872,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def _tafr_actor_state_cpu(self) -> dict[str, torch.Tensor]:
         def _to_full_cpu(v: torch.Tensor) -> torch.Tensor:
-            return v.full_tensor().detach().cpu() if hasattr(v, "full_tensor") else v.detach().cpu().clone()
+            full = v.full_tensor() if hasattr(v, "full_tensor") else v
+            return full.detach().to(device="cpu", copy=True)
 
         if (
             fsdp_version(self.module) == 1
@@ -1864,9 +1881,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
             and torch.distributed.get_world_size() > 1
         ):
             peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+            # Materialize/copy while full parameters are still summoned.  Keeping
+            # state_dict tensor views past this context is unsafe: FSDP resharding
+            # invalidates their CUDA storage, which can surface as
+            # CUDA_ERROR_INVALID_VALUE during the later CPU copy (notably for
+            # DeepSeek/Llama full-finetuning).
             with FSDP.summon_full_params(self.module, writeback=False):
-                raw = peft_model.state_dict()
-            return {k: _to_full_cpu(v) for k, v in raw.items() if torch.is_tensor(v)}
+                raw = {
+                    k: _to_full_cpu(v)
+                    for k, v in peft_model.state_dict().items()
+                    if torch.is_tensor(v)
+                }
+            return raw
 
         return {k: _to_full_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
 
@@ -1881,7 +1907,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
         # Cast PARAMETERS only. FSDP's MixedPrecision keeps buffer_dtype=fp32, so
         # casting buffers here would give the clone bf16 RoPE inv_freq while the
         # actor uses fp32 -- a systematic log-prob gap that A_reg reads as signal.
-        module.to(device=device)
+        # Untied models (e.g. DeepSeek-Math) are built on meta tensors by
+        # get_init_weight_context_manager.  Materialize those tensors before
+        # loading the captured CPU state; Module.to() cannot move meta tensors.
+        if any(param.is_meta for param in module.parameters()):
+            module.to_empty(device=device)
+        else:
+            module.to(device=device)
         for param in module.parameters():
             param.data = param.data.to(target_dtype)
         return module

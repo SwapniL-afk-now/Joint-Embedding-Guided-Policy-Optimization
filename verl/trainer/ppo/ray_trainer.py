@@ -2123,6 +2123,38 @@ class RayPPOTrainer:
             "variant": str(self.tafr_config.variant),
             "logprob_backend": str(self.tafr_config.logprob_backend),
             "vllm_score_micro_batch_size": int(self.tafr_config.vllm_score_micro_batch_size),
+            "gspo_kl_scale": float(self.tafr_config.gspo_kl_scale),
+            "disable_builtin_kl": bool(self.tafr_config.disable_builtin_kl),
+            "failure_data_max_size": (
+                int(self.tafr_config.failure_data_max_size)
+                if self.tafr_config.failure_data_max_size is not None else None
+            ),
+            "failure_data_sampling": str(self.tafr_config.failure_data_sampling),
+            "anchor_checkpoint_dir": self.tafr_config.anchor_checkpoint_dir,
+            "replay_checkpoint_dir": self.tafr_config.replay_checkpoint_dir,
+            "token_advantage_dump_dir": self.tafr_config.token_advantage_dump_dir,
+            "token_advantage_dump_every": int(self.tafr_config.token_advantage_dump_every),
+            # Keep every paper-program control in the RPC payload. These values
+            # are consumed by worker-side losses; validating them only in the
+            # dataclass is insufficient because actor workers do not hold the
+            # trainer's OmegaConf object.
+            "diagnostic_only": bool(self.tafr_config.diagnostic_only),
+            "gate_mode": str(self.tafr_config.gate_mode),
+            "negative_ce": bool(self.tafr_config.negative_ce),
+            "negative_ce_coef": float(self.tafr_config.negative_ce_coef),
+            "anchor_kl_direction": str(self.tafr_config.anchor_kl_direction),
+            "use_importance_weight": bool(self.tafr_config.use_importance_weight),
+            "importance_weight_clip": float(self.tafr_config.importance_weight_clip),
+            "shuffle_advantage_tokens": bool(self.tafr_config.shuffle_advantage_tokens),
+            "anchor_weight": float(self.tafr_config.anchor_weight),
+            "failure_weight": float(self.tafr_config.failure_weight),
+            "normalize_terms_separately": bool(self.tafr_config.normalize_terms_separately),
+            "adv_norm": str(self.tafr_config.adv_norm),
+            "dtc_dose": float(self.tafr_config.dtc_dose),
+            "dtc_tau": float(self.tafr_config.dtc_tau),
+            "dtc_eps": float(self.tafr_config.dtc_eps),
+            "dtc_eps_floor": float(self.tafr_config.dtc_eps_floor),
+            "dtc_ema_decay": float(self.tafr_config.dtc_ema_decay),
             "tafr_failure_model_ready": bool(self.tafr_failure_model_ready),
             "tafr_failure_model_update_count": int(self.tafr_failure_model_update_count),
         }
