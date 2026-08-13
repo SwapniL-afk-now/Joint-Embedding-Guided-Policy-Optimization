@@ -498,6 +498,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
                 old_log_prob=old_log_prob,
                 use_importance_weight=bool(tafr_config.get("use_importance_weight", True)),
                 importance_weight_clip=float(tafr_config.get("importance_weight_clip", 10.0)),
+                # GSPO+FEPO uses the GSPO-style geometric, per-response KL path.
+                sequence_level=(loss_mode == "gspo"),
             )
             if bool(tafr_config.get("diagnostic_only", False)):
                 # Baseline rows: the anchor and failure models were built and their
@@ -533,7 +535,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
                 policy_loss += tafr_output.loss + b_r * replay_half + coef * b_r * neg_ce
                 metrics["tafr_grpo/negative_ce"] = Metric(value=neg_ce, aggregation=metric_aggregation)
             else:
-                policy_loss += tafr_output.loss
+                # The sequence-level FEPO term is intentionally weaker than GSPO.
+                # k3 KL is a second policy objective; applying beta=0.5 at full
+                # strength made it dominate the GSPO gradient in the m04 run.
+                gspo_kl_scale = float(tafr_config.get("gspo_kl_scale", 0.1)) if loss_mode == "gspo" else 1.0
+                policy_loss += gspo_kl_scale * tafr_output.loss
+                if loss_mode == "gspo":
+                    metrics["tafr_grpo/gspo_kl_scale"] = Metric(
+                        value=torch.as_tensor(gspo_kl_scale, device=pg_loss.device), aggregation=AggregationType.MAX
+                    )
             tafr_metrics = Metric.from_dict(tafr_output.metrics, aggregation=AggregationType.MEAN)
             metrics.update(tafr_metrics)
             metrics["tafr_grpo/loss_grpo"] = Metric(value=pg_loss, aggregation=metric_aggregation)

@@ -32,7 +32,7 @@ ${PY} eval_math_multiseed_batched.py --model "${MODEL}" ${COMMON} \
 
 echo "### [${ARM}] code, 5 seeds"
 ${PY} eval_code_multiseed_batched.py --model "${MODEL}" ${COMMON} \
-  --benchmarks humanevalplus,livecodebench --seeds "${SEEDS_ALL}" \
+  --benchmarks humanevalplus,mbppplus,livecodebench --seeds "${SEEDS_ALL}" \
   --out "${OUT}/code.json"
 
 echo "### [${ARM}] done -> ${OUT}"

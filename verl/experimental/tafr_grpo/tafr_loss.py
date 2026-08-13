@@ -270,6 +270,7 @@ def compute_tafr_grpo_auxiliary_loss(
     old_log_prob: Optional[torch.Tensor] = None,
     use_importance_weight: bool = True,
     importance_weight_clip: float = 10.0,
+    sequence_level: bool = False,
 ) -> TAFRLossOutput:
     """Compute TAFR-GRPO KL terms on the pi_old rollout samples.
 
@@ -342,16 +343,25 @@ def compute_tafr_grpo_auxiliary_loss(
             ((iw.detach() * response_mask).sum() / response_mask.sum().clamp_min(1.0)).cpu()
         )
     else:
+        iw_log_ratio = torch.zeros_like(log_prob)
         iw = torch.ones_like(log_prob)
 
     def _k3(log_ratio: torch.Tensor) -> tuple[torch.Tensor, float]:
-        """IW-weighted k3: w * (e^u - 1 - u), u = log r(a) - log pi_theta(a).
+        """Return a per-response k3 estimate.
 
-        Returns the per-sequence estimate and the fraction of tokens whose log-ratio
-        hit the numerical clamp. Clamping is a safeguard and biases the estimator
-        relative to Prop. (iwk3), so its activation rate is reported rather than
-        assumed negligible.
+        GSPO uses a geometric (sequence-level) importance ratio.  Its FEPO companion
+        must not add an independently clipped token-level policy objective, so this
+        path applies k3 to the length-normalized sequence log-ratio as well.  This is
+        deliberately the GSPO-style geometric ratio, not exp(sum(token log-ratios)),
+        which is unusably high variance for long completions.
         """
+        if sequence_level:
+            seq_log_ratio = response_length_normalized_mean(log_ratio, response_mask)
+            seq_iw = response_length_normalized_mean(iw_log_ratio, response_mask).exp()
+            clamped = seq_log_ratio.clamp(min=-20, max=20)
+            frac = float((seq_log_ratio != clamped).float().mean().detach().cpu())
+            return (seq_iw * ((torch.exp(clamped) - 1) - clamped)).clamp(min=-10, max=10), frac
+
         clamped = log_ratio.clamp(min=-20, max=20)
         frac = float(
             (((log_ratio != clamped).to(response_mask.dtype) * response_mask).sum()

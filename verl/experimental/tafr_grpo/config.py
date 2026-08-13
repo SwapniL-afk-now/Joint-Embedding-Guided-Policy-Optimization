@@ -58,6 +58,9 @@ class TAFRGRPOConfig:
     # None means "use beta", so existing arms are unchanged.
     beta_anchor: float | None = None
     beta_replay: float | None = None
+    # GSPO+FEPO only: scale the sequence-level KL auxiliary loss so it cannot
+    # dominate the primary GSPO update.  Other policy losses retain scale 1.0.
+    gspo_kl_scale: float = 0.1
     # Paper regularization-advantage construction.
     failure_advantage_clip: float = 5.0
     # None falls back to the GRPO clip_ratio.
@@ -233,6 +236,8 @@ def validate_tafr_config(config: DictConfig | dict) -> TAFRGRPOConfig:
 
     if custom.beta < 0:
         raise ValueError("custom_tafr_grpo.beta must be non-negative.")
+    if custom.gspo_kl_scale < 0:
+        raise ValueError("custom_tafr_grpo.gspo_kl_scale must be non-negative.")
     for _name in ("beta_anchor", "beta_replay"):
         _v = getattr(custom, _name, None)
         if _v is not None and float(_v) < 0:

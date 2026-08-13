@@ -192,7 +192,7 @@ launch() {
   unset RAY_ADDRESS RAY_ARGS
   PYTHON_BIN=${PYTHON_BIN:-.venv/bin/python} \
     bash examples/tafr_grpo/run_tafr_grpo_fsdp.sh "$@" 2>&1 \
-    | tee -a "logs_${EXPERIMENT_NAME}.log"
+    | tee -a "logs/logs_${EXPERIMENT_NAME}.log"
 }
 
 # Baseline arms measure KL against an anchor they do not use. TAFR must stay
