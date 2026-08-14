@@ -53,7 +53,7 @@ export PROJECT_NAME="${_requested_project:-tafr-repro-qwen-math7b}"
 export NDEVICES_PER_NODE=2
 export CUDA_VISIBLE_DEVICES="${_requested_gpus}"
 export TRAIN_SEED="${_requested_seed:-3407}"
-export TAG="${_requested_tag:-qwen7b-s${TRAIN_SEED}-$(date -u +%Y%m%d)}"
+export TAG="${_requested_tag:-qwen7b-s3407-20260813}"
 export RUN_NAME="${_requested_run_name:-s03_grpo_7b}"
 
 # Qwen2.5-Math-7B uses the configured context window. Keep prompt and answer
@@ -75,8 +75,11 @@ export TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-500}
 export ACTOR_ATTENTION_IMPL=${_requested_actor_attn:-flash_attention_2}
 export VLLM_ATTENTION_BACKEND=${_requested_vllm_attn:-FLASHINFER}
 export ROLLOUT_GPU_MEM_UTIL=${_requested_rollout_mem:-0.60}
-export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-16}
-export ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-32768}
+# Architectural rollout scaling: allow more concurrent requests and token prefill
+# without changing response length or generation count.
+export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-32}
+export ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
+export ROLLOUT_CALCULATE_LOG_PROBS=true
 
 # This is a real GRPO control, not a diagnostic FEPO run.
 export TAFR_ENABLE=false
@@ -106,6 +109,9 @@ IFS=',' read -r -a _gpu_list <<< "${CUDA_VISIBLE_DEVICES}"
 (( ${#_gpu_list[@]} >= 2 )) || { echo "Need two GPUs; got CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" >&2; exit 4; }
 
 launch "${RUN_NAME}" "Qwen2.5-Math-7B pure GRPO${RECOVERY_MODE:+ deterministic recovery}" \
-  actor_rollout_ref.rollout.load_format=auto
+  actor_rollout_ref.rollout.load_format=auto \
+  actor_rollout_ref.rollout.calculate_log_probs=${ROLLOUT_CALCULATE_LOG_PROBS} \
+  algorithm.rollout_correction.bypass_mode=true \
+  algorithm.rollout_correction.loss_type=ppo_clip
 
 unset _requested_model _requested_seed _requested_project _requested_gpus _requested_tag _requested_run_name _requested_rollout_mem _requested_mini_batch _requested_train_batch _requested_actor_attn _requested_vllm_attn _requested_recovery_mode
