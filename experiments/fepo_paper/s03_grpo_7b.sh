@@ -82,7 +82,8 @@ export VLLM_ATTENTION_BACKEND=${_requested_vllm_attn:-FLASHINFER}
 # Architectural actor-path optimizations. These preserve all rollout lengths and
 # generation counts; the native Triton path fuses linear-cross-entropy, while
 # Liger patches Qwen2 RMSNorm/RoPE/SwiGLU. Keep both explicit so resume logs show
-# exactly which path was used.
+# exactly which path was used. The validated fastest canary was hybrid
+# Triton+Liger with TP=1, 24,576 actor tokens, and 64 rollout sequences.
 export USE_FUSED_KERNELS=${_requested_fused_kernels:-true}
 export FUSED_KERNEL_BACKEND=${_requested_fused_backend:-triton}
 export USE_LIGER=${_requested_liger:-true}
@@ -90,6 +91,7 @@ export ACTOR_USE_TORCH_COMPILE=${_requested_actor_compile:-false}
 export ROLLOUT_GPU_MEM_UTIL=${_requested_rollout_mem:-0.60}
 # Architectural rollout scaling: allow more concurrent requests and token prefill
 # without changing response length or generation count.
+export ROLLOUT_TP=${ROLLOUT_TP:-1}
 export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-64}
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
 export ROLLOUT_CALCULATE_LOG_PROBS=true
