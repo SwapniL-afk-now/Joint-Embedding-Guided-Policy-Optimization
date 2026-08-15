@@ -28,6 +28,11 @@ _requested_mini_batch=${PPO_MINI_BATCH_SIZE:-}
 _requested_train_batch=${TRAIN_PROMPT_BATCH_SIZE:-}
 _requested_actor_attn=${ACTOR_ATTENTION_IMPL:-}
 _requested_vllm_attn=${VLLM_ATTENTION_BACKEND:-}
+_requested_fused_kernels=${USE_FUSED_KERNELS:-}
+_requested_fused_backend=${FUSED_KERNEL_BACKEND:-}
+_requested_liger=${USE_LIGER:-}
+_requested_actor_compile=${ACTOR_USE_TORCH_COMPILE:-}
+_requested_val_before_train=${VAL_BEFORE_TRAIN:-}
 _requested_recovery_mode=${RECOVERY_MODE:-true}
 source "${SCRIPT_DIR}/_common.sh"
 
@@ -61,7 +66,7 @@ export RUN_NAME="${_requested_run_name:-s03_grpo_7b}"
 # for the available 2x96-GiB GPUs.
 export MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 export MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
-export PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}
+export PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 export DRGRPO_USE_LORA=true
 export LORA_RANK=${LORA_RANK:-64}
 export LORA_ALPHA=${LORA_ALPHA:-128}
@@ -74,10 +79,18 @@ export TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-500}
 # and paged KV-cache management. Limit concurrency for 7B MHA memory usage.
 export ACTOR_ATTENTION_IMPL=${_requested_actor_attn:-flash_attention_2}
 export VLLM_ATTENTION_BACKEND=${_requested_vllm_attn:-FLASHINFER}
+# Architectural actor-path optimizations. These preserve all rollout lengths and
+# generation counts; the native Triton path fuses linear-cross-entropy, while
+# Liger patches Qwen2 RMSNorm/RoPE/SwiGLU. Keep both explicit so resume logs show
+# exactly which path was used.
+export USE_FUSED_KERNELS=${_requested_fused_kernels:-true}
+export FUSED_KERNEL_BACKEND=${_requested_fused_backend:-triton}
+export USE_LIGER=${_requested_liger:-true}
+export ACTOR_USE_TORCH_COMPILE=${_requested_actor_compile:-false}
 export ROLLOUT_GPU_MEM_UTIL=${_requested_rollout_mem:-0.60}
 # Architectural rollout scaling: allow more concurrent requests and token prefill
 # without changing response length or generation count.
-export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-32}
+export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-64}
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
 export ROLLOUT_CALCULATE_LOG_PROBS=true
 
@@ -95,7 +108,7 @@ if [[ "${RECOVERY_MODE}" == "true" ]]; then
   export VAL_DO_SAMPLE=False
   export VAL_TEMPERATURE=0
   export VAL_TOP_P=0.95
-  export VAL_BEFORE_TRAIN=true
+  export VAL_BEFORE_TRAIN=${_requested_val_before_train:-true}
   export VALIDATION_SEEDS='[3407]'
   export TEST_FREQ=10
   export VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-128}
@@ -111,7 +124,12 @@ IFS=',' read -r -a _gpu_list <<< "${CUDA_VISIBLE_DEVICES}"
 launch "${RUN_NAME}" "Qwen2.5-Math-7B pure GRPO${RECOVERY_MODE:+ deterministic recovery}" \
   actor_rollout_ref.rollout.load_format=auto \
   actor_rollout_ref.rollout.calculate_log_probs=${ROLLOUT_CALCULATE_LOG_PROBS} \
+  actor_rollout_ref.model.use_fused_kernels=${USE_FUSED_KERNELS} \
+  actor_rollout_ref.model.fused_kernel_options.impl_backend=${FUSED_KERNEL_BACKEND} \
+  actor_rollout_ref.model.use_liger=${USE_LIGER} \
+  actor_rollout_ref.actor.fsdp_config.use_torch_compile=${ACTOR_USE_TORCH_COMPILE} \
+  actor_rollout_ref.ref.fsdp_config.use_torch_compile=${ACTOR_USE_TORCH_COMPILE} \
   algorithm.rollout_correction.bypass_mode=true \
   algorithm.rollout_correction.loss_type=ppo_clip
 
-unset _requested_model _requested_seed _requested_project _requested_gpus _requested_tag _requested_run_name _requested_rollout_mem _requested_mini_batch _requested_train_batch _requested_actor_attn _requested_vllm_attn _requested_recovery_mode
+unset _requested_model _requested_seed _requested_project _requested_gpus _requested_tag _requested_run_name _requested_rollout_mem _requested_mini_batch _requested_train_batch _requested_actor_attn _requested_vllm_attn _requested_fused_kernels _requested_fused_backend _requested_liger _requested_actor_compile _requested_val_before_train _requested_recovery_mode

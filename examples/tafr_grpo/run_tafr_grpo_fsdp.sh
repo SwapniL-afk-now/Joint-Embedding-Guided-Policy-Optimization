@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# vLLM imports matplotlib through its CLI module. Training is non-interactive;
+# force a headless backend so inherited Jupyter MPLBACKEND values cannot abort
+# worker startup.
+export MPLBACKEND=Agg
+
 # Example TAFR-GRPO launch. Override paths and model/data settings from the
 # environment to keep the script usable for baselines.
 
