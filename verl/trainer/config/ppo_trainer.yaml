@@ -137,75 +137,28 @@ custom_gpi_ce:
   # forward. Exact when ppo_epochs=1 and there is one optimizer step per batch.
   fuse_old_log_prob: true
 
-# config for Trajectory-Anchored Failure-Replay GRPO
-custom_tafr_grpo:
-
-  # Whether to enable the TAFR-GRPO co-training path
+# config for Success/Failure Distillation Contrastive GRPO
+custom_sdc_grpo:
   enable: false
-
-  # Single KL coefficient used for both anchor and replay KL terms
-  beta: 0.0
-
-  # Anchor KL coefficient (overrides beta when > 0; 0 = use beta)
-
-  # EMA decay for saved GRPO and failure-SFT checkpoints
-  ema_gamma: 0.99
-
-  # Mixture weight for EMA/reference model interpolation
-  mix_eta: 1.0
-
-  # Run failure-SFT updates every N GRPO steps
-  sft_update_interval_grpo_steps: 5
-
-  # Save actor/failure checkpoints and refresh EMA models every N GRPO steps
-  checkpoint_interval_grpo_steps: 10
-
-  # Whether to require verl built-in KL loss and reward KL to be disabled
-  disable_builtin_kl: true
-
-  # Learning rate for the separate failure-SFT optimizer
-  failure_sft_lr: 1.0e-6
-
-  # Batch size for failure-SFT updates
-  failure_sft_batch_size: 8
-
-  # Token budget for failure-SFT micro-batching. >0 packs records greedily so each
-  # step's padded tokens (rows*max_len) stay under this budget (higher GPU util);
-  # 0 falls back to the fixed failure_sft_batch_size.
-  failure_sft_max_token_len_per_gpu: 0
-
-  # Maximum failure-SFT optimizer updates at each SFT interval
-  failure_sft_max_updates_per_interval: 1
-
-  # Throttle heavy TAFR disk writes. 0 = write on every EMA refresh. When > 0, the
-  # EMA refresh + vLLM adapter export still run every checkpoint_interval, but the
-  # failure model / optimizer / tafr_state.pt are only written when
-  # global_step % this == 0 (old dirs rotate, so the latest replaces the previous).
-  save_to_disk_interval_grpo_steps: 0
-
-  # Whether to persist the failure-SFT optimizer state (largest TAFR file).
-  save_failure_sft_optimizer: true
-
-  # Maximum number of wrong-response examples retained in the failure stream
-  failure_data_max_size: null
-
-  # Failure stream sampling policy: recent or uniform
-  failure_data_sampling: recent
-
-  # Directory for materialized adaptive anchor checkpoints
-  anchor_checkpoint_dir: null
-
-  # Directory for materialized replay checkpoints
-  replay_checkpoint_dir: null
-
-  # TAFR variant: full, anchor_only, or replay_only
-  variant: full
-
-  # Backend for anchor/replay logprob scoring: hf (default) or vllm
+  beta: 0.5
   logprob_backend: hf
-
-  # vLLM micro-batch size for prompt-logprob scoring
   vllm_score_micro_batch_size: 16
+  reuse_rollout_log_probs: false
+  verify_rollout_log_probs: false
+  use_importance_weight: true
+  importance_weight_clip: 10.0
+  sft_update_interval_grpo_steps: 5
+  checkpoint_interval_grpo_steps: 10
+  min_sft_updates_before_use: 1
+  sft_lr: 1.0e-6
+  sft_batch_size: 8
+  sft_max_token_len_per_gpu: 0
+  sft_max_updates_per_interval: 1
+  data_max_size: null
+  data_sampling: recent
+  save_to_disk_interval_grpo_steps: 0
+  save_sft_optimizers: true
+  disable_builtin_kl: true
 
 # config for Sequence Sharpening GRPO
 custom_sharpening_grpo:

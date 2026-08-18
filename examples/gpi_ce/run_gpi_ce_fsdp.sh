@@ -6,7 +6,7 @@ set -euo pipefail
 #   bash examples/gpi_ce/run_gpi_ce_fsdp.sh
 #   GPI_ONLINE=8 GPI_OFFLINE=0 bash examples/gpi_ce/run_gpi_ce_fsdp.sh   # online-only arm
 #
-# Structure mirrors examples/tafr_grpo/run_tafr_grpo_fsdp.sh so the runs are
+# Structure mirrors examples/sdc_grpo/run_sdc_grpo_fsdp.sh so the runs are
 # directly comparable; the deltas are the custom_gpi_ce block and the actor
 # settings that keep candidate groups atomic and force one optimizer step.
 #

@@ -742,62 +742,40 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def tafr_init(self, tafr_config: dict):
-        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
+    def sdc_init(self, sdc_config: dict):
+        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
         if self.config.actor.strategy not in ("fsdp", "fsdp2"):
             raise NotImplementedError(
-                "custom_tafr_grpo.enable=true is currently supported only for HF FSDP/FSDP2 actors."
+                "custom_sdc_grpo.enable=true is currently supported only for HF FSDP/FSDP2 actors."
             )
-        return self.actor.engine.tafr_init(tafr_config)
+        return self.actor.engine.sdc_init(sdc_config)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="olive", role="tafr_anchor_log_prob")
-    def tafr_compute_anchor_log_prob(self, data: TensorDict) -> TensorDict:
-        output = self.actor.engine.tafr_compute_anchor_log_prob(data)
-        return output.cpu() if output is not None else None
-
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="purple", role="tafr_failure_log_prob")
-    def tafr_compute_failure_log_prob(self, data: TensorDict) -> TensorDict:
-        output = self.actor.engine.tafr_compute_failure_log_prob(data)
-        return output.cpu() if output is not None else None
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="purple", role="tafr_replay_log_prob")
-    def tafr_compute_replay_log_prob(self, data: TensorDict) -> TensorDict:
-        output = self.actor.engine.tafr_compute_replay_log_prob(data)
-        return output.cpu() if output is not None else None
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="olive", role="tafr_anchor_and_replay_log_prob")
-    def tafr_compute_anchor_and_replay_log_probs(self, data: TensorDict) -> TensorDict:
-        output = self.actor.engine.tafr_compute_anchor_and_replay_log_probs(data)
+    @DistProfiler.annotate(color="purple", role="sdc_success_failure_log_probs")
+    def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
+        output = self.actor.engine.sdc_compute_success_failure_log_probs(data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
-        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
-        return self.actor.engine.tafr_failure_sft_update(records, tafr_config)
+    def sdc_sft_update(self, success_records: list[dict], failure_records: list[dict], sdc_config: dict):
+        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        return self.actor.engine.sdc_sft_update(success_records, failure_records, sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def tafr_update_failure_ema(self, tafr_config: dict):
-        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
-        return self.actor.engine.tafr_update_failure_ema(tafr_config)
+    def sdc_save_checkpoint(self, local_path: str, global_step: int, sdc_config: dict):
+        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        return self.actor.engine.sdc_save_checkpoint(local_path, global_step, sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def tafr_save_and_refresh(self, local_path: str, global_step: int, failure_model_changed: bool, tafr_config: dict):
-        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
-        return self.actor.engine.tafr_save_and_refresh(local_path, global_step, failure_model_changed, tafr_config)
+    def sdc_export_vllm_adapters(self, sdc_config: dict):
+        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        return self.actor.engine.sdc_export_vllm_adapters(sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def tafr_export_vllm_adapters(self, tafr_config: dict):
-        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
-        return self.actor.engine.tafr_export_vllm_adapters(tafr_config)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def tafr_load(self, local_path: str, tafr_config: dict | None = None):
-        assert "actor" in self.role, "TAFR-GRPO requires the actor worker"
-        return self.actor.engine.tafr_load(local_path, tafr_config)
+    def sdc_load(self, local_path: str, sdc_config: dict | None = None):
+        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        return self.actor.engine.sdc_load(local_path, sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):

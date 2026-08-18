@@ -901,27 +901,27 @@ custom_gpi_ce:
   verify_offline: true
   allow_short_offline: false
   fuse_old_log_prob: true
-custom_tafr_grpo:
+custom_sdc_grpo:
   enable: false
-  beta: 0.0
-  ema_gamma: 0.99
-  mix_eta: 1.0
-  sft_update_interval_grpo_steps: 5
-  checkpoint_interval_grpo_steps: 10
-  disable_builtin_kl: true
-  failure_sft_lr: 1.0e-06
-  failure_sft_batch_size: 8
-  failure_sft_max_token_len_per_gpu: 0
-  failure_sft_max_updates_per_interval: 1
-  save_to_disk_interval_grpo_steps: 0
-  save_failure_sft_optimizer: true
-  failure_data_max_size: null
-  failure_data_sampling: recent
-  anchor_checkpoint_dir: null
-  replay_checkpoint_dir: null
-  variant: full
+  beta: 0.5
   logprob_backend: hf
   vllm_score_micro_batch_size: 16
+  reuse_rollout_log_probs: false
+  verify_rollout_log_probs: false
+  use_importance_weight: true
+  importance_weight_clip: 10.0
+  sft_update_interval_grpo_steps: 5
+  checkpoint_interval_grpo_steps: 10
+  min_sft_updates_before_use: 1
+  sft_lr: 1.0e-6
+  sft_batch_size: 8
+  sft_max_token_len_per_gpu: 0
+  sft_max_updates_per_interval: 1
+  data_max_size: null
+  data_sampling: recent
+  save_to_disk_interval_grpo_steps: 0
+  save_sft_optimizers: true
+  disable_builtin_kl: true
 custom_sharpening_grpo:
   enable: false
   use_grpo_reward: true

@@ -2,9 +2,9 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-"""Build the TAFR-GRPO training parquet: One-Shot-RLVR dsr_sub + MATH levels 3-5.
+"""Build the SDC-GRPO training parquet: One-Shot-RLVR dsr_sub + MATH levels 3-5.
 
-    python -m verl.experimental.tafr_grpo.prepare_tafr_train \
+    python -m verl.experimental.sdc_grpo.prepare_sdc_train \
         --output /workspace/jepa-grpo-cache/data/dsr_math345/train.parquet
 
 Two sources, normalized to one schema:

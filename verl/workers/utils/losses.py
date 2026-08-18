@@ -17,12 +17,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.experimental.sharpening_grpo.loss import compute_sharpening_grpo_loss
-from verl.experimental.tafr_grpo.tafr_loss import (
-    compute_regularization_policy_loss,
-    compute_tafr_grpo_auxiliary_loss,
-    replay_gate,
-    response_length_normalized_mean,
-)
+from verl.experimental.sdc_grpo.sdc_loss import compute_sdc_loss
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -62,157 +57,6 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {}
 
 
-def _tafr_regularization_metrics(
-    *,
-    loss: torch.Tensor,
-    regularization_loss: torch.Tensor,
-    regularization_advantage: torch.Tensor,
-    stability_signal: torch.Tensor,
-    failure_signal: torch.Tensor,
-    failure_component: torch.Tensor,
-    raw_advantage: torch.Tensor,
-    scaled_advantage: torch.Tensor,
-    grpo_advantage: torch.Tensor,
-    normalization_scale: torch.Tensor,
-    fail_stats: dict[str, torch.Tensor],
-    group_reward_mean: torch.Tensor,
-    response_mask: torch.Tensor,
-    beta: float,
-    failure_model_ready: bool,
-    update_count: int,
-    advantage_clip: float,
-) -> dict[str, float]:
-    """Metrics for the paper anchor-plus-failure regularization advantage."""
-    mask = response_mask.to(dtype=regularization_advantage.dtype)
-    rmean = group_reward_mean.detach().float().clamp(0.0, 1.0).reshape(-1)
-    failure_rows = (rmean < 1.0).float() * float(failure_model_ready)
-    failure_mask = (failure_rows.unsqueeze(-1) * mask).bool()
-    token_mask = mask.bool()
-    valid_tokens = mask.sum().clamp_min(1.0)
-
-    def _masked_stats(values: torch.Tensor, selected: torch.Tensor) -> tuple[float, float, float]:
-        count = selected.sum()
-        if count.item() == 0:
-            return 0.0, 0.0, 0.0
-        selected_f = selected.to(values.dtype)
-        mean = (values * selected_f).sum() / count
-        var = ((values - mean).square() * selected_f).sum() / count
-        positive = ((values > 0).to(values.dtype) * selected_f).sum() / count
-        return float(mean), float(var.clamp_min(0.0).sqrt()), float(positive)
-
-    def _masked_rms(values: torch.Tensor, selected: torch.Tensor) -> float:
-        count = selected.sum()
-        if count.item() == 0:
-            return 0.0
-        return float(((values.square() * selected.to(values.dtype)).sum() / count).sqrt())
-
-    stability_mean, stability_std, _ = _masked_stats(stability_signal, token_mask)
-    failure_mean, failure_std, failure_pos = _masked_stats(failure_signal, failure_mask)
-    adv_mean, adv_std, adv_pos = _masked_stats(regularization_advantage, token_mask)
-    raw_rms = _masked_rms(raw_advantage, token_mask)
-    reg_rms = _masked_rms(regularization_advantage, token_mask)
-    grpo_rms = _masked_rms(grpo_advantage, token_mask)
-    weighted_rms = abs(beta) * reg_rms
-    rms_ratio = weighted_rms / grpo_rms if grpo_rms > 1.0e-8 else 0.0
-    scale = float(normalization_scale.reshape(-1)[0]) if normalization_scale.numel() else 0.0
-    ratio = fail_stats["ppo_ratio"]
-    ratio_mean = float((ratio * mask).sum() / valid_tokens)
-    clip_fraction = float(((scaled_advantage.abs() > advantage_clip).to(mask.dtype) * mask).sum() / valid_tokens)
-
-    def _within_between_std(values: torch.Tensor) -> tuple[float, float]:
-        """Split token-level variation into within-sequence and between-sequence parts.
-
-        A_reg is per-token by construction, but if it were near-constant along each
-        rollout it would be per-token in shape and per-sequence in effect -- i.e. no
-        better than GRPO's broadcast advantage. within >> between means it really is
-        doing token-level credit assignment.
-        """
-        counts = mask.sum(dim=-1)
-        rows = counts > 0
-        if not bool(rows.any()):
-            return 0.0, 0.0
-        counts = counts[rows].clamp_min(1.0)
-        vals = values[rows]
-        row_mask = mask[rows]
-        row_mean = (vals * row_mask).sum(dim=-1) / counts
-        within_var = ((vals - row_mean.unsqueeze(-1)).square() * row_mask).sum(dim=-1) / counts
-        within = float(within_var.clamp_min(0.0).sqrt().mean())
-        between = float(row_mean.std(unbiased=False)) if row_mean.numel() > 1 else 0.0
-        return within, between
-
-    adv_within_std, adv_between_std = _within_between_std(regularization_advantage)
-    failure_within_std, failure_between_std = _within_between_std(failure_signal)
-
-    def _quantiles(values: torch.Tensor) -> dict[str, float]:
-        """Distribution of the per-token advantage actually delivered.
-
-        A std alone hides whether the signal is a few saturated spikes or a broad
-        spread -- which is the difference between shaping most tokens and shouting
-        at a handful.
-        """
-        sel = values[token_mask]
-        if sel.numel() == 0:
-            return dict.fromkeys(("p50", "p90", "p99", "max"), 0.0)
-        a = sel.abs().float()
-        q = torch.quantile(a, torch.tensor([0.5, 0.9, 0.99], device=a.device)) if a.numel() > 1 else a.repeat(3)
-        return {"p50": float(q[0]), "p90": float(q[1]), "p99": float(q[2]), "max": float(a.max())}
-
-    adv_q = _quantiles(regularization_advantage)
-
-    def _regime_mean(regime: torch.Tensor) -> float:
-        selected = regime.to(mask.dtype).unsqueeze(-1).bool() & token_mask
-        return _masked_stats(regularization_advantage, selected)[0]
-
-    all_correct = (rmean == 1.0).to(mask.dtype).unsqueeze(-1).bool() & token_mask
-    all_correct_reg_max = float((regularization_advantage.abs() * all_correct).max()) if all_correct.any() else 0.0
-    all_correct_failure_max = float((failure_component.abs() * all_correct).max()) if all_correct.any() else 0.0
-
-    values = {
-        "tafr_adv/advantage_abs_p50": adv_q["p50"],
-        "tafr_adv/advantage_abs_p90": adv_q["p90"],
-        "tafr_adv/advantage_abs_p99": adv_q["p99"],
-        "tafr_adv/advantage_abs_max_all": adv_q["max"],
-        "tafr_adv/advantage_within_seq_std": adv_within_std,
-        "tafr_adv/advantage_between_seq_std": adv_between_std,
-        "tafr_adv/failure_signal_within_seq_std": failure_within_std,
-        "tafr_adv/failure_signal_between_seq_std": failure_between_std,
-        "tafr_adv/regularization_loss": float(regularization_loss.detach().cpu()),
-        "tafr_adv/weighted_regularization_loss": float((beta * regularization_loss).detach().cpu()),
-        # Compatibility aliases for existing dashboards.
-        "tafr_adv/failure_loss": float(regularization_loss.detach().cpu()),
-        "tafr_adv/weighted_failure_loss": float((beta * regularization_loss).detach().cpu()),
-        "tafr_adv/total_policy_loss": float(loss.detach().cpu()),
-        "tafr_adv/group_difficulty_mean": float((1.0 - rmean).mean().cpu()),
-        "tafr_adv/active_group_fraction": float(failure_rows.mean().cpu()),
-        "tafr_adv/scored_token_fraction": float(failure_mask.to(mask.dtype).sum() / valid_tokens),
-        "tafr_adv/stability_signal_mean": stability_mean,
-        "tafr_adv/stability_signal_std": stability_std,
-        "tafr_adv/failure_signal_mean": failure_mean,
-        "tafr_adv/failure_signal_std": failure_std,
-        "tafr_adv/failure_signal_positive_fraction": failure_pos,
-        "tafr_adv/advantage_mean": adv_mean,
-        "tafr_adv/advantage_std": adv_std,
-        "tafr_adv/advantage_positive_fraction": adv_pos,
-        "tafr_adv/raw_regularization_advantage_rms": raw_rms,
-        "tafr_adv/regularization_advantage_rms": reg_rms,
-        "tafr_adv/grpo_advantage_rms": grpo_rms,
-        "tafr_adv/weighted_regularization_advantage_rms": weighted_rms,
-        "tafr_adv/regularization_to_grpo_rms_ratio": rms_ratio,
-        "tafr_adv/normalization_scale": scale,
-        "tafr_adv/advantage_clip_fraction": clip_fraction,
-        "tafr_adv/ppo_ratio_mean": ratio_mean,
-        "tafr_adv/ppo_ratio_clip_fraction": float(fail_stats["ppo_ratio_clip_fraction"].detach().cpu()),
-        "tafr_adv/failure_model_ready": 1.0 if failure_model_ready else 0.0,
-        "tafr_adv/failure_model_update_count": float(update_count),
-        "tafr_adv/all_wrong/advantage_mean": _regime_mean(rmean == 0.0),
-        "tafr_adv/mixed/advantage_mean": _regime_mean((rmean > 0.0) & (rmean < 1.0)),
-        "tafr_adv/all_correct/advantage_abs_max": all_correct_reg_max,
-        "tafr_adv/all_correct/regularization_advantage_abs_max": all_correct_reg_max,
-        "tafr_adv/all_correct/failure_component_abs_max": all_correct_failure_max,
-    }
-    return values
-
-
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None, exploration=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
@@ -244,8 +88,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
 
     metrics = {}
 
-    tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default=None)
-    tafr_group_ids = _as_list(data.get("uid", None)) if tafr_config and tafr_config.get("enable", False) else []
+    sdc_config = tu.get_non_tensor_data(data=data, key="custom_sdc_grpo", default=None)
 
     gpi_config = tu.get_non_tensor_data(data=data, key="custom_gpi_ce", default=None)
     gpi_enabled = bool(gpi_config and gpi_config.get("enable", False))
@@ -276,21 +119,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         for field in ("rm_scores", "token_level_rewards"):
             if field in data:
                 fields.append(field)
-    tafr_enabled = bool(tafr_config and tafr_config.get("enable", False))
-    if tafr_enabled:
-        for field in (
-            "tafr_group_reward_mean",
-            "tafr_failure_log_prob",
-            "tafr_anchor_log_probs",
-            "tafr_replay_log_probs",
-            "tafr_regularization_advantage",
-            "tafr_stability_signal",
-            "tafr_failure_signal",
-            "tafr_failure_component",
-            "tafr_raw_regularization_advantage",
-            "tafr_scaled_regularization_advantage",
-            "tafr_regularization_scale",
-        ):
+    sdc_enabled = bool(sdc_config and sdc_config.get("enable", False))
+    if sdc_enabled:
+        for field in ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs"):
             if field in data:
                 fields.append(field)
     if sharpening_enabled:
@@ -411,149 +242,28 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         metrics["sharpen/alpha"] = Metric(value=sharpening_alpha, aggregation=AggregationType.MAX)
         metrics["sharpen/beta"] = Metric(value=sharpening_beta, aggregation=AggregationType.MAX)
 
-    if tafr_enabled:
-        if "tafr_group_reward_mean" not in data:
-            raise ValueError("TAFR-GRPO batch is missing required field: tafr_group_reward_mean")
-        loss_version = str(tafr_config.get("loss_version", "failure_token_adv"))
-        if loss_version == "failure_token_adv":
-            required = (
-                "tafr_regularization_advantage",
-                "tafr_stability_signal",
-                "tafr_failure_signal",
-                "tafr_failure_component",
-                "tafr_raw_regularization_advantage",
-                "tafr_scaled_regularization_advantage",
-                "tafr_regularization_scale",
-            )
-            missing = [field for field in required if field not in data]
-            if missing:
-                raise ValueError(f"TAFR paper advantage is missing required fields: {missing}")
-            failure_model_ready = bool(tafr_config.get("tafr_failure_model_ready", False))
-            update_count = int(tafr_config.get("tafr_failure_model_update_count", 0))
-            advantage_clip = float(tafr_config.get("failure_advantage_clip", 5.0))
-            clip_ratio_raw = tafr_config.get("failure_clip_ratio", None)
-            regularization_clip_ratio = float(clip_ratio_raw) if clip_ratio_raw is not None else config.clip_ratio
-            beta = float(tafr_config.get("beta", 0.5))
-            regularization_advantage = data["tafr_regularization_advantage"]
-            regularization_loss, reg_stats = compute_regularization_policy_loss(
-                current_log_prob=log_prob,
-                old_log_prob=old_log_prob,
-                regularization_advantage=regularization_advantage,
-                response_mask=response_mask,
-                clip_ratio=regularization_clip_ratio,
-                loss_agg_mode=loss_agg_mode,
-                global_batch_info=config.global_batch_info,
-            )
-            combined_advantages = advantages + beta * regularization_advantage
-            combined_pg_loss, _ = policy_loss_fn(
-                old_log_prob=old_log_prob,
-                log_prob=log_prob,
-                advantages=combined_advantages,
-                response_mask=policy_response_mask,
-                loss_agg_mode=loss_agg_mode,
-                config=config,
-                rollout_is_weights=rollout_is_weights,
-            )
-            policy_loss = ppo_loss_coef * combined_pg_loss
-            tafr_metrics = _tafr_regularization_metrics(
-                loss=policy_loss,
-                regularization_loss=regularization_loss,
-                regularization_advantage=regularization_advantage,
-                stability_signal=data["tafr_stability_signal"],
-                failure_signal=data["tafr_failure_signal"],
-                failure_component=data["tafr_failure_component"],
-                raw_advantage=data["tafr_raw_regularization_advantage"],
-                scaled_advantage=data["tafr_scaled_regularization_advantage"],
-                grpo_advantage=advantages,
-                normalization_scale=data["tafr_regularization_scale"],
-                fail_stats=reg_stats,
-                group_reward_mean=data["tafr_group_reward_mean"],
-                response_mask=response_mask,
-                beta=beta,
-                failure_model_ready=failure_model_ready,
-                update_count=update_count,
-                advantage_clip=advantage_clip,
-            )
-            tafr_metrics = Metric.from_dict(tafr_metrics, aggregation=AggregationType.MEAN)
-            metrics.update(tafr_metrics)
-            metrics["tafr_adv/loss_grpo"] = Metric(value=pg_loss, aggregation=metric_aggregation)
-            metrics["tafr_adv/combined_policy_loss"] = Metric(value=combined_pg_loss, aggregation=metric_aggregation)
-            metrics["tafr_adv/loss_delta_vs_grpo"] = Metric(
-                value=combined_pg_loss - pg_loss, aggregation=metric_aggregation
-            )
-        else:
-            tafr_output = compute_tafr_grpo_auxiliary_loss(
-                log_prob=log_prob,
-                response_mask=response_mask,
-                group_reward_mean=data["tafr_group_reward_mean"],
-                beta=float(tafr_config.get("beta", 0.0)),
-                beta_anchor=tafr_config.get("beta_anchor", None),
-                beta_replay=tafr_config.get("beta_replay", None),
-                variant=str(tafr_config.get("variant", "full")),
-                anchor_log_prob=data.get("tafr_anchor_log_probs", None),
-                replay_log_prob=data.get("tafr_replay_log_probs", None),
-                group_ids=tafr_group_ids,
-                gate_mode=str(tafr_config.get("gate_mode", "difficulty")),
-                anchor_kl_direction=str(tafr_config.get("anchor_kl_direction", "forward")),
-                old_log_prob=old_log_prob,
-                use_importance_weight=bool(tafr_config.get("use_importance_weight", True)),
-                importance_weight_clip=float(tafr_config.get("importance_weight_clip", 10.0)),
-                # GSPO+FEPO uses the GSPO-style geometric, per-response KL path.
-                sequence_level=(loss_mode == "gspo"),
-            )
-            if bool(tafr_config.get("diagnostic_only", False)):
-                # Baseline rows: the anchor and failure models were built and their
-                # KLs measured above, but nothing may reach the actor. Multiplying by
-                # zero (rather than skipping) keeps the term in the autograd graph, so
-                # any accidental gradient path shows up as a non-zero grad rather than
-                # silently vanishing.
-                policy_loss = policy_loss + 0.0 * tafr_output.loss
-                metrics["tafr_grpo/diagnostic_only"] = Metric(
-                    value=torch.ones_like(pg_loss), aggregation=metric_aggregation
-                )
-            elif bool(tafr_config.get("negative_ce", False)):
-                # Table 7 control: same failed replay buffer, but the learned failure
-                # density is replaced by uniform negative cross-entropy on the failed
-                # rollouts. Anchor term is untouched, so the only difference from full
-                # FEPO is *what* provides the repulsion direction.
-                gate = replay_gate(
-                    data["tafr_group_reward_mean"].to(log_prob.dtype).clamp(0.0, 1.0),
-                    str(tafr_config.get("gate_mode", "difficulty")),
-                )
-                seq_nll = response_length_normalized_mean(log_prob, response_mask)
-                neg_ce = (gate * seq_nll).mean()
-                coef = float(tafr_config.get("negative_ce_coef", 1.0))
-                b_r = tafr_config.get("beta_replay", None)
-                b_r = float(tafr_config.get("beta", 0.0)) if b_r is None else float(b_r)
-                # tafr_output.loss carries b_a*anchor - b_r*replay; drop the replay half
-                # by re-adding it, then subtract the negative-CE term in its place.
-                # replay_loss is None only for variant=anchor_only, where there is no
-                # replay half to remove.
-                replay_half = tafr_output.replay_loss
-                if replay_half is None:
-                    replay_half = torch.zeros_like(tafr_output.loss)
-                policy_loss += tafr_output.loss + b_r * replay_half + coef * b_r * neg_ce
-                metrics["tafr_grpo/negative_ce"] = Metric(value=neg_ce, aggregation=metric_aggregation)
-            else:
-                # The sequence-level FEPO term is intentionally weaker than GSPO.
-                # k3 KL is a second policy objective; applying beta=0.5 at full
-                # strength made it dominate the GSPO gradient in the m04 run.
-                gspo_kl_scale = float(tafr_config.get("gspo_kl_scale", 0.1)) if loss_mode == "gspo" else 1.0
-                policy_loss += gspo_kl_scale * tafr_output.loss
-                if loss_mode == "gspo":
-                    metrics["tafr_grpo/gspo_kl_scale"] = Metric(
-                        value=torch.as_tensor(gspo_kl_scale, device=pg_loss.device), aggregation=AggregationType.MAX
-                    )
-            tafr_metrics = Metric.from_dict(tafr_output.metrics, aggregation=AggregationType.MEAN)
-            metrics.update(tafr_metrics)
-            metrics["tafr_grpo/loss_grpo"] = Metric(value=pg_loss, aggregation=metric_aggregation)
-            # Share of the update attributable to TAFR rather than the policy gradient.
-            # Log the two magnitudes separately and divide post-hoc: mean(a/b) != mean(a)/mean(b),
-            # and a single microbatch with pg_loss ~ 0 sent the averaged ratio to 1463 on the
-            # beta=1.0 arm while grad_norm stayed at a normal 0.18. Plot
-            # tafr_advantage_abs / loss_grpo_abs in the UI instead.
-            metrics["tafr_grpo/loss_grpo_abs"] = Metric(value=pg_loss.detach().abs(), aggregation=metric_aggregation)
-
+    if sdc_enabled:
+        required = ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs")
+        missing = [field for field in required if field not in data]
+        if missing:
+            raise ValueError(f"SDC batch is missing required fields: {missing}")
+        sdc_loss, sdc_stats = compute_sdc_loss(
+            log_prob=log_prob,
+            old_log_prob=old_log_prob,
+            success_log_prob=data["sdc_success_log_probs"],
+            failure_log_prob=data["sdc_failure_log_probs"],
+            response_mask=response_mask,
+            failure_mask=data["sdc_failure_mask"],
+            beta=float(sdc_config.get("beta", 0.0)),
+            loss_agg_mode=loss_agg_mode,
+            global_batch_info=config.global_batch_info,
+            use_importance_weight=bool(sdc_config.get("use_importance_weight", True)),
+            importance_weight_clip=float(sdc_config.get("importance_weight_clip", 10.0)),
+            models_ready=bool(sdc_config.get("sdc_models_ready", False)),
+        )
+        policy_loss = policy_loss + sdc_loss
+        metrics.update(Metric.from_dict(sdc_stats, aggregation=AggregationType.MEAN))
+        metrics["sdc/loss_grpo"] = Metric(value=pg_loss, aggregation=metric_aggregation)
     # add entropy loss
     if entropy is not None:
         entropy_loss = agg_loss(

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Greedy (n=1, temp 0) multi-seed eval of a merged best checkpoint.
-# Usage: ARM=repro|repro-grpo GPU=0 bash examples/tafr_grpo/run_repro_eval.sh
+# Usage: ARM=repro|repro-grpo GPU=0 bash examples/sdc_grpo/run_repro_eval.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 

@@ -69,6 +69,7 @@ from verl.utils.ulysses import (
     ulysses_pad,
     ulysses_pad_and_slice_inputs,
 )
+from verl.experimental.sdc_grpo.sft_trainer import outcome_sft_loss
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
@@ -79,13 +80,11 @@ from .utils import create_device_mesh, get_sharding_strategy
 logger = logging.getLogger(__file__)
 
 
-def tafr_cast_state_to_dest(state: dict, dest_state: dict, param_dtype, device):
+def sdc_cast_state_to_dest(state: dict, dest_state: dict, param_dtype, device):
     """Cast a state dict to the destination module's per-tensor dtypes.
 
-    Forcing one dtype casts BUFFERS too. FSDP runs MixedPrecision(param_dtype=bf16,
-    buffer_dtype=fp32), so a bf16 buffer cast gives a TAFR clone bf16 RoPE inv_freq
-    while the actor uses fp32 -- a systematic log-prob gap that A_reg's RMS matching
-    amplifies ~20x and feeds to the policy as signal.
+    Preserve each destination tensor's dtype so both SDC clones match the actor
+    for parameters and buffers.
     """
     dest_dtypes = {k: v.dtype for k, v in dest_state.items() if torch.is_tensor(v)}
     return {
@@ -661,731 +660,167 @@ class FSDPEngine(BaseEngine):
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
-    def _tafr_actor_state_cpu(self) -> dict[str, torch.Tensor]:
-        def _to_full_cpu(v: torch.Tensor) -> torch.Tensor:
-            full = v.full_tensor() if hasattr(v, "full_tensor") else v
+    def _sdc_actor_state_cpu(self) -> dict[str, torch.Tensor]:
+        def to_cpu(value):
+            full = value.full_tensor() if hasattr(value, "full_tensor") else value
             return full.detach().to(device="cpu", copy=True)
-
-        if (
-            fsdp_version(self.module) == 1
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
-            peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
-            # Materialize/copy while full parameters are still summoned.  Keeping
-            # state_dict tensor views past this context is unsafe: FSDP resharding
-            # invalidates their CUDA storage, which can surface as
-            # CUDA_ERROR_INVALID_VALUE during the later CPU copy (notably for
-            # DeepSeek/Llama full-finetuning).
+        if fsdp_version(self.module) == 1 and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            wrapped = getattr(self.module, "_fsdp_wrapped_module", self.module)
             with FSDP.summon_full_params(self.module, writeback=False):
-                raw = {
-                    k: _to_full_cpu(v)
-                    for k, v in peft_model.state_dict().items()
-                    if torch.is_tensor(v)
-                }
-            return raw
+                return {k: to_cpu(v) for k, v in wrapped.state_dict().items() if torch.is_tensor(v)}
+        return {k: to_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
 
-        return {k: _to_full_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
-
-    def _tafr_clone_trainable_module(self):
+    def _sdc_clone_from_state(self, state: dict[str, torch.Tensor]):
         module = self._build_module()
         if self._is_lora:
             module = self._build_lora_module(module)
-        # Cast to the FSDP mixed-precision param dtype (typically bf16) so that
-        # FlashAttention (fp16/bf16 only) works on cloned anchor/replay/failure models.
-        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
         device = next(self.module.parameters()).device
-        # Cast PARAMETERS only. FSDP's MixedPrecision keeps buffer_dtype=fp32, so
-        # casting buffers here would give the clone bf16 RoPE inv_freq while the
-        # actor uses fp32 -- a systematic log-prob gap that A_reg reads as signal.
-        # Untied models (e.g. DeepSeek-Math) are built on meta tensors by
-        # get_init_weight_context_manager.  Materialize those tensors before
-        # loading the captured CPU state; Module.to() cannot move meta tensors.
         if any(param.is_meta for param in module.parameters()):
             module.to_empty(device=device)
         else:
             module.to(device=device)
+        dtype = next(self.module.parameters()).dtype
         for param in module.parameters():
-            param.data = param.data.to(target_dtype)
+            param.data = param.data.to(dtype)
+        loaded = sdc_cast_state_to_dest(state, module.state_dict(), next(module.parameters()).dtype, device)
+        module.load_state_dict(loaded, strict=False)
+        module.train(True)
+        for param in module.parameters():
+            param.requires_grad_(True)
         return module
 
-    def _tafr_clone_from_state(self, state: dict[str, torch.Tensor], trainable: bool):
-        module = self._tafr_clone_trainable_module()
-        device = next(module.parameters()).device
-        # Match each destination tensor's dtype rather than forcing one dtype, so
-        # fp32 buffers (RoPE inv_freq) stay fp32 exactly as they are on the actor.
-        loaded = tafr_cast_state_to_dest(state, module.state_dict(), next(module.parameters()).dtype, device)
-        missing, unexpected = module.load_state_dict(loaded, strict=False)
-        if self.rank == 0 and (missing or unexpected):
-            logger.warning(f"TAFR clone loaded with missing={len(missing)} unexpected={len(unexpected)} keys")
-        module.train(trainable)
-        for param in module.parameters():
-            param.requires_grad_(trainable)
-        return module
-
-    def _tafr_move_optimizer_state(self, optimizer, device):
+    @staticmethod
+    def _sdc_move_optimizer_state(optimizer, device):
         for state in optimizer.state.values():
-            for key, value in state.items():
+            for value in state.values():
                 if torch.is_tensor(value):
-                    state[key] = value.to(device=device, non_blocking=True)
+                    value.data = value.to(device=device, non_blocking=True)
 
-    def _tafr_uses_vllm_logprobs(self, tafr_config: dict) -> bool:
-        return bool(tafr_config.get("logprob_backend", "hf") == "vllm" and self._is_lora)
-
-    def _tafr_peft_config_dict(self):
-        peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
-        peft_config = getattr(peft_model, "peft_config", {}).get("default", None)
-        if hasattr(peft_config, "to_dict"):
-            return peft_config.to_dict()
-        return peft_config
-
-    def _tafr_actor_lora_state_cpu(self) -> dict[str, torch.Tensor]:
-        params = collect_lora_params(module=self.module, layered_summon=False, base_sync_done=True)
-        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
-        return {k: v.detach().cpu().clone() for k, v in params.items() if torch.is_tensor(v)}
-
-    def _tafr_failure_lora_state_cpu(self) -> dict[str, torch.Tensor]:
-        from peft.utils.save_and_load import get_peft_model_state_dict
-
-        params = get_peft_model_state_dict(self._tafr_failure)
-        params = convert_weight_keys(params, getattr(self._tafr_failure, "base_model", self._tafr_failure))
-        return {k: v.detach().cpu().clone() for k, v in params.items() if torch.is_tensor(v)}
-
-    def _tafr_mix_lora_states(self, ema_state: dict[str, torch.Tensor], eta: float) -> dict[str, torch.Tensor]:
-        lora_tensors = {}
-        for key, ref_value in self._tafr_ref_lora_state.items():
-            if not torch.is_tensor(ref_value):
-                continue
-            ema_value = ema_state.get(key, ref_value)
-            if torch.is_floating_point(ref_value):
-                value = (1.0 - eta) * ref_value + eta * ema_value.to(ref_value.dtype)
-            else:
-                value = ema_value
-            lora_tensors[key] = value.detach().cpu().clone()
-        return lora_tensors
-
-    def tafr_update_failure_ema(self, tafr_config: dict):
-        """Update the failure-model EMA from the current failure-SFT weights.
-
-        Called eagerly after every successful failure-SFT update so the scorer
-        adapter stays fresh without waiting for a disk-checkpoint interval.
-        """
-        self.tafr_init(tafr_config)
-        gamma = float(tafr_config.get("ema_gamma", 0.9))
-        failure_state = {
-            k: v.detach().cpu().clone() for k, v in self._tafr_failure.state_dict().items() if torch.is_tensor(v)
-        }
-        for key, value in failure_state.items():
-            if key not in self._tafr_fail_ema_state:
-                self._tafr_fail_ema_state[key] = value.clone()
-            elif torch.is_floating_point(value):
-                self._tafr_fail_ema_state[key] = gamma * self._tafr_fail_ema_state[key] + (1.0 - gamma) * value
-            else:
-                self._tafr_fail_ema_state[key] = value.clone()
-        if self._is_lora:
-            failure_lora_state = self._tafr_failure_lora_state_cpu()
-            for key, value in failure_lora_state.items():
-                if key not in self._tafr_fail_lora_ema_state:
-                    self._tafr_fail_lora_ema_state[key] = value.clone()
-                elif torch.is_floating_point(value):
-                    self._tafr_fail_lora_ema_state[key] = (
-                        gamma * self._tafr_fail_lora_ema_state[key] + (1.0 - gamma) * value
-                    )
-                else:
-                    self._tafr_fail_lora_ema_state[key] = value.clone()
-        return {"tafr_failure_ema_updated": True}
-
-    def tafr_compute_failure_log_prob(self, data: TensorDict) -> TensorDict:
-        """Score the given response tokens under the frozen failure model (HF path)."""
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        failure_lp = self._tafr_model_log_probs(self._tafr_failure, input_ids, attention_mask, response_mask)
-        return TensorDict({"tafr_failure_log_probs": failure_lp}, batch_size=[failure_lp.shape[0]])
-
-    def tafr_export_vllm_adapters(self, tafr_config: dict):
-        self.tafr_init(tafr_config)
-        if not self._tafr_uses_vllm_logprobs(tafr_config):
-            logger.warning(
-                "TAFR vLLM export disabled: _tafr_uses_vllm_logprobs=False "
-                f"(logprob_backend={tafr_config.get('logprob_backend')!r}, is_lora={self._is_lora})"
-            )
-            return {"enabled": False}
-        eta = float(tafr_config.get("mix_eta", 1.0))
-        peft_config = self._tafr_peft_config_dict()
-        if self._tafr_new_mode(tafr_config):
-            anchor_tensors = self._tafr_mix_lora_states(self._tafr_grpo_lora_ema_state, eta)
-            failure_tensors = self._tafr_mix_lora_states(self._tafr_fail_lora_ema_state, eta)
-            if peft_config is None or not anchor_tensors or not failure_tensors:
-                logger.warning(
-                    "TAFR vLLM export disabled: peft_config=%s anchor_tensors=%d failure_tensors=%d",
-                    "None" if peft_config is None else "ok",
-                    len(anchor_tensors),
-                    len(failure_tensors),
-                )
-                return {"enabled": False}
-            return {
-                "enabled": True,
-                "peft_config": peft_config,
-                "anchor": anchor_tensors,
-                "failure": failure_tensors,
-                "tafr_failure_model_ready": bool(
-                    getattr(self, "_tafr_failure_model_ready", False)
-                    or tafr_config.get("tafr_failure_model_ready", False)
-                ),
-                "tafr_failure_model_update_count": int(
-                    getattr(self, "_tafr_failure_model_update_count", 0)
-                    or tafr_config.get("tafr_failure_model_update_count", 0)
-                ),
-            }
-        anchor_tensors = self._tafr_mix_lora_states(self._tafr_grpo_lora_ema_state, eta)
-        replay_tensors = self._tafr_mix_lora_states(self._tafr_fail_lora_ema_state, eta)
-        if peft_config is None or not anchor_tensors or not replay_tensors:
-            logger.warning(
-                "TAFR vLLM export disabled: peft_config=%s anchor_tensors=%d replay_tensors=%d "
-                "ref_lora_keys=%d grpo_lora_ema_keys=%d (LoRA params not found for export)",
-                "None" if peft_config is None else "ok",
-                len(anchor_tensors),
-                len(replay_tensors),
-                len(getattr(self, "_tafr_ref_lora_state", {})),
-                len(self._tafr_grpo_lora_ema_state),
-            )
-            return {"enabled": False}
-        return {
-            "enabled": True,
-            "peft_config": peft_config,
-            "anchor": anchor_tensors,
-            "replay": replay_tensors,
-        }
-
-    def _tafr_new_mode(self, tafr_config: dict) -> bool:
-        return str(tafr_config.get("loss_version", "failure_token_adv")) == "failure_token_adv"
-
-    def tafr_init(self, tafr_config: dict):
-        if getattr(self, "_tafr_initialized", False):
-            return {"tafr_initialized": True}
-        if self.engine_config.strategy not in ("fsdp", "fsdp2"):
-            raise NotImplementedError("TAFR-GRPO currently supports only FSDP/FSDP2 HF actors.")
-        new_mode = self._tafr_new_mode(tafr_config)
-        ref_state = self._tafr_actor_state_cpu()
-        self._tafr_ref_state = {k: v.clone() for k, v in ref_state.items()}
-        self._tafr_fail_ema_state = {k: v.clone() for k, v in ref_state.items()}
-        self._tafr_grpo_ema_state = {k: v.clone() for k, v in ref_state.items()}
-        if self._is_lora:
-            ref_lora_state = self._tafr_actor_lora_state_cpu()
-            self._tafr_ref_lora_state = {k: v.clone() for k, v in ref_lora_state.items()}
-            self._tafr_fail_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
-            self._tafr_grpo_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
-        # The paper advantage always needs pi_anchor; only the legacy path needs replay.
-        if self._tafr_uses_vllm_logprobs(tafr_config):
-            self._tafr_anchor = None
-        else:
-            self._tafr_anchor = self._tafr_clone_from_state(ref_state, trainable=False)
-        self._tafr_replay = (
-            None
-            if new_mode or self._tafr_uses_vllm_logprobs(tafr_config)
-            else self._tafr_clone_from_state(ref_state, trainable=False)
-        )
-        self._tafr_failure = self._tafr_clone_from_state(ref_state, trainable=True)
-        lr = float(tafr_config.get("failure_sft_lr", 1.0e-6))
-        self._tafr_failure_optimizer = torch.optim.AdamW(
-            [p for p in self._tafr_failure.parameters() if p.requires_grad], lr=lr
-        )
-        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(device=next(self.module.parameters()).device, dtype=target_dtype)
-        self._tafr_tokenizer = None
-        self._tafr_failure_model_ready = bool(tafr_config.get("tafr_failure_model_ready", False))
-        self._tafr_failure_model_update_count = int(tafr_config.get("tafr_failure_model_update_count", 0))
-        self._tafr_initialized = True
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return {"tafr_initialized": True}
-
-    def _tafr_mix_states(self, ema_state: dict[str, torch.Tensor], eta: float) -> dict[str, torch.Tensor]:
-        mixed = {}
-        for key, ref_value in self._tafr_ref_state.items():
-            ema_value = ema_state.get(key, ref_value)
-            if torch.is_floating_point(ref_value):
-                mixed[key] = (1.0 - eta) * ref_value + eta * ema_value.to(ref_value.dtype)
-            else:
-                mixed[key] = ema_value.clone()
-        return mixed
-
-    def _tafr_model_log_probs(self, module, input_ids, attention_mask, response_mask, max_token_len: int = 24576):
-        """Score chosen-token log-probs, length-sorted under a padded-token budget.
-
-        The naive version ran a fixed 16 rows padded to the full width, so a batch
-        of short responses still paid for prompt_len + max_response_len columns.
-        Sorting by true length and trimming each batch to its own longest row cuts
-        the padded tokens roughly in proportion to mean/max length -- typically 3x
-        on this data. Only trailing columns are dropped, and the response block is
-        re-indexed explicitly, so the returned values are unchanged.
-        """
-        module_was_training = module.training
+    def _sdc_model_log_probs(self, module, input_ids, attention_mask, response_mask):
+        was_training = module.training
         module.eval()
-        bsz, width = input_ids.shape
-        response_len = response_mask.shape[-1]
-        prompt_width = width - response_len  # response block is the trailing columns
-        device = input_ids.device
-
-        positions = torch.arange(1, width + 1, device=device).unsqueeze(0)
-        valid_end = (attention_mask * positions).max(dim=-1).values.clamp_min(prompt_width + 1)
-        order = torch.argsort(valid_end, descending=True)
-
-        out = torch.zeros(bsz, response_len, device=device, dtype=torch.float32)
         with torch.no_grad():
-            i = 0
-            while i < bsz:
-                j, batch_width = i, 0
-                while j < bsz:
-                    cand = max(batch_width, int(valid_end[order[j]]))
-                    if j > i and (j - i + 1) * cand > max_token_len:
-                        break
-                    batch_width, j = cand, j + 1
-                idx = order[i:j]
-                ids = input_ids[idx, :batch_width]
-                outputs = module(input_ids=ids, attention_mask=attention_mask[idx, :batch_width], use_cache=False)
-                logits = outputs.logits[:, :-1, :].contiguous()
-                labels = ids[:, 1:].contiguous()
-                flat_lp = logprobs_from_logits(
-                    logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
-                ).view(labels.shape)
-                # label position p predicts column p+1, so response column
-                # prompt_width + t sits at label index prompt_width + t - 1.
-                out[idx, : batch_width - prompt_width] = flat_lp[:, prompt_width - 1 : batch_width - 1].float()
-                i = j
-        module.train(module_was_training)
-        return out.detach()
+            outputs = module(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            logits = outputs.logits[:, :-1].contiguous()
+            labels = input_ids[:, 1:].contiguous()
+            token_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False).view(labels.shape)
+            width = response_mask.shape[-1]
+            prompt_width = input_ids.shape[-1] - width
+            result = torch.zeros(input_ids.shape[0], width, device=input_ids.device, dtype=torch.float32)
+            available = min(width, token_lp.shape[-1] - prompt_width + 1)
+            if available > 0:
+                result[:, :available] = token_lp[:, prompt_width - 1 : prompt_width - 1 + available].float()
+        module.train(was_training)
+        return result.detach()
 
-    def tafr_compute_anchor_log_prob(self, data: TensorDict) -> TensorDict:
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_anchor is None:
-            self._tafr_anchor = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
+    def sdc_init(self, sdc_config: dict):
+        if getattr(self, "_sdc_initialized", False):
+            return {"sdc_initialized": True}
+        if self.engine_config.strategy not in ("fsdp", "fsdp2"):
+            raise NotImplementedError("SDC-GRPO currently supports only FSDP/FSDP2 HF actors.")
+        state = self._sdc_actor_state_cpu()
+        self._sdc_success = self._sdc_clone_from_state(state)
+        self._sdc_failure = self._sdc_clone_from_state(state)
+        lr = float(sdc_config.get("sft_lr", 1e-6))
+        self._sdc_success_optimizer = torch.optim.AdamW(self._sdc_success.parameters(), lr=lr)
+        self._sdc_failure_optimizer = torch.optim.AdamW(self._sdc_failure.parameters(), lr=lr)
+        self._sdc_success_model_update_count = int(sdc_config.get("sdc_success_model_update_count", 0))
+        self._sdc_failure_model_update_count = int(sdc_config.get("sdc_failure_model_update_count", 0))
+        self._sdc_models_ready = bool(sdc_config.get("sdc_models_ready", False))
+        self._sdc_tokenizer = None
+        self._sdc_initialized = True
+        return {"sdc_initialized": True}
+
+    def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
+        config = tu.get_non_tensor_data(data=data, key="custom_sdc_grpo", default={}) or {}
+        self.sdc_init(config)
         padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        anchor_lp = self._tafr_model_log_probs(self._tafr_anchor, input_ids, attention_mask, response_mask)
-        # Score the live actor through the SAME dense path as the anchor/failure
-        # clones. The canonical old_log_probs come from the actor's varlen
-        # remove-padding kernels, and that path difference alone contributes
-        # ~0.03 nats/token -- which A_reg's RMS matching then amplifies ~20x into
-        # a fake signal. A_reg only needs the three log-probs to be mutually
-        # consistent, so give it its own pi_old from this path.
-        old_lp = self._tafr_model_log_probs(self.module, input_ids, attention_mask, response_mask)
-        return TensorDict(
-            {"tafr_anchor_log_probs": anchor_lp, "tafr_old_log_probs": old_lp},
-            batch_size=[anchor_lp.shape[0]],
-        )
-
-    def _tafr_get_tokenizer(self):
-        if self._tafr_tokenizer is None:
-            from transformers import AutoTokenizer
-
-            self._tafr_tokenizer = AutoTokenizer.from_pretrained(
-                self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code
-            )
-            if self._tafr_tokenizer.pad_token_id is None:
-                self._tafr_tokenizer.pad_token = self._tafr_tokenizer.eos_token
-        return self._tafr_tokenizer
-
-    def tafr_compute_replay_log_prob(self, data: TensorDict) -> TensorDict:
-        """Evaluate frozen pi_replay on the actor-generated (pi_old) rollout samples.
-
-        No generation happens here. Responses were already sampled by pi_old during
-        rollout. We just score them under pi_replay so the actor loss can compute:
-            - beta * (1 - r_bar_x) * D_KL(pi_replay || pi_theta)
-        using the same y_i samples used for GRPO and anchor KL.
-        """
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_new_mode(tafr_config):
-            raise RuntimeError("TAFR anchor/replay scoring is not available in failure_token_adv mode.")
-        if self._tafr_replay is None:
-            self._tafr_replay = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_fail_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
-        return TensorDict({"tafr_replay_log_probs": replay_lp}, batch_size=[replay_lp.shape[0]])
-
-    def tafr_compute_anchor_and_replay_log_probs(self, data: TensorDict) -> TensorDict:
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_anchor is None:
-            self._tafr_anchor = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        if self._tafr_replay is None:
-            self._tafr_replay = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_fail_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        anchor_lp = self._tafr_model_log_probs(self._tafr_anchor, input_ids, attention_mask, response_mask)
-        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
-        return TensorDict(
-            {"tafr_anchor_log_probs": anchor_lp, "tafr_replay_log_probs": replay_lp},
-            batch_size=[anchor_lp.shape[0]],
-        )
-
-    def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
-        self.tafr_init(tafr_config)
-        if not records:
-            return {"tafr_grpo/failure_sft_updates": 0.0}
-        tokenizer = self._tafr_get_tokenizer()
-        batch_size = int(tafr_config.get("failure_sft_batch_size", 1))
-        # max_updates caps optimizer steps; defaults to processing all records.
-        max_updates = int(tafr_config.get("failure_sft_max_updates_per_interval", len(records)))
-        updates = 0
-        total_loss = 0.0
         device = next(self.module.parameters()).device
-        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(dtype=target_dtype)
-        self._tafr_move_optimizer_state(self._tafr_failure_optimizer, device)
-        max_seq_len = int(tafr_config.get("max_response_length", 2048))
-        # Gradient checkpointing: recompute activations during backward instead
-        # of storing them. vLLM stays resident on the same GPU (NCCL_CUMEM_ENABLE=0
-        # prevents cumem-based sleep from freeing weights), so activations must be
-        # minimised to avoid OOM.
-        self._tafr_failure.gradient_checkpointing_enable()
-        self._tafr_failure.train()
-        torch.cuda.empty_cache()
-        # Build micro-batches. When failure_sft_max_token_len_per_gpu > 0, pack records
-        # greedily by a padded-token budget (n_rows * max_len_in_batch) so each step
-        # fills the GPU rather than using a fixed row count; otherwise fall back to the
-        # fixed failure_sft_batch_size grouping. Either way cap at max_updates steps.
-        max_token_len = int(tafr_config.get("failure_sft_max_token_len_per_gpu", 0))
-        if max_token_len > 0:
-            lengths = [
-                len(
-                    tokenizer(
-                        str(r["prompt"]) + str(r["wrong_response"]),
-                        truncation=True,
-                        max_length=max_seq_len,
-                    )["input_ids"]
-                )
-                for r in records
-            ]
-            order = sorted(range(len(records)), key=lambda i: lengths[i])
-            micro_batches: list[list[dict]] = []
-            cur: list[int] = []
-            cur_max = 0
-            for i in order:
-                new_max = max(cur_max, lengths[i])
-                if cur and (len(cur) + 1) * new_max > max_token_len:
-                    micro_batches.append([records[j] for j in cur])
-                    cur, cur_max = [i], lengths[i]
-                else:
-                    cur.append(i)
-                    cur_max = new_max
-            if cur:
-                micro_batches.append([records[j] for j in cur])
-            micro_batches = micro_batches[:max_updates]
-        else:
-            micro_batches = [
-                records[start : start + batch_size]
-                for start in range(0, min(len(records), batch_size * max_updates), batch_size)
-            ]
-        for chunk in micro_batches:
-            texts = [str(r["prompt"]) + str(r["wrong_response"]) for r in chunk]
-            prompts = [str(r["prompt"]) for r in chunk]
-            enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(
-                device
-            )
-            prompt_enc = tokenizer(
-                prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len
-            ).to(device)
-            prompt_lens = prompt_enc["attention_mask"].sum(dim=-1)
-            outputs = self._tafr_failure(**enc, use_cache=False)
-            logits = outputs.logits[:, :-1, :].contiguous()
-            labels = enc["input_ids"][:, 1:].contiguous()
-            flat_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False)
-            log_probs = flat_lp.view(labels.shape)
-            token_positions = torch.arange(log_probs.shape[-1], device=device).unsqueeze(0)
-            response_mask = (token_positions >= (prompt_lens - 1).unsqueeze(1)) & enc["attention_mask"][:, 1:].bool()
-            denom = response_mask.sum(dim=-1).clamp_min(1).float()
-            loss = -((log_probs * response_mask).sum(dim=-1) / denom).mean()
-            self._tafr_failure_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self._tafr_failure_optimizer.step()
-            total_loss += float(loss.detach().cpu())
-            updates += 1
-        self._tafr_failure.gradient_checkpointing_disable()
-        self._tafr_move_optimizer_state(self._tafr_failure_optimizer, torch.device("cpu"))
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return {
-            "tafr_grpo/failure_sft_updates": float(updates),
-            "tafr_grpo/failure_sft_loss": total_loss / max(updates, 1),
-        }
+        ids = padded["input_ids"].to(device)
+        attention = padded["attention_mask"].to(device)
+        response = padded["response_mask"].to(device)
+        active = padded.get("sdc_failure_mask", torch.ones(ids.shape[0], dtype=torch.bool, device=device)).to(device).bool()
+        success = torch.zeros_like(response, dtype=torch.float32)
+        failure = torch.zeros_like(response, dtype=torch.float32)
+        if bool(active.any()):
+            active_ids, active_attention, active_response = ids[active], attention[active], response[active]
+            success[active] = self._sdc_model_log_probs(self._sdc_success, active_ids, active_attention, active_response)
+            failure[active] = self._sdc_model_log_probs(self._sdc_failure, active_ids, active_attention, active_response)
+        return TensorDict({"sdc_success_log_probs": success, "sdc_failure_log_probs": failure}, batch_size=[ids.shape[0]])
 
-    def tafr_save_and_refresh(self, local_path: str, global_step: int, failure_model_changed: bool, tafr_config: dict):
-        self.tafr_init(tafr_config)
-        os.makedirs(local_path, exist_ok=True)
-        # Disk writes are throttled independently of EMA/adapter freshness: the
-        # failure EMA and scorer adapter are updated eagerly after every failure-SFT
-        # update (tafr_update_failure_ema), while tafr_state.pt / failure model /
-        # optimizer are written only when due. Old global_step dirs are rotated away
-        # by the trainer, so the last save replaces the previous.
-        save_interval = int(tafr_config.get("save_to_disk_interval_grpo_steps", 0))
-        save_to_disk = save_interval <= 0 or (global_step % save_interval == 0)
-        save_optimizer = bool(tafr_config.get("save_failure_sft_optimizer", True))
-        new_mode = self._tafr_new_mode(tafr_config)
-        gamma = float(tafr_config.get("ema_gamma", 0.9))
-        eta = float(tafr_config.get("mix_eta", 1.0))
-        failure_dir = os.path.join(local_path, "failure_sft")
-        if save_to_disk and self.rank == 0:
-            os.makedirs(failure_dir, exist_ok=True)
-            torch.save(self._tafr_failure.state_dict(), os.path.join(failure_dir, "pytorch_model.bin"))
-            if save_optimizer:
-                torch.save(self._tafr_failure_optimizer.state_dict(), os.path.join(failure_dir, "optimizer.pt"))
-        # Refresh the lagged actor EMA used by pi_anchor in every TAFR mode.
-        actor_state = self._tafr_actor_state_cpu()
-        for key, value in actor_state.items():
-            if torch.is_floating_point(value):
-                self._tafr_grpo_ema_state[key] = gamma * self._tafr_grpo_ema_state[key] + (1.0 - gamma) * value
-            else:
-                self._tafr_grpo_ema_state[key] = value.clone()
-        if self._is_lora:
-            actor_lora_state = self._tafr_actor_lora_state_cpu()
-            for key, value in actor_lora_state.items():
-                if torch.is_floating_point(value):
-                    self._tafr_grpo_lora_ema_state[key] = (
-                        gamma * self._tafr_grpo_lora_ema_state[key] + (1.0 - gamma) * value
-                    )
-                else:
-                    self._tafr_grpo_lora_ema_state[key] = value.clone()
-        anchor_state = self._tafr_mix_states(self._tafr_grpo_ema_state, eta)
-        if self._tafr_uses_vllm_logprobs(tafr_config):
-            self._tafr_anchor = None
-        else:
-            self._tafr_anchor = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            self._tafr_anchor = self._tafr_clone_from_state(anchor_state, trainable=False)
-        if new_mode:
-            self._tafr_replay = None
-        else:
-            replay_state = self._tafr_mix_states(self._tafr_fail_ema_state, eta)
-            self._tafr_replay = (
-                None
-                if self._tafr_uses_vllm_logprobs(tafr_config)
-                else self._tafr_clone_from_state(replay_state, trainable=False)
-            )
-        if self.rank == 0:
-            save_dict = {
-                "global_step": global_step,
-                "ema_gamma": gamma,
-                "mix_eta": eta,
-                "failure_model_changed": bool(failure_model_changed),
-                "fail_ema_state": self._tafr_fail_ema_state,
-                "failure_model_ready": bool(
-                    getattr(self, "_tafr_failure_model_ready", False)
-                    or tafr_config.get("tafr_failure_model_ready", False)
-                ),
-                "failure_model_update_count": int(
-                    getattr(self, "_tafr_failure_model_update_count", 0)
-                    or tafr_config.get("tafr_failure_model_update_count", 0)
-                ),
-            }
-            if self._is_lora:
-                save_dict["fail_lora_ema_state"] = self._tafr_fail_lora_ema_state
-            save_dict["grpo_ema_state"] = self._tafr_grpo_ema_state
-            if self._is_lora:
-                save_dict["grpo_lora_ema_state"] = self._tafr_grpo_lora_ema_state
-            if save_to_disk:
-                torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
-        return {"tafr_refreshed": True, "tafr_failure_ema_updated": bool(failure_model_changed)}
+    def _sdc_get_tokenizer(self):
+        if self._sdc_tokenizer is None:
+            from transformers import AutoTokenizer
+            self._sdc_tokenizer = AutoTokenizer.from_pretrained(self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code)
+            if self._sdc_tokenizer.pad_token_id is None:
+                self._sdc_tokenizer.pad_token = self._sdc_tokenizer.eos_token
+        return self._sdc_tokenizer
 
-    def tafr_load(self, local_path: str, tafr_config: dict | None = None):
-        state_path = os.path.join(local_path, "tafr_state.pt")
-        failure_path = os.path.join(local_path, "failure_sft", "pytorch_model.bin")
-        optimizer_path = os.path.join(local_path, "failure_sft", "optimizer.pt")
-        tafr_config = tafr_config or {}
-        self.tafr_init(tafr_config)
-        if os.path.exists(state_path):
-            state = torch.load(state_path, map_location="cpu")
-            self._tafr_grpo_ema_state = state.get("grpo_ema_state", self._tafr_grpo_ema_state)
-            self._tafr_fail_ema_state = state.get("fail_ema_state", self._tafr_fail_ema_state)
-            if self._is_lora:
-                self._tafr_grpo_lora_ema_state = state.get(
-                    "grpo_lora_ema_state", self._tafr_grpo_lora_ema_state
-                )
-                self._tafr_fail_lora_ema_state = state.get("fail_lora_ema_state", self._tafr_fail_lora_ema_state)
-            self._tafr_failure_model_ready = bool(state.get("failure_model_ready", False))
-            self._tafr_failure_model_update_count = int(state.get("failure_model_update_count", 0))
-        if os.path.exists(failure_path):
-            loaded = torch.load(failure_path, map_location="cpu")
-            self._tafr_failure.load_state_dict(loaded, strict=False)
-        if os.path.exists(optimizer_path):
-            optimizer_state = torch.load(optimizer_path, map_location="cpu")
-            self._tafr_failure_optimizer.load_state_dict(optimizer_state)
-            self._tafr_move_optimizer_state(self._tafr_failure_optimizer, torch.device("cpu"))
-        if not self._tafr_uses_vllm_logprobs(tafr_config):
-            self._tafr_anchor = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            self._tafr_anchor = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        return {
-            "tafr_loaded": os.path.exists(state_path),
-            "tafr_failure_model_ready": bool(getattr(self, "_tafr_failure_model_ready", False)),
-            "tafr_failure_model_update_count": int(getattr(self, "_tafr_failure_model_update_count", 0)),
-        }
+    def _sdc_sft_model(self, model, optimizer, records: list[dict], prefix: str, config: dict):
+        if not records:
+            return {f"sdc/{prefix}_sft_updates": 0.0}
+        tokenizer = self._sdc_get_tokenizer()
+        device = next(self.module.parameters()).device
+        batch_size = int(config.get("sft_batch_size", 8)); max_updates = int(config.get("sft_max_updates_per_interval", 1)); max_length = int(config.get("max_response_length", 2048))
+        token_budget = int(config.get("sft_max_token_len_per_gpu", 0) or 0)
+        if token_budget > 0:
+            batch_size = min(batch_size, max(1, token_budget // max_length))
+        total, updates = 0.0, 0
+        for start in range(0, min(len(records), batch_size * max_updates), batch_size):
+            chunks = records[start : start + batch_size]; rows = []; masks = []
+            for record in chunks:
+                prompt = [{"role": "user", "content": str(record["prompt"])}]
+                full = prompt + [{"role": "assistant", "content": str(record["response"])}]
+                prompt_ids = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+                ids = torch.as_tensor(tokenizer.apply_chat_template(full, add_generation_prompt=False, tokenize=True)[:max_length], dtype=torch.long)
+                mask = torch.zeros_like(ids); mask[min(len(prompt_ids), ids.numel()) :] = 1; rows.append(ids); masks.append(mask)
+            width = max(row.numel() for row in rows); pad_id = tokenizer.pad_token_id or 0
+            ids = torch.full((len(rows), width), pad_id, dtype=torch.long, device=device); attention = torch.zeros_like(ids); response = torch.zeros_like(ids)
+            for i, row in enumerate(rows):
+                ids[i, : row.numel()] = row.to(device); attention[i, : row.numel()] = 1; response[i, : row.numel()] = masks[i].to(device)
+            output = model(input_ids=ids, attention_mask=attention, use_cache=False); logits = output.logits[:, :-1]; labels = ids[:, 1:]
+            token_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False).view(labels.shape); mask = response[:, 1:].bool(); loss = outcome_sft_loss(token_lp, mask)
+            optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step(); total += float(loss.detach().cpu()); updates += 1
+        return {f"sdc/{prefix}_sft_updates": float(updates), f"sdc/{prefix}_sft_loss": total / max(updates, 1)}
 
-    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
-        raise NotImplementedError("forward_step must be implemented in subclass")
+    def sdc_sft_update(self, success_records: list[dict], failure_records: list[dict], config: dict):
+        self.sdc_init(config)
+        success = self._sdc_sft_model(self._sdc_success, self._sdc_success_optimizer, success_records, "success", config)
+        failure = self._sdc_sft_model(self._sdc_failure, self._sdc_failure_optimizer, failure_records, "failure", config)
+        self._sdc_success_model_update_count += int(success["sdc/success_sft_updates"]); self._sdc_failure_model_update_count += int(failure["sdc/failure_sft_updates"])
+        minimum = int(config.get("min_sft_updates_before_use", 1)); self._sdc_models_ready = self._sdc_success_model_update_count >= minimum and self._sdc_failure_model_update_count >= minimum
+        return {**success, **failure, "sdc/success_model_update_count": float(self._sdc_success_model_update_count), "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count), "sdc/models_ready": float(self._sdc_models_ready)}
 
-    def optimizer_zero_grad(self):
-        """
-        Zero gradients and enforce FSDP grad-clipping logic.
-        """
-        # Start of a logical batch: reset the step counters that prove exactly one
-        # optimizer step follows.
-        self._optimizer_step_calls = 0
-        self._optimizer_steps_skipped_nonfinite = 0
-        self.optimizer.zero_grad()
+    def _sdc_peft_state(self, model):
+        from peft.utils.save_and_load import get_peft_model_state_dict
+        return {k: v.detach().cpu().clone() for k, v in get_peft_model_state_dict(model).items() if torch.is_tensor(v)}
 
-    def grad_norm_only(self) -> float:
-        """Total gradient norm WITHOUT touching the gradients.
+    def sdc_export_vllm_adapters(self, config: dict):
+        self.sdc_init(config)
+        if config.get("logprob_backend") != "vllm" or not self._is_lora:
+            return {"enabled": False}
+        wrapped = getattr(self.module, "_fsdp_wrapped_module", self.module); peft_config = getattr(wrapped, "peft_config", {}).get("default", None)
+        if hasattr(peft_config, "to_dict"): peft_config = peft_config.to_dict()
+        return {"enabled": True, "peft_config": peft_config, "success": self._sdc_peft_state(self._sdc_success), "failure": self._sdc_peft_state(self._sdc_failure)}
 
-        Same FSDP-version dispatch as `optimizer_step`'s clip, but with a max-norm large
-        enough that the clip coefficient always clamps to 1.0, so grads are scaled by
-        exactly 1.0 (a no-op). Lets a caller read ONE contribution's norm when several
-        backward passes accumulate into a single optimizer step.
-        """
-        big = 1e30
-        if isinstance(self.module, FSDP):
-            grad_norm = self.module.clip_grad_norm_(big)
-        elif isinstance(self.module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=big)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.module.parameters(), max_norm=big)
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
-        return float(grad_norm)
+    def sdc_save_checkpoint(self, local_path: str, global_step: int, config: dict):
+        self.sdc_init(config); os.makedirs(local_path, exist_ok=True)
+        for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
+            directory = os.path.join(local_path, f"{name}_sft"); os.makedirs(directory, exist_ok=True); torch.save(model.state_dict(), os.path.join(directory, "pytorch_model.bin"))
+            if bool(config.get("save_sft_optimizers", True)): torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt"))
+        torch.save({"global_step": global_step, "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}, os.path.join(local_path, "sdc_state.pt"))
+        return {"sdc_saved": True, "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}
 
-    def optimizer_step(self, clip_grad_override: Optional[float] = None):
-        """
-        Clip gradients, skip update if non-finite, and step optimizer.
-
-        Args:
-            clip_grad_override: If provided, use this gradient-clip max-norm
-                instead of `self.optimizer_config.clip_grad`. Lets a caller
-                that shares this engine's optimizer (e.g. an auxiliary loss's
-                update) apply a tighter trust region than the main step.
-
-        Returns:
-            grad_norm (float): Norm of gradients before clipping.
-        """
-        clip_grad = clip_grad_override if clip_grad_override is not None else self.optimizer_config.clip_grad
-        assert clip_grad is not None
-
-        # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__.
-        scaler = getattr(self, "scaler", None)
-
-        # Unscale gradients before clip so the clip threshold is applied to true gradient
-        # magnitudes, not scaled ones. scaler.step() will skip the update if any grad is inf/nan.
-        if scaler is not None:
-            scaler.unscale_(self.optimizer)
-
-        if isinstance(self.module, FSDP):
-            grad_norm = self.module.clip_grad_norm_(clip_grad)
-        elif isinstance(self.module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=clip_grad)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.module.parameters(), max_norm=clip_grad)
-
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
-
-        stepped = False
-        if scaler is not None:
-            # scaler handles inf/nan skipping internally via _check_inf_per_device.
-            scaler.step(self.optimizer)
-            scaler.update()
-            stepped = torch.isfinite(grad_norm).item()
-        else:
-            # if grad_norm is not finite, skip the update
-            if not torch.isfinite(grad_norm):
-                print(f"WARN: grad_norm is not finite: {grad_norm}")
-                self.optimizer.zero_grad()
-            else:
-                self.optimizer.step()
-                stepped = True
-
-        # Observable proof of the one-step-per-logical-batch invariant. Both counters
-        # are reset by optimizer_zero_grad, so they report per logical batch, and are
-        # surfaced as optimization/* metrics.
-        self._optimizer_step_calls = getattr(self, "_optimizer_step_calls", 0) + 1
-        if not stepped:
-            self._optimizer_steps_skipped_nonfinite = getattr(self, "_optimizer_steps_skipped_nonfinite", 0) + 1
-
-        if self._qat_enabled:
-            from verl.utils.qat.core import invalidate_all_scales
-
-            invalidate_all_scales(self.module)
-
-        exploration = getattr(self, "exploration", None)
-        if stepped and exploration is not None:
-            exploration.after_optimizer_step(self.module)
-
-        return grad_norm.item()
-
-    def lr_scheduler_step(self):
-        """
-        Advance FSDP scheduler and return updated learning rate.
-        """
-        self.lr_scheduler.step()
-        lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
-        return lr
-
-    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
-        """
-        Move FSDP model and/or optimizer to CPU or GPU with offload support.
-        Note that this function executes irrespective of offload config. It serves as manual control
-        """
-        super().to(device=device, model=model, optimizer=optimizer, grad=grad)
-
-        if self.engine_config.forward_only:
-            # force cpu_offload
-            return
-
-        device_name = get_device_name()
-
-        assert device in (device_name, "cpu")
-        if device == device_name:
-            if model:
-                load_fsdp_model_to_gpu(self.module)
-            if optimizer and self.optimizer is not None:
-                load_fsdp_optimizer(self.optimizer, device)
-            gc.collect()
-        elif device == "cpu":
-            if model:
-                offload_fsdp_model_to_cpu(self.module)
-            if optimizer and self.optimizer is not None:
-                offload_fsdp_optimizer(self.optimizer)
-        else:
-            raise ValueError(f"Invalid device type: {device}")
-
+    def sdc_load(self, local_path: str, config: dict | None = None):
+        config = config or {}; self.sdc_init(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
+        for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
+            directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
+            if os.path.exists(model_path): model.load_state_dict(torch.load(model_path, map_location="cpu"), strict=False)
+            if os.path.exists(optimizer_path):
+                optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
+                self._sdc_move_optimizer_state(optimizer, next(model.parameters()).device)
+        return {"sdc_loaded": os.path.exists(state_path), "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}
     def save_checkpoint(
         self,
         local_path: str,
@@ -1870,461 +1305,167 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         return model_output
 
-    def _tafr_actor_state_cpu(self) -> dict[str, torch.Tensor]:
-        def _to_full_cpu(v: torch.Tensor) -> torch.Tensor:
-            full = v.full_tensor() if hasattr(v, "full_tensor") else v
+    def _sdc_actor_state_cpu(self) -> dict[str, torch.Tensor]:
+        def to_cpu(value):
+            full = value.full_tensor() if hasattr(value, "full_tensor") else value
             return full.detach().to(device="cpu", copy=True)
-
-        if (
-            fsdp_version(self.module) == 1
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
-            peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
-            # Materialize/copy while full parameters are still summoned.  Keeping
-            # state_dict tensor views past this context is unsafe: FSDP resharding
-            # invalidates their CUDA storage, which can surface as
-            # CUDA_ERROR_INVALID_VALUE during the later CPU copy (notably for
-            # DeepSeek/Llama full-finetuning).
+        if fsdp_version(self.module) == 1 and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            wrapped = getattr(self.module, "_fsdp_wrapped_module", self.module)
             with FSDP.summon_full_params(self.module, writeback=False):
-                raw = {
-                    k: _to_full_cpu(v)
-                    for k, v in peft_model.state_dict().items()
-                    if torch.is_tensor(v)
-                }
-            return raw
+                return {k: to_cpu(v) for k, v in wrapped.state_dict().items() if torch.is_tensor(v)}
+        return {k: to_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
 
-        return {k: _to_full_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
-
-    def _tafr_clone_trainable_module(self):
+    def _sdc_clone_from_state(self, state: dict[str, torch.Tensor]):
         module = self._build_module()
         if self._is_lora:
             module = self._build_lora_module(module)
-        # Cast to the FSDP mixed-precision param dtype (typically bf16) so that
-        # FlashAttention (fp16/bf16 only) works on cloned anchor/replay/failure models.
-        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
         device = next(self.module.parameters()).device
-        # Cast PARAMETERS only. FSDP's MixedPrecision keeps buffer_dtype=fp32, so
-        # casting buffers here would give the clone bf16 RoPE inv_freq while the
-        # actor uses fp32 -- a systematic log-prob gap that A_reg reads as signal.
-        # Untied models (e.g. DeepSeek-Math) are built on meta tensors by
-        # get_init_weight_context_manager.  Materialize those tensors before
-        # loading the captured CPU state; Module.to() cannot move meta tensors.
         if any(param.is_meta for param in module.parameters()):
             module.to_empty(device=device)
         else:
             module.to(device=device)
+        dtype = next(self.module.parameters()).dtype
         for param in module.parameters():
-            param.data = param.data.to(target_dtype)
+            param.data = param.data.to(dtype)
+        loaded = sdc_cast_state_to_dest(state, module.state_dict(), next(module.parameters()).dtype, device)
+        module.load_state_dict(loaded, strict=False)
+        module.train(True)
+        for param in module.parameters():
+            param.requires_grad_(True)
         return module
 
-    def _tafr_clone_from_state(self, state: dict[str, torch.Tensor], trainable: bool):
-        module = self._tafr_clone_trainable_module()
-        device = next(module.parameters()).device
-        # Match each destination tensor's dtype rather than forcing one dtype, so
-        # fp32 buffers (RoPE inv_freq) stay fp32 exactly as they are on the actor.
-        loaded = tafr_cast_state_to_dest(state, module.state_dict(), next(module.parameters()).dtype, device)
-        missing, unexpected = module.load_state_dict(loaded, strict=False)
-        if self.rank == 0 and (missing or unexpected):
-            logger.warning(f"TAFR clone loaded with missing={len(missing)} unexpected={len(unexpected)} keys")
-        module.train(trainable)
-        for param in module.parameters():
-            param.requires_grad_(trainable)
-        return module
-
-    def _tafr_move_optimizer_state(self, optimizer, device):
+    @staticmethod
+    def _sdc_move_optimizer_state(optimizer, device):
         for state in optimizer.state.values():
-            for key, value in state.items():
+            for value in state.values():
                 if torch.is_tensor(value):
-                    state[key] = value.to(device=device, non_blocking=True)
+                    value.data = value.to(device=device, non_blocking=True)
 
-    def tafr_init(self, tafr_config: dict):
-        if getattr(self, "_tafr_initialized", False):
-            return {"tafr_initialized": True}
-        if self.engine_config.strategy not in ("fsdp", "fsdp2"):
-            raise NotImplementedError("TAFR-GRPO currently supports only FSDP/FSDP2 HF actors.")
-        new_mode = self._tafr_new_mode(tafr_config)
-        ref_state = self._tafr_actor_state_cpu()
-        self._tafr_ref_state = {k: v.clone() for k, v in ref_state.items()}
-        self._tafr_fail_ema_state = {k: v.clone() for k, v in ref_state.items()}
-        self._tafr_grpo_ema_state = {k: v.clone() for k, v in ref_state.items()}
-        if self._is_lora:
-            ref_lora_state = self._tafr_actor_lora_state_cpu()
-            self._tafr_ref_lora_state = {k: v.clone() for k, v in ref_lora_state.items()}
-            self._tafr_fail_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
-            self._tafr_grpo_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
-        # The paper advantage always needs pi_anchor; only the legacy path needs replay.
-        if self._tafr_uses_vllm_logprobs(tafr_config):
-            self._tafr_anchor = None
-        else:
-            self._tafr_anchor = self._tafr_clone_from_state(ref_state, trainable=False)
-        self._tafr_replay = (
-            None
-            if new_mode or self._tafr_uses_vllm_logprobs(tafr_config)
-            else self._tafr_clone_from_state(ref_state, trainable=False)
-        )
-        self._tafr_failure = self._tafr_clone_from_state(ref_state, trainable=True)
-        lr = float(tafr_config.get("failure_sft_lr", 1.0e-6))
-        self._tafr_failure_optimizer = torch.optim.AdamW(
-            [p for p in self._tafr_failure.parameters() if p.requires_grad], lr=lr
-        )
-        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(device=next(self.module.parameters()).device, dtype=target_dtype)
-        self._tafr_tokenizer = None
-        self._tafr_failure_model_ready = bool(tafr_config.get("tafr_failure_model_ready", False))
-        self._tafr_failure_model_update_count = int(tafr_config.get("tafr_failure_model_update_count", 0))
-        self._tafr_initialized = True
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return {"tafr_initialized": True}
-
-    def _tafr_mix_states(self, ema_state: dict[str, torch.Tensor], eta: float) -> dict[str, torch.Tensor]:
-        mixed = {}
-        for key, ref_value in self._tafr_ref_state.items():
-            ema_value = ema_state.get(key, ref_value)
-            if torch.is_floating_point(ref_value):
-                mixed[key] = (1.0 - eta) * ref_value + eta * ema_value.to(ref_value.dtype)
-            else:
-                mixed[key] = ema_value.clone()
-        return mixed
-
-    def _tafr_model_log_probs(self, module, input_ids, attention_mask, response_mask, max_token_len: int = 24576):
-        """Score chosen-token log-probs, length-sorted under a padded-token budget.
-
-        The naive version ran a fixed 16 rows padded to the full width, so a batch
-        of short responses still paid for prompt_len + max_response_len columns.
-        Sorting by true length and trimming each batch to its own longest row cuts
-        the padded tokens roughly in proportion to mean/max length -- typically 3x
-        on this data. Only trailing columns are dropped, and the response block is
-        re-indexed explicitly, so the returned values are unchanged.
-        """
-        module_was_training = module.training
+    def _sdc_model_log_probs(self, module, input_ids, attention_mask, response_mask):
+        was_training = module.training
         module.eval()
-        bsz, width = input_ids.shape
-        response_len = response_mask.shape[-1]
-        prompt_width = width - response_len  # response block is the trailing columns
-        device = input_ids.device
-
-        positions = torch.arange(1, width + 1, device=device).unsqueeze(0)
-        valid_end = (attention_mask * positions).max(dim=-1).values.clamp_min(prompt_width + 1)
-        order = torch.argsort(valid_end, descending=True)
-
-        out = torch.zeros(bsz, response_len, device=device, dtype=torch.float32)
         with torch.no_grad():
-            i = 0
-            while i < bsz:
-                j, batch_width = i, 0
-                while j < bsz:
-                    cand = max(batch_width, int(valid_end[order[j]]))
-                    if j > i and (j - i + 1) * cand > max_token_len:
-                        break
-                    batch_width, j = cand, j + 1
-                idx = order[i:j]
-                ids = input_ids[idx, :batch_width]
-                outputs = module(input_ids=ids, attention_mask=attention_mask[idx, :batch_width], use_cache=False)
-                logits = outputs.logits[:, :-1, :].contiguous()
-                labels = ids[:, 1:].contiguous()
-                flat_lp = logprobs_from_logits(
-                    logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
-                ).view(labels.shape)
-                # label position p predicts column p+1, so response column
-                # prompt_width + t sits at label index prompt_width + t - 1.
-                out[idx, : batch_width - prompt_width] = flat_lp[:, prompt_width - 1 : batch_width - 1].float()
-                i = j
-        module.train(module_was_training)
-        return out.detach()
+            outputs = module(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            logits = outputs.logits[:, :-1].contiguous()
+            labels = input_ids[:, 1:].contiguous()
+            token_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False).view(labels.shape)
+            width = response_mask.shape[-1]
+            prompt_width = input_ids.shape[-1] - width
+            result = torch.zeros(input_ids.shape[0], width, device=input_ids.device, dtype=torch.float32)
+            available = min(width, token_lp.shape[-1] - prompt_width + 1)
+            if available > 0:
+                result[:, :available] = token_lp[:, prompt_width - 1 : prompt_width - 1 + available].float()
+        module.train(was_training)
+        return result.detach()
 
-    def tafr_compute_anchor_log_prob(self, data: TensorDict) -> TensorDict:
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_anchor is None:
-            self._tafr_anchor = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
+    def sdc_init(self, sdc_config: dict):
+        if getattr(self, "_sdc_initialized", False):
+            return {"sdc_initialized": True}
+        if self.engine_config.strategy not in ("fsdp", "fsdp2"):
+            raise NotImplementedError("SDC-GRPO currently supports only FSDP/FSDP2 HF actors.")
+        state = self._sdc_actor_state_cpu()
+        self._sdc_success = self._sdc_clone_from_state(state)
+        self._sdc_failure = self._sdc_clone_from_state(state)
+        lr = float(sdc_config.get("sft_lr", 1e-6))
+        self._sdc_success_optimizer = torch.optim.AdamW(self._sdc_success.parameters(), lr=lr)
+        self._sdc_failure_optimizer = torch.optim.AdamW(self._sdc_failure.parameters(), lr=lr)
+        self._sdc_success_model_update_count = int(sdc_config.get("sdc_success_model_update_count", 0))
+        self._sdc_failure_model_update_count = int(sdc_config.get("sdc_failure_model_update_count", 0))
+        self._sdc_models_ready = bool(sdc_config.get("sdc_models_ready", False))
+        self._sdc_tokenizer = None
+        self._sdc_initialized = True
+        return {"sdc_initialized": True}
+
+    def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
+        config = tu.get_non_tensor_data(data=data, key="custom_sdc_grpo", default={}) or {}
+        self.sdc_init(config)
         padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        anchor_lp = self._tafr_model_log_probs(self._tafr_anchor, input_ids, attention_mask, response_mask)
-        # Score the live actor through the SAME dense path as the anchor/failure
-        # clones. The canonical old_log_probs come from the actor's varlen
-        # remove-padding kernels, and that path difference alone contributes
-        # ~0.03 nats/token -- which A_reg's RMS matching then amplifies ~20x into
-        # a fake signal. A_reg only needs the three log-probs to be mutually
-        # consistent, so give it its own pi_old from this path.
-        old_lp = self._tafr_model_log_probs(self.module, input_ids, attention_mask, response_mask)
-        return TensorDict(
-            {"tafr_anchor_log_probs": anchor_lp, "tafr_old_log_probs": old_lp},
-            batch_size=[anchor_lp.shape[0]],
-        )
-
-    def _tafr_get_tokenizer(self):
-        if self._tafr_tokenizer is None:
-            from transformers import AutoTokenizer
-
-            self._tafr_tokenizer = AutoTokenizer.from_pretrained(
-                self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code
-            )
-            if self._tafr_tokenizer.pad_token_id is None:
-                self._tafr_tokenizer.pad_token = self._tafr_tokenizer.eos_token
-        return self._tafr_tokenizer
-
-    def tafr_compute_replay_log_prob(self, data: TensorDict) -> TensorDict:
-        """Evaluate frozen pi_replay on the actor-generated (pi_old) rollout samples.
-
-        No generation happens here. Responses were already sampled by pi_old during
-        rollout. We just score them under pi_replay so the actor loss can compute:
-            - beta * (1 - r_bar_x) * D_KL(pi_replay || pi_theta)
-        using the same y_i samples used for GRPO and anchor KL.
-        """
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_new_mode(tafr_config):
-            raise RuntimeError("TAFR anchor/replay scoring is not available in failure_token_adv mode.")
-        if self._tafr_replay is None:
-            self._tafr_replay = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_fail_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
-        return TensorDict({"tafr_replay_log_probs": replay_lp}, batch_size=[replay_lp.shape[0]])
-
-    def tafr_compute_anchor_and_replay_log_probs(self, data: TensorDict) -> TensorDict:
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_anchor is None:
-            self._tafr_anchor = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        if self._tafr_replay is None:
-            self._tafr_replay = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_fail_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        anchor_lp = self._tafr_model_log_probs(self._tafr_anchor, input_ids, attention_mask, response_mask)
-        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
-        return TensorDict(
-            {"tafr_anchor_log_probs": anchor_lp, "tafr_replay_log_probs": replay_lp},
-            batch_size=[anchor_lp.shape[0]],
-        )
-
-    def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
-        self.tafr_init(tafr_config)
-        if not records:
-            return {"tafr_grpo/failure_sft_updates": 0.0}
-        tokenizer = self._tafr_get_tokenizer()
-        batch_size = int(tafr_config.get("failure_sft_batch_size", 1))
-        # max_updates caps optimizer steps; defaults to processing all records.
-        max_updates = int(tafr_config.get("failure_sft_max_updates_per_interval", len(records)))
-        updates = 0
-        total_loss = 0.0
         device = next(self.module.parameters()).device
-        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(dtype=target_dtype)
-        self._tafr_move_optimizer_state(self._tafr_failure_optimizer, device)
-        max_seq_len = int(tafr_config.get("max_response_length", 2048))
-        # Gradient checkpointing: recompute activations during backward instead
-        # of storing them. vLLM stays resident on the same GPU (NCCL_CUMEM_ENABLE=0
-        # prevents cumem-based sleep from freeing weights), so activations must be
-        # minimised to avoid OOM.
-        self._tafr_failure.gradient_checkpointing_enable()
-        self._tafr_failure.train()
-        torch.cuda.empty_cache()
-        # Build micro-batches. When failure_sft_max_token_len_per_gpu > 0, pack records
-        # greedily by a padded-token budget (n_rows * max_len_in_batch) so each step
-        # fills the GPU rather than using a fixed row count; otherwise fall back to the
-        # fixed failure_sft_batch_size grouping. Either way cap at max_updates steps.
-        max_token_len = int(tafr_config.get("failure_sft_max_token_len_per_gpu", 0))
-        if max_token_len > 0:
-            lengths = [
-                len(
-                    tokenizer(
-                        str(r["prompt"]) + str(r["wrong_response"]),
-                        truncation=True,
-                        max_length=max_seq_len,
-                    )["input_ids"]
-                )
-                for r in records
-            ]
-            order = sorted(range(len(records)), key=lambda i: lengths[i])
-            micro_batches: list[list[dict]] = []
-            cur: list[int] = []
-            cur_max = 0
-            for i in order:
-                new_max = max(cur_max, lengths[i])
-                if cur and (len(cur) + 1) * new_max > max_token_len:
-                    micro_batches.append([records[j] for j in cur])
-                    cur, cur_max = [i], lengths[i]
-                else:
-                    cur.append(i)
-                    cur_max = new_max
-            if cur:
-                micro_batches.append([records[j] for j in cur])
-            micro_batches = micro_batches[:max_updates]
-        else:
-            micro_batches = [
-                records[start : start + batch_size]
-                for start in range(0, min(len(records), batch_size * max_updates), batch_size)
-            ]
-        for chunk in micro_batches:
-            texts = [str(r["prompt"]) + str(r["wrong_response"]) for r in chunk]
-            prompts = [str(r["prompt"]) for r in chunk]
-            enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(
-                device
-            )
-            prompt_enc = tokenizer(
-                prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len
-            ).to(device)
-            prompt_lens = prompt_enc["attention_mask"].sum(dim=-1)
-            outputs = self._tafr_failure(**enc, use_cache=False)
-            logits = outputs.logits[:, :-1, :].contiguous()
-            labels = enc["input_ids"][:, 1:].contiguous()
-            flat_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False)
-            log_probs = flat_lp.view(labels.shape)
-            token_positions = torch.arange(log_probs.shape[-1], device=device).unsqueeze(0)
-            response_mask = (token_positions >= (prompt_lens - 1).unsqueeze(1)) & enc["attention_mask"][:, 1:].bool()
-            denom = response_mask.sum(dim=-1).clamp_min(1).float()
-            loss = -((log_probs * response_mask).sum(dim=-1) / denom).mean()
-            self._tafr_failure_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self._tafr_failure_optimizer.step()
-            total_loss += float(loss.detach().cpu())
-            updates += 1
-        self._tafr_failure.gradient_checkpointing_disable()
-        self._tafr_move_optimizer_state(self._tafr_failure_optimizer, torch.device("cpu"))
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return {
-            "tafr_grpo/failure_sft_updates": float(updates),
-            "tafr_grpo/failure_sft_loss": total_loss / max(updates, 1),
-        }
+        ids = padded["input_ids"].to(device)
+        attention = padded["attention_mask"].to(device)
+        response = padded["response_mask"].to(device)
+        active = padded.get("sdc_failure_mask", torch.ones(ids.shape[0], dtype=torch.bool, device=device)).to(device).bool()
+        success = torch.zeros_like(response, dtype=torch.float32)
+        failure = torch.zeros_like(response, dtype=torch.float32)
+        if bool(active.any()):
+            active_ids, active_attention, active_response = ids[active], attention[active], response[active]
+            success[active] = self._sdc_model_log_probs(self._sdc_success, active_ids, active_attention, active_response)
+            failure[active] = self._sdc_model_log_probs(self._sdc_failure, active_ids, active_attention, active_response)
+        return TensorDict({"sdc_success_log_probs": success, "sdc_failure_log_probs": failure}, batch_size=[ids.shape[0]])
 
-    def tafr_save_and_refresh(self, local_path: str, global_step: int, failure_model_changed: bool, tafr_config: dict):
-        self.tafr_init(tafr_config)
-        os.makedirs(local_path, exist_ok=True)
-        # Disk writes are throttled independently of EMA/adapter freshness: the
-        # failure EMA and scorer adapter are updated eagerly after every failure-SFT
-        # update (tafr_update_failure_ema), while tafr_state.pt / failure model /
-        # optimizer are written only when due. Old global_step dirs are rotated away
-        # by the trainer, so the last save replaces the previous.
-        save_interval = int(tafr_config.get("save_to_disk_interval_grpo_steps", 0))
-        save_to_disk = save_interval <= 0 or (global_step % save_interval == 0)
-        save_optimizer = bool(tafr_config.get("save_failure_sft_optimizer", True))
-        new_mode = self._tafr_new_mode(tafr_config)
-        gamma = float(tafr_config.get("ema_gamma", 0.9))
-        eta = float(tafr_config.get("mix_eta", 1.0))
-        failure_dir = os.path.join(local_path, "failure_sft")
-        if save_to_disk and self.rank == 0:
-            os.makedirs(failure_dir, exist_ok=True)
-            torch.save(self._tafr_failure.state_dict(), os.path.join(failure_dir, "pytorch_model.bin"))
-            if save_optimizer:
-                torch.save(self._tafr_failure_optimizer.state_dict(), os.path.join(failure_dir, "optimizer.pt"))
-        # Refresh the lagged actor EMA used by pi_anchor in every TAFR mode.
-        actor_state = self._tafr_actor_state_cpu()
-        for key, value in actor_state.items():
-            if torch.is_floating_point(value):
-                self._tafr_grpo_ema_state[key] = gamma * self._tafr_grpo_ema_state[key] + (1.0 - gamma) * value
-            else:
-                self._tafr_grpo_ema_state[key] = value.clone()
-        if self._is_lora:
-            actor_lora_state = self._tafr_actor_lora_state_cpu()
-            for key, value in actor_lora_state.items():
-                if torch.is_floating_point(value):
-                    self._tafr_grpo_lora_ema_state[key] = (
-                        gamma * self._tafr_grpo_lora_ema_state[key] + (1.0 - gamma) * value
-                    )
-                else:
-                    self._tafr_grpo_lora_ema_state[key] = value.clone()
-        anchor_state = self._tafr_mix_states(self._tafr_grpo_ema_state, eta)
-        if self._tafr_uses_vllm_logprobs(tafr_config):
-            self._tafr_anchor = None
-        else:
-            self._tafr_anchor = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            self._tafr_anchor = self._tafr_clone_from_state(anchor_state, trainable=False)
-        if new_mode:
-            self._tafr_replay = None
-        else:
-            replay_state = self._tafr_mix_states(self._tafr_fail_ema_state, eta)
-            self._tafr_replay = (
-                None
-                if self._tafr_uses_vllm_logprobs(tafr_config)
-                else self._tafr_clone_from_state(replay_state, trainable=False)
-            )
-        if self.rank == 0:
-            save_dict = {
-                "global_step": global_step,
-                "ema_gamma": gamma,
-                "mix_eta": eta,
-                "failure_model_changed": bool(failure_model_changed),
-                "fail_ema_state": self._tafr_fail_ema_state,
-                "failure_model_ready": bool(
-                    getattr(self, "_tafr_failure_model_ready", False)
-                    or tafr_config.get("tafr_failure_model_ready", False)
-                ),
-                "failure_model_update_count": int(
-                    getattr(self, "_tafr_failure_model_update_count", 0)
-                    or tafr_config.get("tafr_failure_model_update_count", 0)
-                ),
-            }
-            if self._is_lora:
-                save_dict["fail_lora_ema_state"] = self._tafr_fail_lora_ema_state
-            save_dict["grpo_ema_state"] = self._tafr_grpo_ema_state
-            if self._is_lora:
-                save_dict["grpo_lora_ema_state"] = self._tafr_grpo_lora_ema_state
-            if save_to_disk:
-                torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
-        return {"tafr_refreshed": True, "tafr_failure_ema_updated": bool(failure_model_changed)}
+    def _sdc_get_tokenizer(self):
+        if self._sdc_tokenizer is None:
+            from transformers import AutoTokenizer
+            self._sdc_tokenizer = AutoTokenizer.from_pretrained(self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code)
+            if self._sdc_tokenizer.pad_token_id is None:
+                self._sdc_tokenizer.pad_token = self._sdc_tokenizer.eos_token
+        return self._sdc_tokenizer
 
-    def tafr_load(self, local_path: str, tafr_config: dict | None = None):
-        state_path = os.path.join(local_path, "tafr_state.pt")
-        failure_path = os.path.join(local_path, "failure_sft", "pytorch_model.bin")
-        optimizer_path = os.path.join(local_path, "failure_sft", "optimizer.pt")
-        tafr_config = tafr_config or {}
-        self.tafr_init(tafr_config)
-        if os.path.exists(state_path):
-            state = torch.load(state_path, map_location="cpu")
-            self._tafr_grpo_ema_state = state.get("grpo_ema_state", self._tafr_grpo_ema_state)
-            self._tafr_fail_ema_state = state.get("fail_ema_state", self._tafr_fail_ema_state)
-            if self._is_lora:
-                self._tafr_grpo_lora_ema_state = state.get(
-                    "grpo_lora_ema_state", self._tafr_grpo_lora_ema_state
-                )
-                self._tafr_fail_lora_ema_state = state.get("fail_lora_ema_state", self._tafr_fail_lora_ema_state)
-            self._tafr_failure_model_ready = bool(state.get("failure_model_ready", False))
-            self._tafr_failure_model_update_count = int(state.get("failure_model_update_count", 0))
-        if os.path.exists(failure_path):
-            loaded = torch.load(failure_path, map_location="cpu")
-            self._tafr_failure.load_state_dict(loaded, strict=False)
-        if os.path.exists(optimizer_path):
-            optimizer_state = torch.load(optimizer_path, map_location="cpu")
-            self._tafr_failure_optimizer.load_state_dict(optimizer_state)
-            self._tafr_move_optimizer_state(self._tafr_failure_optimizer, torch.device("cpu"))
-        if not self._tafr_uses_vllm_logprobs(tafr_config):
-            self._tafr_anchor = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            self._tafr_anchor = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        return {
-            "tafr_loaded": os.path.exists(state_path),
-            "tafr_failure_model_ready": bool(getattr(self, "_tafr_failure_model_ready", False)),
-            "tafr_failure_model_update_count": int(getattr(self, "_tafr_failure_model_update_count", 0)),
-        }
+    def _sdc_sft_model(self, model, optimizer, records: list[dict], prefix: str, config: dict):
+        if not records:
+            return {f"sdc/{prefix}_sft_updates": 0.0}
+        tokenizer = self._sdc_get_tokenizer()
+        device = next(self.module.parameters()).device
+        batch_size = int(config.get("sft_batch_size", 8)); max_updates = int(config.get("sft_max_updates_per_interval", 1)); max_length = int(config.get("max_response_length", 2048))
+        token_budget = int(config.get("sft_max_token_len_per_gpu", 0) or 0)
+        if token_budget > 0:
+            batch_size = min(batch_size, max(1, token_budget // max_length))
+        total, updates = 0.0, 0
+        for start in range(0, min(len(records), batch_size * max_updates), batch_size):
+            chunks = records[start : start + batch_size]; rows = []; masks = []
+            for record in chunks:
+                prompt = [{"role": "user", "content": str(record["prompt"])}]
+                full = prompt + [{"role": "assistant", "content": str(record["response"])}]
+                prompt_ids = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+                ids = torch.as_tensor(tokenizer.apply_chat_template(full, add_generation_prompt=False, tokenize=True)[:max_length], dtype=torch.long)
+                mask = torch.zeros_like(ids); mask[min(len(prompt_ids), ids.numel()) :] = 1; rows.append(ids); masks.append(mask)
+            width = max(row.numel() for row in rows); pad_id = tokenizer.pad_token_id or 0
+            ids = torch.full((len(rows), width), pad_id, dtype=torch.long, device=device); attention = torch.zeros_like(ids); response = torch.zeros_like(ids)
+            for i, row in enumerate(rows):
+                ids[i, : row.numel()] = row.to(device); attention[i, : row.numel()] = 1; response[i, : row.numel()] = masks[i].to(device)
+            output = model(input_ids=ids, attention_mask=attention, use_cache=False); logits = output.logits[:, :-1]; labels = ids[:, 1:]
+            token_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False).view(labels.shape); mask = response[:, 1:].bool(); loss = outcome_sft_loss(token_lp, mask)
+            optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step(); total += float(loss.detach().cpu()); updates += 1
+        return {f"sdc/{prefix}_sft_updates": float(updates), f"sdc/{prefix}_sft_loss": total / max(updates, 1)}
 
+    def sdc_sft_update(self, success_records: list[dict], failure_records: list[dict], config: dict):
+        self.sdc_init(config)
+        success = self._sdc_sft_model(self._sdc_success, self._sdc_success_optimizer, success_records, "success", config)
+        failure = self._sdc_sft_model(self._sdc_failure, self._sdc_failure_optimizer, failure_records, "failure", config)
+        self._sdc_success_model_update_count += int(success["sdc/success_sft_updates"]); self._sdc_failure_model_update_count += int(failure["sdc/failure_sft_updates"])
+        minimum = int(config.get("min_sft_updates_before_use", 1)); self._sdc_models_ready = self._sdc_success_model_update_count >= minimum and self._sdc_failure_model_update_count >= minimum
+        return {**success, **failure, "sdc/success_model_update_count": float(self._sdc_success_model_update_count), "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count), "sdc/models_ready": float(self._sdc_models_ready)}
+
+    def _sdc_peft_state(self, model):
+        from peft.utils.save_and_load import get_peft_model_state_dict
+        return {k: v.detach().cpu().clone() for k, v in get_peft_model_state_dict(model).items() if torch.is_tensor(v)}
+
+    def sdc_export_vllm_adapters(self, config: dict):
+        self.sdc_init(config)
+        if config.get("logprob_backend") != "vllm" or not self._is_lora:
+            return {"enabled": False}
+        wrapped = getattr(self.module, "_fsdp_wrapped_module", self.module); peft_config = getattr(wrapped, "peft_config", {}).get("default", None)
+        if hasattr(peft_config, "to_dict"): peft_config = peft_config.to_dict()
+        return {"enabled": True, "peft_config": peft_config, "success": self._sdc_peft_state(self._sdc_success), "failure": self._sdc_peft_state(self._sdc_failure)}
+
+    def sdc_save_checkpoint(self, local_path: str, global_step: int, config: dict):
+        self.sdc_init(config); os.makedirs(local_path, exist_ok=True)
+        for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
+            directory = os.path.join(local_path, f"{name}_sft"); os.makedirs(directory, exist_ok=True); torch.save(model.state_dict(), os.path.join(directory, "pytorch_model.bin"))
+            if bool(config.get("save_sft_optimizers", True)): torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt"))
+        torch.save({"global_step": global_step, "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}, os.path.join(local_path, "sdc_state.pt"))
+        return {"sdc_saved": True, "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}
+
+    def sdc_load(self, local_path: str, config: dict | None = None):
+        config = config or {}; self.sdc_init(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
+        for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
+            directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
+            if os.path.exists(model_path): model.load_state_dict(torch.load(model_path, map_location="cpu"), strict=False)
+            if os.path.exists(optimizer_path):
+                optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
+                self._sdc_move_optimizer_state(optimizer, next(model.parameters()).device)
+        return {"sdc_loaded": os.path.exists(state_path), "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
