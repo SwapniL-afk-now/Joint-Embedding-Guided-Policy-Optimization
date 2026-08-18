@@ -919,6 +919,7 @@ custom_sdc:
   verify_rollout_log_probs: false
   use_importance_weight: true
   importance_weight_clip: 10.0
+  base_mix_gamma: 0.9
   sft_update_interval_policy_steps: 5
   checkpoint_interval_policy_steps: 10
   min_sft_updates_before_use: 1

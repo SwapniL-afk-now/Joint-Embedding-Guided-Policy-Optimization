@@ -76,6 +76,7 @@ from verl.experimental.sdc.sft_trainer import (
     pair_outcome_records,
 )
 from verl.experimental.sdc.data_collector import OutcomeExample
+from verl.experimental.sdc.sdc_state import build_sdc_checkpoint_state, clone_frozen_state, mix_module_with_base
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
@@ -738,8 +739,14 @@ class FSDPEngine(BaseEngine):
         if self.engine_config.strategy not in ("fsdp", "fsdp2"):
             raise NotImplementedError("SDC currently supports only FSDP/FSDP2 HF actors.")
         state = self._sdc_actor_state_cpu()
-        self._sdc_success = self._sdc_clone_from_state(state)
-        self._sdc_failure = self._sdc_clone_from_state(state)
+        self._sdc_base_state_cpu = clone_frozen_state(state)
+        self._sdc_base_mix_gamma = float(sdc_config.get("base_mix_gamma", 0.9))
+        if not 0.0 <= self._sdc_base_mix_gamma <= 1.0:
+            raise ValueError(
+                f"custom_sdc.base_mix_gamma must be between 0.0 and 1.0, got {self._sdc_base_mix_gamma}."
+            )
+        self._sdc_success = self._sdc_clone_from_state(self._sdc_base_state_cpu)
+        self._sdc_failure = self._sdc_clone_from_state(self._sdc_base_state_cpu)
         lr = float(sdc_config.get("sft_lr", 1e-6))
         self._sdc_success_optimizer = torch.optim.AdamW(
             (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad), lr=lr
@@ -760,6 +767,7 @@ class FSDPEngine(BaseEngine):
         failure_counts = self._sdc_parameter_counts(self._sdc_failure, self._sdc_failure_optimizer)
         return {
             "sdc_initialized": True,
+            "sdc/base_mix_gamma": self._sdc_base_mix_gamma,
             "sdc/actor_total_parameters": actor_counts["total"],
             "sdc/actor_trainable_parameters": actor_counts["trainable"],
             "sdc/success_total_parameters": success_counts["total"],
@@ -772,7 +780,16 @@ class FSDPEngine(BaseEngine):
 
     def sdc_reinitialize_from_actor(self, sdc_config: dict):
         self._sdc_initialized = False
-        return self.sdc_init(sdc_config)
+        reset_config = dict(sdc_config or {})
+        reset_config.pop("sdc_success_model_update_count", None)
+        reset_config.pop("sdc_failure_model_update_count", None)
+        reset_config.pop("sdc_models_ready", None)
+        return self.sdc_init(reset_config)
+
+    def _sdc_mix_with_base(self, model) -> None:
+        """Restore the common frozen-base component after a paired SFT refresh."""
+
+        mix_module_with_base(model, self._sdc_base_state_cpu, self._sdc_base_mix_gamma)
 
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
         config = tu.get_non_tensor_data(data=data, key="custom_sdc", default={}) or {}
@@ -857,14 +874,16 @@ class FSDPEngine(BaseEngine):
                 torch.save(model.state_dict(), os.path.join(directory, "pytorch_model.bin"))
                 torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt"))
             torch.save(
-                {
-                    "global_step": global_step,
-                    "sdc_success_model_update_count": self._sdc_success_model_update_count,
-                    "sdc_failure_model_update_count": self._sdc_failure_model_update_count,
-                    "sdc_models_ready": self._sdc_models_ready,
-                    "success_buffer_state": config.get("success_buffer_state"),
-                    "failure_buffer_state": config.get("failure_buffer_state"),
-                },
+                build_sdc_checkpoint_state(
+                    global_step=global_step,
+                    success_model_update_count=self._sdc_success_model_update_count,
+                    failure_model_update_count=self._sdc_failure_model_update_count,
+                    models_ready=self._sdc_models_ready,
+                    base_state=self._sdc_base_state_cpu,
+                    base_mix_gamma=self._sdc_base_mix_gamma,
+                    success_buffer_state=config.get("success_buffer_state"),
+                    failure_buffer_state=config.get("failure_buffer_state"),
+                ),
                 os.path.join(local_path, "sdc_state.pt"),
             )
         if distributed:
@@ -1015,7 +1034,15 @@ class FSDPEngine(BaseEngine):
         failure_updates = int(failure["sdc/failure_sft_updates"])
         if success_updates != failure_updates:
             raise RuntimeError("SDC success/failure refresh produced different optimizer-step counts.")
+        success_tokens = int(success["sdc/success_sft_response_tokens"])
+        failure_tokens = int(failure["sdc/failure_sft_response_tokens"])
+        if success_tokens != failure_tokens:
+            raise RuntimeError("SDC success/failure refresh consumed different response-token budgets.")
         if success_updates:
+            # Base mixing changes model parameters only.  The two AdamW
+            # optimizers retain their independent moments and step counters.
+            self._sdc_mix_with_base(self._sdc_success)
+            self._sdc_mix_with_base(self._sdc_failure)
             self._sdc_sync_model_and_optimizer(self._sdc_success, self._sdc_success_optimizer)
             self._sdc_sync_model_and_optimizer(self._sdc_failure, self._sdc_failure_optimizer)
         self._sdc_success_model_update_count += success_updates
@@ -1055,6 +1082,11 @@ class FSDPEngine(BaseEngine):
 
     def sdc_load(self, local_path: str, config: dict | None = None):
         config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        if state.get("sdc_base_state_cpu") is not None:
+            self._sdc_base_state_cpu = clone_frozen_state(state["sdc_base_state_cpu"])
+        self._sdc_base_mix_gamma = float(state.get("base_mix_gamma", self._sdc_base_mix_gamma))
+        if not 0.0 <= self._sdc_base_mix_gamma <= 1.0:
+            raise ValueError(f"Invalid checkpoint base_mix_gamma={self._sdc_base_mix_gamma}.")
         self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
         for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
             directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
@@ -1626,8 +1658,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if self.engine_config.strategy not in ("fsdp", "fsdp2"):
             raise NotImplementedError("SDC currently supports only FSDP/FSDP2 HF actors.")
         state = self._sdc_actor_state_cpu()
-        self._sdc_success = self._sdc_clone_from_state(state)
-        self._sdc_failure = self._sdc_clone_from_state(state)
+        self._sdc_base_state_cpu = clone_frozen_state(state)
+        self._sdc_base_mix_gamma = float(sdc_config.get("base_mix_gamma", 0.9))
+        if not 0.0 <= self._sdc_base_mix_gamma <= 1.0:
+            raise ValueError(
+                f"custom_sdc.base_mix_gamma must be between 0.0 and 1.0, got {self._sdc_base_mix_gamma}."
+            )
+        self._sdc_success = self._sdc_clone_from_state(self._sdc_base_state_cpu)
+        self._sdc_failure = self._sdc_clone_from_state(self._sdc_base_state_cpu)
         lr = float(sdc_config.get("sft_lr", 1e-6))
         self._sdc_success_optimizer = torch.optim.AdamW(
             (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad), lr=lr
@@ -1648,6 +1686,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         failure_counts = self._sdc_parameter_counts(self._sdc_failure, self._sdc_failure_optimizer)
         return {
             "sdc_initialized": True,
+            "sdc/base_mix_gamma": self._sdc_base_mix_gamma,
             "sdc/actor_total_parameters": actor_counts["total"],
             "sdc/actor_trainable_parameters": actor_counts["trainable"],
             "sdc/success_total_parameters": success_counts["total"],
@@ -1660,7 +1699,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def sdc_reinitialize_from_actor(self, sdc_config: dict):
         self._sdc_initialized = False
-        return self.sdc_init(sdc_config)
+        reset_config = dict(sdc_config or {})
+        reset_config.pop("sdc_success_model_update_count", None)
+        reset_config.pop("sdc_failure_model_update_count", None)
+        reset_config.pop("sdc_models_ready", None)
+        return self.sdc_init(reset_config)
+
+    def _sdc_mix_with_base(self, model) -> None:
+        """Restore the common frozen-base component after a paired SFT refresh."""
+
+        mix_module_with_base(model, self._sdc_base_state_cpu, self._sdc_base_mix_gamma)
 
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
         config = tu.get_non_tensor_data(data=data, key="custom_sdc", default={}) or {}
@@ -1826,7 +1874,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
         failure_updates = int(failure["sdc/failure_sft_updates"])
         if success_updates != failure_updates:
             raise RuntimeError("SDC success/failure refresh produced different optimizer-step counts.")
+        success_tokens = int(success["sdc/success_sft_response_tokens"])
+        failure_tokens = int(failure["sdc/failure_sft_response_tokens"])
+        if success_tokens != failure_tokens:
+            raise RuntimeError("SDC success/failure refresh consumed different response-token budgets.")
         if success_updates:
+            # Base mixing changes model parameters only.  The two AdamW
+            # optimizers retain their independent moments and step counters.
+            self._sdc_mix_with_base(self._sdc_success)
+            self._sdc_mix_with_base(self._sdc_failure)
             self._sdc_sync_model_and_optimizer(self._sdc_success, self._sdc_success_optimizer)
             self._sdc_sync_model_and_optimizer(self._sdc_failure, self._sdc_failure_optimizer)
         self._sdc_success_model_update_count += success_updates
@@ -1866,6 +1922,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def sdc_load(self, local_path: str, config: dict | None = None):
         config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        if state.get("sdc_base_state_cpu") is not None:
+            self._sdc_base_state_cpu = clone_frozen_state(state["sdc_base_state_cpu"])
+        self._sdc_base_mix_gamma = float(state.get("base_mix_gamma", self._sdc_base_mix_gamma))
+        if not 0.0 <= self._sdc_base_mix_gamma <= 1.0:
+            raise ValueError(f"Invalid checkpoint base_mix_gamma={self._sdc_base_mix_gamma}.")
         self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
         for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
             directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")

@@ -18,6 +18,7 @@ class SDCConfig:
     verify_rollout_log_probs: bool = False
     use_importance_weight: bool = True
     importance_weight_clip: float = 10.0
+    base_mix_gamma: float = 0.9
 
     # S/F reference training. Both references use the same paired response-token
     # budget, optimizer-step count, and learning rate.
@@ -33,6 +34,12 @@ class SDCConfig:
     data_sampling: str = "recent"
     save_to_disk_interval_policy_steps: int = 0
     loss_agg_mode: str = "token-mean"
+
+    def __post_init__(self):
+        if not 0.0 <= float(self.base_mix_gamma) <= 1.0:
+            raise ValueError(
+                f"custom_sdc.base_mix_gamma must be in [0, 1], got {self.base_mix_gamma}."
+            )
 
     @classmethod
     def from_config(cls, config: DictConfig | dict[str, Any] | None) -> SDCConfig:
@@ -103,6 +110,8 @@ def validate_sdc_config(config: DictConfig | dict) -> SDCConfig:
         raise ValueError("custom_sdc.vllm_score_micro_batch_size must be positive.")
     if settings.importance_weight_clip < 0:
         raise ValueError("custom_sdc.importance_weight_clip must be non-negative.")
+    if not 0.0 <= float(settings.base_mix_gamma) <= 1.0:
+        raise ValueError("custom_sdc.base_mix_gamma must be between 0.0 and 1.0.")
     if not settings.use_importance_weight:
         raise ValueError("SDC requires importance weighting to retain the actor-dependent gradient.")
     if settings.loss_agg_mode != "token-mean":

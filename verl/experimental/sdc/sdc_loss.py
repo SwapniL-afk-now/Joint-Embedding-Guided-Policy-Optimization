@@ -20,6 +20,36 @@ def _zero_metrics() -> dict[str, float]:
     }
 
 
+def _all_reduce_detached(value: torch.Tensor) -> torch.Tensor:
+    """Return a globally summed diagnostic tensor without autograd edges."""
+
+    value = value.detach().clone()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+    return value
+
+
+def _all_reduce_max_detached(value: torch.Tensor) -> torch.Tensor:
+    value = value.detach().clone()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MAX)
+    return value
+
+
+def _all_gather_detached_values(value: torch.Tensor) -> torch.Tensor:
+    """Gather variable-length diagnostic values for global quantiles."""
+
+    value = value.detach()
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return value
+    gathered: list[torch.Tensor | None] = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, value.cpu())
+    values = [item for item in gathered if item is not None and item.numel()]
+    if not values:
+        return value.new_empty(0)
+    return torch.cat(values).to(device=value.device)
+
+
 def compute_sdc_loss(
     *,
     log_prob: torch.Tensor,
@@ -45,7 +75,7 @@ def compute_sdc_loss(
     if loss_agg_mode != "token-mean":
         raise ValueError("SDC uses fixed loss aggregation 'token-mean'.")
     zero = log_prob.sum() * 0.0
-    if not models_ready or beta == 0.0 or failure_mask.numel() == 0 or not bool(failure_mask.any()):
+    if not models_ready or beta == 0.0:
         return zero, _zero_metrics()
     if not use_importance_weight:
         raise ValueError("SDC requires importance weighting; disabling it removes the actor gradient.")
@@ -75,34 +105,67 @@ def compute_sdc_loss(
         torch.distributed.all_reduce(count)
     count = count.clamp_min(1.0)
     loss = float(beta) * (token_loss * mask).sum() / count * dp_size
-    active_tokens = response_mask.to(log_prob.dtype).sum().clamp_min(1.0)
+
+    # Metrics must use global numerator/denominator pairs.  They are detached
+    # diagnostics and deliberately do not participate in the actor gradient.
     active_contrast = (success - failure)[mask]
+    valid_sequences = mask.any(dim=-1)
+    sequence_values = ((success - failure) * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1)
+    local_metric_sums = torch.stack(
+        [
+            (token_loss.detach() * mask).sum(),
+            mask.to(log_prob.dtype).sum(),
+            response_mask.to(log_prob.dtype).sum(),
+            (ratio.detach() * mask).sum(),
+            (ratio_clipped.to(log_prob.dtype) * mask).sum(),
+            (weight_clipped.to(log_prob.dtype) * mask).sum(),
+            sequence_values[valid_sequences].sum(),
+            valid_sequences.to(log_prob.dtype).sum(),
+        ]
+    )
+    (
+        global_token_loss_sum,
+        global_active_count,
+        global_response_count,
+        global_importance_sum,
+        global_log_ratio_clipped_count,
+        global_importance_clip_count,
+        global_sequence_sum,
+        global_sequence_count,
+    ) = _all_reduce_detached(local_metric_sums)
+    global_has_active = bool(global_active_count.item() > 0)
+    if not global_has_active:
+        return zero, _zero_metrics()
+    global_active_count = global_active_count.clamp_min(1.0)
+    global_response_count = global_response_count.clamp_min(1.0)
+    global_sequence_count = global_sequence_count.clamp_min(1.0)
+    global_contrast_max = _all_reduce_max_detached(
+        active_contrast.max() if active_contrast.numel() else torch.tensor(float("-inf"), device=log_prob.device)
+    )
+    global_active_contrast = _all_gather_detached_values(active_contrast)
     metrics = {
-        "sdc/loss": float(loss.detach().cpu()),
-        "sdc/active_token_fraction": float(
-            mask.to(log_prob.dtype).sum().detach().cpu() / active_tokens.detach().cpu()
-        ),
-        "sdc/importance_weight_mean": float((ratio.detach() * mask).sum().cpu() / count.cpu()),
+        "sdc/loss": float((float(beta) * global_token_loss_sum / global_active_count).cpu()),
+        "sdc/active_token_fraction": float((global_active_count / global_response_count).cpu()),
+        "sdc/importance_weight_mean": float((global_importance_sum / global_active_count).cpu()),
         "sdc/log_ratio_clipped_fraction": float(
-            (ratio_clipped.to(log_prob.dtype) * mask).sum().cpu() / count.cpu()
+            (global_log_ratio_clipped_count / global_active_count).cpu()
         ),
         "sdc/importance_weight_clip_fraction": float(
-            (weight_clipped.to(log_prob.dtype) * mask).sum().cpu() / count.cpu()
+            (global_importance_clip_count / global_active_count).cpu()
         ),
     }
-    if active_contrast.numel():
+    if global_has_active:
         q = torch.quantile(
-            active_contrast.float(),
-            torch.tensor([0.10, 0.50, 0.90], device=active_contrast.device),
+            global_active_contrast.float(),
+            torch.tensor([0.10, 0.50, 0.90], device=global_active_contrast.device),
         )
-        sequence_mean = ((success - failure) * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1)
-        sequence_mean = sequence_mean[mask.any(dim=-1)].mean()
+        sequence_mean = global_sequence_sum / global_sequence_count
         metrics.update(
             {
                 "sdc/contrast_p10": float(q[0].detach().cpu()),
                 "sdc/contrast_p50": float(q[1].detach().cpu()),
                 "sdc/contrast_p90": float(q[2].detach().cpu()),
-                "sdc/contrast_max": float(active_contrast.max().detach().cpu()),
+                "sdc/contrast_max": float(global_contrast_max.cpu()),
                 "sdc/contrast_sequence_mean": float(sequence_mean.detach().cpu()),
             }
         )

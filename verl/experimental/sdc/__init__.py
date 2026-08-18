@@ -16,6 +16,12 @@ from verl.experimental.sdc.data_collector import (
     validate_sdc_outcome,
 )
 from verl.experimental.sdc.sdc_loss import compute_sdc_loss, contrast_quality_metrics
+from verl.experimental.sdc.sdc_state import (
+    build_sdc_checkpoint_state,
+    clone_frozen_state,
+    mix_module_with_base,
+    mix_state_with_base,
+)
 
 __all__ = [
     "SDCConfig",
@@ -31,4 +37,8 @@ __all__ = [
     "validate_sdc_outcome",
     "compute_sdc_loss",
     "contrast_quality_metrics",
+    "clone_frozen_state",
+    "mix_state_with_base",
+    "mix_module_with_base",
+    "build_sdc_checkpoint_state",
 ]

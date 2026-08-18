@@ -2143,6 +2143,7 @@ class RayPPOTrainer:
             "verify_rollout_log_probs": bool(self.sdc_config.verify_rollout_log_probs),
             "use_importance_weight": bool(self.sdc_config.use_importance_weight),
             "importance_weight_clip": float(self.sdc_config.importance_weight_clip),
+            "base_mix_gamma": float(self.sdc_config.base_mix_gamma),
             "loss_agg_mode": "token-mean",
             "sft_update_interval_policy_steps": int(self.sdc_config.sft_update_interval_policy_steps),
             "checkpoint_interval_policy_steps": int(self.sdc_config.checkpoint_interval_policy_steps),
