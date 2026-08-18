@@ -94,7 +94,8 @@ def run_merge(config) -> None:
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
-        print(f"ray init kwargs: {ray_init_kwargs}")
+        from verl.trainer.constants_ppo import redact_secrets
+        print(f"ray init kwargs: {redact_secrets(ray_init_kwargs)}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     ray.get(main_task.remote(config))

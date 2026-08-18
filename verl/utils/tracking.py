@@ -101,7 +101,37 @@ class Tracking:
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
             run_id = os.environ.get("WANDB_RUN_ID", None)
-            wandb.init(id=run_id, project=project_name, name=experiment_name, entity=entity, config=config, settings=settings, resume="allow")
+            # Not "WANDB_FORK_FROM": wandb auto-maps any WANDB_* env var straight onto
+            # its own Settings (env_prefix="WANDB_"), so that name would silently feed
+            # wandb's real (gated) fork_from mechanism regardless of what's passed here.
+            fork_from = os.environ.get("JEPA_WANDB_FORK_FROM", None)
+            if fork_from:
+                # wandb's real `fork_from` is gated behind a private preview this account
+                # doesn't have (confirmed via CommError), and a failed fork_from attempt
+                # poisons wandb's process-global settings singleton so even a subsequent
+                # plain wandb.init() in the same process inherits the broken state — so
+                # don't attempt it at all. Instead: start a fresh run and manually replay
+                # the source run's scalar history up to the given step, e.g.
+                # "5jdbqaj6?_step=40" (media/images are not replayed).
+                src_run_id, _, step_part = fork_from.partition("?")
+                fork_step = int(step_part.split("=", 1)[1]) if "=" in step_part else None
+                api = wandb.Api()
+                src_path = f"{entity}/{project_name}/{src_run_id}" if entity else f"{project_name}/{src_run_id}"
+                src_history = api.run(src_path).history(samples=100000, pandas=False)
+                wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+                print(f"[tracking] replaying scalar history from {src_path} up to step {fork_step} into new run")
+                for row in src_history:
+                    step = row.get("_step")
+                    if step is None or (fork_step is not None and step > fork_step):
+                        continue
+                    payload = {
+                        k: v for k, v in row.items()
+                        if not k.startswith("_") and not (isinstance(v, dict) and v.get("_type") == "image-file")
+                    }
+                    if payload:
+                        wandb.log(payload, step=int(step))
+            else:
+                wandb.init(id=run_id, project=project_name, name=experiment_name, entity=entity, config=config, settings=settings, resume="allow")
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:

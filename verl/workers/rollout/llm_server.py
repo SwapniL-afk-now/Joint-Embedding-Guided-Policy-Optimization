@@ -175,6 +175,7 @@ class LLMServerClient:
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
 
+    @auto_await
     @rollout_trace_op
     async def generate(
         self,
@@ -219,7 +220,36 @@ class LLMServerClient:
             self._release_server(server_id)
 
     @auto_await
-    async def score_tafr_logprobs(
+    async def generate_batch(self, requests: list[dict[str, Any]]) -> list[TokenOutput]:
+        """Submit independent token-generation requests concurrently."""
+        tasks = []
+        acquired: list[tuple[str, ray.actor.ActorHandle]] = []
+        for request in requests:
+            server_id, server = await self._acquire_server(str(request["request_id"]))
+            acquired.append((server_id, server))
+            multimodal_kwargs = {}
+            if request.get("audio_data") is not None:
+                multimodal_kwargs["audio_data"] = request["audio_data"]
+            if request.get("mm_processor_kwargs"):
+                multimodal_kwargs["mm_processor_kwargs"] = request["mm_processor_kwargs"]
+            tasks.append(
+                server.generate.remote(
+                    request_id=uuid4().hex,
+                    prompt_ids=request["prompt_ids"],
+                    sampling_params=request["sampling_params"],
+                    image_data=request.get("image_data"),
+                    video_data=request.get("video_data"),
+                    **multimodal_kwargs,
+                )
+            )
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for server_id, _ in acquired:
+                self._release_server(server_id)
+
+    @auto_await
+    async def score_sdc_logprobs(
         self,
         *,
         sequences: list[list[int]],
@@ -235,7 +265,7 @@ class LLMServerClient:
             server_id, server = await self._acquire_server(uuid4().hex)
             acquired.append((server_id, server))
             tasks.append(
-                server.score_tafr_logprobs.remote(
+                server.score_sdc_logprobs.remote(
                     sequence_ids=sequence_ids,
                     prompt_len=prompt_len,
                     response_len=response_len,
@@ -250,7 +280,7 @@ class LLMServerClient:
                 self._release_server(server_id)
 
     @auto_await
-    async def score_tafr_logprobs_multi(
+    async def score_sdc_logprobs_multi(
         self,
         *,
         sequences: list[list[int]],
@@ -258,7 +288,7 @@ class LLMServerClient:
         response_lens: list[int],
         adapters: tuple[str, ...],
     ) -> dict[str, list[list[float]]]:
-        """Score the same sequences under multiple TAFR adapters in one batched sweep.
+        """Score the same sequences under multiple SDC adapters in one batched sweep.
 
         Emits one request per (sequence, adapter) and awaits them all in a single
         ``asyncio.gather`` so vLLM's continuous batcher interleaves the distinct
@@ -278,7 +308,7 @@ class LLMServerClient:
                 acquired.append((server_id, server))
                 index.append(adapter)
                 tasks.append(
-                    server.score_tafr_logprobs.remote(
+                    server.score_sdc_logprobs.remote(
                         sequence_ids=sequence_ids,
                         prompt_len=prompt_len,
                         response_len=response_len,
@@ -440,7 +470,7 @@ class LLMServerManager:
         return self.rollout_replicas
 
     @auto_await
-    async def load_tafr_lora_adapters(self, payload: dict[str, Any], adapters: tuple[str, ...] = ("anchor", "replay")):
+    async def load_sdc_lora_adapters(self, payload: dict[str, Any], adapters: tuple[str, ...] = ("success", "failure")):
         if not payload.get("enabled", False):
             return
         peft_config = payload["peft_config"]
@@ -449,7 +479,7 @@ class LLMServerManager:
             for adapter in adapters:
                 if adapter in payload:
                     tasks.append(
-                        server.load_tafr_lora_adapter.remote(
+                        server.load_sdc_lora_adapter.remote(
                             adapter=adapter,
                             peft_config=peft_config,
                             lora_tensors=payload[adapter],

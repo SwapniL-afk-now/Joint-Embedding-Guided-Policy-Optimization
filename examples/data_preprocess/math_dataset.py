@@ -73,7 +73,8 @@ if __name__ == "__main__":
                 "prompt": [{"role": "user", "content": question}],
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": solution},
-                "extra_info": {"split": split, "index": idx},
+                # "problem" is required by the JEPA batch builders (teacher-cache keying).
+                "extra_info": {"split": split, "index": idx, "problem": question},
             }
             return data
 

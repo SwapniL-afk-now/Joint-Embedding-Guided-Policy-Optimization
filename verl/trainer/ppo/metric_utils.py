@@ -336,12 +336,31 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     """
     total_num_tokens = sum(batch.meta_info["global_token_num"])
     time = timing_raw["step"]
+
+    # Running totals and peak memory for cost accounting. Per-step values alone
+    # cannot answer "tokens to reach the target" or "GPU-hours to reach it" -- those
+    # need a cumulative series, and reconstructing one after the fact from a
+    # downsampled wandb history is lossy. Accumulate on the function object so no
+    # trainer state or call-site change is required.
+    fn = compute_throughout_metrics
+    fn.cumulative_tokens = getattr(fn, "cumulative_tokens", 0) + total_num_tokens
+    fn.cumulative_seconds = getattr(fn, "cumulative_seconds", 0.0) + time
+
+    peak_memory_gb = 0.0
+    if torch.cuda.is_available():
+        # max_memory_allocated is monotonic since the last reset, so this is the peak
+        # over the whole run -- which is the number Table 4 reports.
+        peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
+
     # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
     # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,
     return {
         "perf/total_num_tokens": total_num_tokens,
         "perf/time_per_step": time,
+        "perf/cumulative_tokens": fn.cumulative_tokens,
+        "perf/cumulative_gpu_hours": fn.cumulative_seconds * n_gpus / 3600.0,
+        "perf/peak_memory_gb": peak_memory_gb,
         "perf/throughput": total_num_tokens / (time * n_gpus),
     }
 

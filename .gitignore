@@ -8,6 +8,9 @@
 **/playground
 **/wandb
 jepa-grpo-cache/
+/eval_results/
+merged_ckpt/
+grad_direction_probe/*.jsonl
 
 /pyrightconfig.json
 
@@ -139,3 +142,14 @@ results/
 eval_smoketest/
 *.out
 grpo-1.5b-math-wandb.csv
+
+# run artifacts (t-SNE dumps, per-run diagnostics)
+analysis/
+
+# training logs: Ray used to dump credentials into these (see redact_secrets)
+logs_*.log
+*.oom.log
+.env
+
+# per-run validation dumps (155M+, Table 2 source, kept local)
+val_dumps/

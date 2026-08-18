@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Example Sequence Sharpening GRPO launch. Mirrors
-# examples/tafr_grpo/run_tafr_grpo_fsdp.sh so that the only differences
+# examples/sdc_grpo/run_sdc_grpo_fsdp.sh so that the only differences
 # are the algorithm-specific knobs. Override paths and model/data
 # settings from the environment to keep the script usable for baselines.
 

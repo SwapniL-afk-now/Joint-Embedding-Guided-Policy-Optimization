@@ -169,15 +169,20 @@ def validate_config(
     if config.algorithm.get("use_kl_in_reward", False) and config.actor_rollout_ref.actor.use_kl_loss:
         print("NOTICE: You have both enabled in-reward kl and kl loss.")
 
-    if config.get("custom_tafr_grpo", {}).get("enable", False):
-        from verl.experimental.tafr_grpo.config import validate_tafr_config
+    if config.get("custom_sdc", {}).get("enable", False) or config.get("custom_sdc_grpo", {}).get("enable", False):
+        from verl.experimental.sdc.config import validate_sdc_config
 
-        validate_tafr_config(config)
+        validate_sdc_config(config)
 
     if config.get("custom_sharpening_grpo", {}).get("enable", False):
         from verl.experimental.sharpening_grpo.config import validate_sharpening_config
 
         validate_sharpening_config(config)
+
+    if config.get("custom_abstract_rl", {}).get("enable", False):
+        from verl.experimental.abstract_rl.config import validate_abstract_rl_config
+
+        validate_abstract_rl_config(config)
 
     # critic
     if use_critic:

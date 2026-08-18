@@ -1,0 +1,17 @@
+--- Joint-Embedding-Guided-Policy-Optimization/verl/experimental/jepa_grpo/worker.py
++++ Joint-Embedding-Guided-Policy-Optimization/verl/experimental/jepa_grpo/worker.py
+@@ -1550,5 +1550,14 @@
+                     self.predictor_delta.grad.div_(dp_size)
+                 pred_gn = float(self.predictor_delta.grad.detach().norm().cpu())
+                 _prev_delta = self.predictor_delta.data.clone()  # for ||Δθ|| applied
+ 
++            if not fuse:
++                # FSDP's sequential JEPA-only backward can leave an optimizer
++                # group containing tensors from distinct FSDP views. PyTorch's
++                # foreach Adam path requires every tensor at a given list index
++                # to share a device and dtype, and therefore aborts before the
++                # first update. The scalar path handles FSDP parameters
++                # independently; keep the fused (normal policy) path unchanged.
++                for group in engine.optimizer.param_groups:
++                    group["foreach"] = False
+             grad_norm = engine.optimizer_step(clip_grad_override=clip_used)

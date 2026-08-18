@@ -41,7 +41,16 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
-    if data_source == "openai/gsm8k":
+    if data_source in ("ifeval", "followbench"):
+        # Rule-verifiable instruction following, FEPO cross-domain check (Table 5).
+        from . import instruction_following
+
+        res = instruction_following.compute_score(solution_str, ground_truth, extra_info)
+    elif data_source == "mmlu":
+        from . import instruction_following
+
+        res = instruction_following.compute_score_mmlu(solution_str, ground_truth, extra_info)
+    elif data_source == "openai/gsm8k":
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
@@ -66,6 +75,10 @@ def default_compute_score(
         "olympiadbench",
         "deepscaler-preview-dataset",
         "minervamath",
+        # probe256.parquet (00_setup.sh) -- held-out math prompts for the Table 2
+        # mechanism analysis. Same scoring as any other math source; without this
+        # entry every probe validation raises NotImplementedError.
+        "probe",
     ] or data_source.startswith("aime"):
         from verl.experimental.fepo.math_parser import compute_math_reward
 

@@ -17,7 +17,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.experimental.sharpening_grpo.loss import compute_sharpening_grpo_loss
-from verl.experimental.tafr_grpo.tafr_loss import compute_tafr_grpo_auxiliary_loss
+from verl.experimental.sdc.sdc_loss import compute_sdc_loss
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -25,7 +25,7 @@ from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
-from verl.workers.utils.wasserstein_guidance import compute_wasserstein_guidance_loss, _as_list
+from verl.workers.utils.wasserstein_guidance import _as_list, compute_wasserstein_guidance_loss
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -88,11 +88,16 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
 
     metrics = {}
 
-    tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default=None)
-    tafr_group_ids = _as_list(data.get("uid", None)) if tafr_config and tafr_config.get("enable", False) else []
+    sdc_config = tu.get_non_tensor_data(data=data, key="custom_sdc", default=None)
+
+    gpi_config = tu.get_non_tensor_data(data=data, key="custom_gpi_ce", default=None)
+    gpi_enabled = bool(gpi_config and gpi_config.get("enable", False))
 
     sharpening_config = tu.get_non_tensor_data(data=data, key="custom_sharpening_grpo", default=None)
     sharpening_enabled = bool(sharpening_config and sharpening_config.get("enable", False))
+
+    abstract_config = tu.get_non_tensor_data(data=data, key="custom_abstract_rl", default=None)
+    abstract_enabled = bool(abstract_config and abstract_config.get("enable", False))
 
     wasserstein_guidance = getattr(config, "wasserstein_guidance", {})
     wg_enabled = bool(wasserstein_guidance.get("enable", False))
@@ -114,13 +119,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         for field in ("rm_scores", "token_level_rewards"):
             if field in data:
                 fields.append(field)
-    tafr_enabled = bool(tafr_config and tafr_config.get("enable", False))
-    if tafr_enabled:
-        for field in (
-            "tafr_group_reward_mean",
-            "tafr_anchor_log_probs",
-            "tafr_replay_log_probs",
-        ):
+    sdc_enabled = bool(sdc_config and sdc_config.get("enable", False))
+    if sdc_enabled:
+        for field in ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs"):
             if field in data:
                 fields.append(field)
     if sharpening_enabled:
@@ -128,6 +129,19 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         # standard fields. Make sure it is included in the padded payload.
         if "ref_log_prob" in data and "ref_log_prob" not in fields:
             fields.append("ref_log_prob")
+    if gpi_enabled:
+        for field in ("gpi_q_target", "gpi_group_id", "gpi_scalar_reward", "gpi_is_offline"):
+            if field in data:
+                fields.append(field)
+    if abstract_enabled:
+        for field in (
+            "abstract_mask",
+            "abstract_reasoning_mask",
+            "abstract_prior_log_probs",
+            "abstract_kl_weight",
+        ):
+            if field in data:
+                fields.append(field)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
@@ -144,16 +158,36 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
-    policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=policy_response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_is_weights=rollout_is_weights,
-    )
+    if gpi_enabled:
+        # GPI-CE is a finite-group cross entropy, not a policy-gradient surrogate:
+        # it needs the candidate group and q*, neither of which the registered
+        # policy-loss interface carries, and it uses no ratio, clip or advantage.
+        from verl.experimental.gpi_ce import compute_gpi_ce_loss
+
+        pg_loss, pg_metrics = compute_gpi_ce_loss(
+            log_prob=log_prob,
+            response_mask=policy_response_mask,
+            group_size=int(gpi_config["group_size"]),
+            groups_per_rank=int(gpi_config["groups_per_rank"]),
+            # Absent on the fused path -> q* is built here from the detached scores,
+            # which saves the whole separate old-policy forward.
+            q_target=data.get("gpi_q_target", None),
+            group_ids=data.get("gpi_group_id", None),
+            rewards=data.get("gpi_scalar_reward", None),
+            temperature=float(gpi_config["temperature"]),
+            is_offline=data.get("gpi_is_offline", None),
+        )
+    else:
+        policy_loss_fn = get_policy_loss_fn(loss_mode)
+        pg_loss, pg_metrics = policy_loss_fn(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=policy_response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_is_weights=rollout_is_weights,
+        )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
@@ -193,9 +227,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         # When use_grpo_reward=False, the GRPO contribution is exactly 0 but the
         # term is still computed and reported in metrics for diagnostics.
         grpo_scale = ppo_loss_coef if sharpening_use_grpo_reward else 0.0
-        policy_loss = grpo_scale * sharpen_output.grpo_term \
-            + sharpening_gamma * sharpening_alpha * sharpen_output.seq_term \
+        policy_loss = (
+            grpo_scale * sharpen_output.grpo_term
+            + sharpening_gamma * sharpening_alpha * sharpen_output.seq_term
             + sharpening_beta * sharpen_output.kl_term
+        )
 
         sharpen_metrics = Metric.from_dict(sharpen_output.metrics, aggregation=AggregationType.MEAN)
         metrics.update(sharpen_metrics)
@@ -206,24 +242,27 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         metrics["sharpen/alpha"] = Metric(value=sharpening_alpha, aggregation=AggregationType.MAX)
         metrics["sharpen/beta"] = Metric(value=sharpening_beta, aggregation=AggregationType.MAX)
 
-    if tafr_enabled:
-        if "tafr_group_reward_mean" not in data:
-            raise ValueError("TAFR-GRPO batch is missing required field: tafr_group_reward_mean")
-        tafr_output = compute_tafr_grpo_auxiliary_loss(
+    if sdc_enabled:
+        required = ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs")
+        missing = [field for field in required if field not in data]
+        if missing:
+            raise ValueError(f"SDC batch is missing required fields: {missing}")
+        sdc_loss, sdc_stats = compute_sdc_loss(
             log_prob=log_prob,
+            old_log_prob=old_log_prob,
+            success_log_prob=data["sdc_success_log_probs"],
+            failure_log_prob=data["sdc_failure_log_probs"],
             response_mask=response_mask,
-            group_reward_mean=data["tafr_group_reward_mean"],
-            beta=float(tafr_config.get("beta", 0.0)),
-            variant=str(tafr_config.get("variant", "full")),
-            anchor_log_prob=data.get("tafr_anchor_log_probs", None),
-            replay_log_prob=data.get("tafr_replay_log_probs", None),
-            group_ids=tafr_group_ids,
+            failure_mask=data["sdc_failure_mask"],
+            beta=float(sdc_config.get("beta", 0.0)),
+            loss_agg_mode="token-mean",
+            global_batch_info=config.global_batch_info,
+            use_importance_weight=bool(sdc_config.get("use_importance_weight", True)),
+            importance_weight_clip=float(sdc_config.get("importance_weight_clip", 10.0)),
+            models_ready=bool(sdc_config.get("sdc_models_ready", False)),
         )
-        policy_loss += tafr_output.loss
-        tafr_metrics = Metric.from_dict(tafr_output.metrics, aggregation=AggregationType.MEAN)
-        metrics.update(tafr_metrics)
-        metrics["tafr_grpo/loss_grpo"] = Metric(value=pg_loss, aggregation=metric_aggregation)
-
+        policy_loss = policy_loss + sdc_loss
+        metrics.update(Metric.from_dict(sdc_stats, aggregation=AggregationType.MEAN))
     # add entropy loss
     if entropy is not None:
         entropy_loss = agg_loss(
@@ -254,6 +293,60 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         metrics["wasserstein_guidance/active_groups"] = wg_stats.active_groups
         metrics["wasserstein_guidance/mixed_group_fraction"] = wg_stats.mixed_group_fraction
         metrics["wasserstein_guidance/mean_wrong_mass"] = wg_stats.mean_wrong_mass
+
+    # add the abstraction compression KL (correct + valid abstraction tokens only)
+    if abstract_enabled and "abstract_mask" in data:
+        from verl.experimental.abstract_rl.loss import (
+            compute_abstract_sft_loss,
+            compute_compression_loss,
+            compute_span_diagnostics,
+        )
+
+        abstract_mask = data["abstract_mask"].to(bool) & response_mask
+        reasoning_mask = data["abstract_reasoning_mask"].to(bool) & response_mask
+        sft_warmup = bool(abstract_config.get("sft_warmup", False))
+        if sft_warmup:
+            # Format warm-up: imitate the grafted abstractions outright. The policy
+            # loss is dropped (its ratio is 1 by construction on grafted rows) and
+            # the compression KL is off until the format exists.
+            sft_loss, sft_metrics = compute_abstract_sft_loss(
+                log_prob=log_prob, abstract_mask=abstract_mask, row_weight=data["abstract_kl_weight"]
+            )
+            policy_loss = sft_loss
+            metrics.update(
+                Metric.from_dict(
+                    {f"abstract_rl/{k}": v for k, v in sft_metrics.items()}, aggregation=AggregationType.MEAN
+                )
+            )
+            metrics["abstract_rl/sft_warmup"] = 1.0
+        compression_loss, compression_metrics = compute_compression_loss(
+            log_prob=log_prob,
+            prior_log_prob=data["abstract_prior_log_probs"],
+            abstract_mask=abstract_mask,
+            row_weight=data["abstract_kl_weight"],
+            kl_type=str(abstract_config.get("kl_type", "low_var_kl")),
+            kl_clip=float(abstract_config.get("kl_clip", 0.0)),
+        )
+        kl_coef = 0.0 if sft_warmup else float(abstract_config.get("kl_coef", 0.0))
+        policy_loss = policy_loss + kl_coef * compression_loss
+        compression_metrics.update(
+            compute_span_diagnostics(
+                log_prob=log_prob,
+                old_log_prob=old_log_prob,
+                entropy=entropy,
+                reasoning_mask=reasoning_mask,
+                abstract_mask=abstract_mask,
+                response_mask=response_mask,
+                clip_low=config.clip_ratio_low,
+                clip_high=config.clip_ratio_high,
+            )
+        )
+        metrics.update(
+            Metric.from_dict(
+                {f"abstract_rl/{k}": v for k, v in compression_metrics.items()}, aggregation=AggregationType.MEAN
+            )
+        )
+        metrics["abstract_rl/kl_coef"] = kl_coef
 
     if config.use_kl_loss:
         ref_log_prob = data["ref_log_prob"]

@@ -17,7 +17,7 @@ sigreg_loss to zero-mean / unit per-dim variance first.
 import torch
 import torch.nn.functional as F
 
-from verl.experimental.jepa_grpo.core_algos import sigreg_loss
+from verl.experimental.jepa_grpo.core_algos import llm_jepa_paper_loss, sigreg_loss
 
 
 def _isotropic_sphere(n, d, seed):
@@ -93,3 +93,33 @@ def test_sigreg_is_finite_on_total_collapse():
     loss = sigreg_loss(x, M=512)
     assert torch.isfinite(loss), loss.item()
     assert loss.item() > 0.0
+
+
+def test_llm_jepa_is_single_raw_code_target_with_detached_target():
+    pred = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], requires_grad=True)
+    target = torch.tensor([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]], requires_grad=True)
+    loss, metrics = llm_jepa_paper_loss(pred, target, sigreg_lambda=0.0)
+
+    expected = (1.0 - F.cosine_similarity(pred, target.detach(), dim=-1)).mean()
+    assert torch.allclose(loss, expected)
+    assert metrics["jepa/n_anchors_cot"] == 0
+    assert metrics["jepa/n_anchors_code"] == 2
+
+    loss.backward()
+    assert pred.grad is not None
+    assert target.grad is None
+
+
+def test_llm_jepa_sigreg_has_live_prediction_gradient():
+    torch.manual_seed(7)
+    pred = F.normalize(torch.randn(8, 16), dim=-1).detach().requires_grad_(True)
+    target = F.normalize(torch.randn(8, 16), dim=-1)
+    torch.manual_seed(11)
+    loss, metrics = llm_jepa_paper_loss(
+        pred, target, sigreg_lambda=0.1, sigreg_projections=32
+    )
+    assert metrics["jepa/sigreg_lambda"] == 0.1
+    assert metrics["jepa/paper_sigreg_loss"] > 0.0
+    loss.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()

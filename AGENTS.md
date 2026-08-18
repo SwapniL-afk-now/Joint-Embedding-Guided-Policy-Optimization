@@ -5,6 +5,14 @@
 > and how to run training + evaluation. The rest of this file is the upstream verl
 > contribution policy.
 
+> **Every script runs in tmux. No exceptions.** Training, eval, merges, uploads —
+> launch each one in its own named tmux session (`tmux new-session -d -s <name>`,
+> then `send-keys`), never with `nohup`/`setsid`/`&`. A detached `setsid` job survives
+> but cannot be attached to, so nobody can watch or drive it afterwards.
+> Two things that cost real time when skipped: `send-keys` into a just-created session
+> is eaten by shell startup (send a `cd` first and confirm with `pwd`), and the pane's
+> cwd is not your shell's — always send absolute paths or `cd` inside the pane.
+
 > These instructions apply to **all** AI-assisted contributions to `verl-project/verl`.
 > Breaching these guidelines can result in automatic banning.
 

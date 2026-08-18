@@ -20,21 +20,24 @@ def score_outputs(outputs, meta, n):
     for out, (data_source, ground_truth) in zip(outputs, meta):
         row = []
         for sample in out.outputs[:n]:
-            row.append(bool(default_compute_score(data_source, sample.text, ground_truth)["acc"]))
+            # Most scorers return {"score","acc",...}; gsm8k returns a bare float.
+            res = default_compute_score(data_source, sample.text, ground_truth)
+            row.append(bool(res["acc"] if isinstance(res, dict) else res > 0))
         correct.append(row)
     return np.asarray(correct, dtype=bool)
 
 
+METRIC_NAMES = ["avg@32", "pass@1", "pass@8", "pass@16", "pass@32"]
+
+
 def summarize(correct):
-    first8 = correct[:, :8]
-    first16 = correct[:, :16]
-    return {
-        "pass@1": float(correct[:, 0].mean()),
-        "avg@8": float(first8.mean()),
-        "pass@8": float(first8.any(axis=1).mean()),
-        "avg@16": float(first16.mean()),
-        "pass@16": float(first16.any(axis=1).mean()),
-    }
+    n = correct.shape[1]
+    out = {"pass@1": float(correct[:, 0].mean())}
+    for k in (8, 16, 32):
+        if k <= n:
+            out[f"avg@{k}"] = float(correct[:, :k].mean())
+            out[f"pass@{k}"] = float(correct[:, :k].any(axis=1).mean())
+    return out
 
 
 def main():
@@ -48,6 +51,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.92)
+    parser.add_argument("--max-num-seqs", type=int, default=2048)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=131072)
     args = parser.parse_args()
 
     benchmarks = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
@@ -98,6 +103,8 @@ def main():
         dtype="bfloat16",
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=4096,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
         trust_remote_code=False,
     )
     outputs = llm.generate(batched_prompts, sampling_params)
@@ -112,7 +119,7 @@ def main():
             per_seed[str(seed)][benchmark] = summarize(seed_correct[start:end])
 
     per_benchmark = {}
-    metric_names = ["pass@1", "avg@8", "pass@8", "avg@16", "pass@16"]
+    metric_names = list(per_seed[str(seeds[0])][benchmarks[0]].keys())
     for benchmark in benchmarks:
         per_benchmark[benchmark] = {"n_q": spans[benchmark][1] - spans[benchmark][0]}
         for metric in metric_names:
@@ -121,10 +128,16 @@ def main():
             per_benchmark[benchmark][f"{metric}_std"] = float(values.std())
             per_benchmark[benchmark][f"{metric}_seeds"] = values.tolist()
 
+    # Macro = mean over benchmarks, computed per seed first, so the reported std is
+    # the spread across seeds (what varies) rather than across benchmarks.
     macro = {}
     for metric in metric_names:
-        values = np.asarray([per_benchmark[b][f"{metric}_mean"] for b in benchmarks], dtype=float)
-        macro[metric] = float(values.mean())
+        per_seed_macro = [
+            float(np.mean([per_seed[str(seed)][b][metric] for b in benchmarks])) for seed in seeds
+        ]
+        macro[f"{metric}_mean"] = float(np.mean(per_seed_macro))
+        macro[f"{metric}_std"] = float(np.std(per_seed_macro))
+        macro[f"{metric}_seeds"] = per_seed_macro
 
     result = {
         "model": args.model,
@@ -141,22 +154,14 @@ def main():
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(result, indent=2))
 
-    print("\nbenchmark      pass@1        avg@8         pass@8        avg@16        pass@16")
+    header = "benchmark    n_q  " + "  ".join(f"{m:^17}" for m in metric_names)
+    print("\n" + header)
     for benchmark in benchmarks:
         row = per_benchmark[benchmark]
-        print(
-            f"{benchmark:12} "
-            f"{row['pass@1_mean']:.4f}+/-{row['pass@1_std']:.4f}  "
-            f"{row['avg@8_mean']:.4f}+/-{row['avg@8_std']:.4f}  "
-            f"{row['pass@8_mean']:.4f}+/-{row['pass@8_std']:.4f}  "
-            f"{row['avg@16_mean']:.4f}+/-{row['avg@16_std']:.4f}  "
-            f"{row['pass@16_mean']:.4f}+/-{row['pass@16_std']:.4f}"
-        )
-    print(
-        f"{'MACRO':12} "
-        f"{macro['pass@1']:.4f}        {macro['avg@8']:.4f}        "
-        f"{macro['pass@8']:.4f}        {macro['avg@16']:.4f}        {macro['pass@16']:.4f}"
-    )
+        cells = "  ".join(f"{row[m+'_mean']:.4f}+/-{row[m+'_std']:.4f}" for m in metric_names)
+        print(f"{benchmark:12} {row['n_q']:4d}  {cells}")
+    cells = "  ".join(f"{macro[m+'_mean']:.4f}+/-{macro[m+'_std']:.4f}" for m in metric_names)
+    print(f"{'MACRO':12} {'':4}  {cells}")
     print(f"\nsaved -> {args.out}")
 
 

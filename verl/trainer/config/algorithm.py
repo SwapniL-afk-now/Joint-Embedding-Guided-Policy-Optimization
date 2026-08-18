@@ -651,6 +651,7 @@ class AlgoConfig(BaseConfig):
     gamma: float = 1.0
     lam: float = 1.0
     adv_estimator: str = "gae"
+    base_rl_name: Optional[str] = None
     norm_adv_by_std_in_grpo: bool = True
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
@@ -667,3 +668,15 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+
+    # Paper-faithful NGRPO calibration and asymmetric clipping.
+    ngrpo_r_max: float = 1.0
+    ngrpo_epsilon_pos: float = 0.24
+    ngrpo_epsilon_neg: float = 0.16
+
+    # Paper-faithful AVSPO collapse calibration.
+    avspo_collapse_tau: float = 1e-6
+    avspo_alpha: float = 0.5
+    avspo_anchor_reward: float = 0.1
+    avspo_adapt_tau_init: float = 0.5
+    avspo_adapt_eta: float = 0.01

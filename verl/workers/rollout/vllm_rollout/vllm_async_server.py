@@ -34,9 +34,9 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
-from verl.experimental.tafr_grpo.vllm_scoring import (
+from verl.experimental.sdc.vllm_scoring import (
     extract_response_logprobs_from_prompt_logprobs,
-    tafr_vllm_adapter_spec,
+    sdc_vllm_adapter_spec,
 )
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
@@ -203,13 +203,13 @@ class vLLMHttpServer:
             kwargs=kwargs,
         )
 
-    async def load_tafr_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict):
+    async def load_sdc_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict):
         import pickle
         if self.node_rank != 0:
             return
         # Pickle lora_tensors to bytes so torch.Tensors survive msgpack serialization
         await self.engine.collective_rpc(
-            method="load_tafr_lora_adapter",
+            method="load_sdc_lora_adapter",
             kwargs={"adapter": adapter, "peft_config": peft_config, "lora_tensors_pkl": pickle.dumps(lora_tensors)},
         )
 
@@ -503,7 +503,14 @@ class vLLMHttpServer:
         assert max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        # Booleans retain the legacy sampled-token behavior. A positive integer
+        # asks vLLM for top alternatives, used by Hindsight-Posterior GRPO.
+        requested_logprobs = sampling_params.pop("logprobs", False)
+        sampling_params["logprobs"] = (
+            0
+            if requested_logprobs is True
+            else (int(requested_logprobs) if isinstance(requested_logprobs, int) and requested_logprobs > 0 else None)
+        )
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -568,6 +575,11 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            if sampling_params.logprobs > 0:
+                extra_fields["top_logprobs"] = [
+                    [(int(token_id), float(item.logprob)) for token_id, item in entries.items()]
+                    for entries in final_res.outputs[0].logprobs
+                ]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -596,7 +608,7 @@ class vLLMHttpServer:
             extra_fields=extra_fields,
         )
 
-    async def score_tafr_logprobs(
+    async def score_sdc_logprobs(
         self,
         sequence_ids: list[int],
         prompt_len: int,
@@ -605,14 +617,14 @@ class vLLMHttpServer:
         request_id: str,
         priority: int = 0,
     ) -> list[float]:
-        """Score existing prompt+response tokens under a TAFR LoRA adapter."""
+        """Score existing prompt+response tokens under a SDC LoRA adapter."""
 
         if self.node_rank != 0:
             return []
         sequence_ids = normalize_token_ids(sequence_ids)
-        spec = tafr_vllm_adapter_spec(adapter)
+        spec = sdc_vllm_adapter_spec(adapter)
         if spec.int_id not in await self.engine.list_loras():
-            raise RuntimeError(f"TAFR vLLM scoring adapter {adapter!r} (int_id={spec.int_id}) is not loaded.")
+            raise RuntimeError(f"SDC vLLM scoring adapter {adapter!r} (int_id={spec.int_id}) is not loaded.")
         if len(sequence_ids) > self.config.max_model_len:
             raise ValueError(
                 f"Sequence length ({len(sequence_ids)}) exceeds max_model_len ({self.config.max_model_len})."

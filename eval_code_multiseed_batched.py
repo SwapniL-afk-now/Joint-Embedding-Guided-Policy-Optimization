@@ -73,12 +73,11 @@ def score_one(ds, text, ground_truth, extra_info):
 
 
 def summarize(correct):
-    first8 = correct[:, :8]
-    metrics = {
-        "pass@1": float(correct[:, 0].mean()),
-        "avg@8": float(first8.mean()),
-        "pass@8": float(np.mean([passk(int(c), 8, 8) for c in first8.sum(axis=1)])),
-    }
+    metrics = {"pass@1": float(correct[:, 0].mean())}
+    if correct.shape[1] >= 8:
+        first8 = correct[:, :8]
+        metrics["avg@8"] = float(first8.mean())
+        metrics["pass@8"] = float(np.mean([passk(int(c), 8, 8) for c in first8.sum(axis=1)]))
     if correct.shape[1] >= 16:
         first16 = correct[:, :16]
         metrics["avg@16"] = float(first16.mean())
@@ -102,8 +101,6 @@ def main():
 
     benchmarks = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
-    if args.n < 8:
-        raise ValueError("--n must be at least 8 to report avg@8/pass@8")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     prompts = []
@@ -180,9 +177,7 @@ def main():
         for benchmark, (start, end) in spans.items():
             per_seed[str(seed)][benchmark] = summarize(seed_correct[start:end])
 
-    metric_names = ["pass@1", "avg@8", "pass@8"]
-    if args.n >= 16:
-        metric_names.extend(["avg@16", "pass@16"])
+    metric_names = list(per_seed[str(seeds[0])][benchmarks[0]].keys())
     per_benchmark = {}
     for benchmark in benchmarks:
         per_benchmark[benchmark] = {"n_q": spans[benchmark][1] - spans[benchmark][0]}
