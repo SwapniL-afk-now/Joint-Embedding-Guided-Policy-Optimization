@@ -21,6 +21,7 @@ implement PPO-like algorithms.
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -341,6 +342,34 @@ def _group_scores(scores: torch.Tensor, index: np.ndarray) -> dict[Any, list[int
     return id2rows
 
 
+@dataclass
+class AVSPOState:
+    tau_adapt: float = 0.5
+    previous_mean_reward: float | None = None
+    last_acr: float = 0.0
+    step: int = 0
+    last_metrics: dict[str, float] = field(default_factory=dict)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "tau_adapt": self.tau_adapt,
+            "previous_mean_reward": self.previous_mean_reward,
+            "last_acr": self.last_acr,
+            "step": self.step,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.tau_adapt = float(state.get("tau_adapt", self.tau_adapt))
+        value = state.get("previous_mean_reward", self.previous_mean_reward)
+        self.previous_mean_reward = None if value is None else float(value)
+        self.last_acr = float(state.get("last_acr", self.last_acr))
+        self.step = int(state.get("step", self.step))
+
+
+def _population_std(values: torch.Tensor) -> torch.Tensor:
+    return values.std(unbiased=False) if values.numel() else values.new_tensor(0.0)
+
+
 @register_adv_est(AdvantageEstimator.NGRPO)
 def compute_ngrpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -350,46 +379,25 @@ def compute_ngrpo_outcome_advantage(
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """NGRPO: repair all-negative groups instead of discarding them.
+    """Paper-faithful NGRPO Advantage Calibration.
 
-    Table 1 baseline. GRPO gives every response in an all-wrong group an advantage of
-    exactly zero, so the group contributes no gradient at all -- the failure mode FEPO
-    is built to address. NGRPO instead treats the group as if a hypothetical correct
-    response had been observed, restoring a non-zero (uniformly negative) advantage
-    that pushes the whole group down.
-
-    Mixed and all-correct groups are left exactly as GRPO computes them, so the only
-    difference from the GRPO baseline is confined to homogeneous-failure groups.
-
-    Config (`algorithm.ngrpo_virtual_reward`, default 1.0): the reward assigned to the
-    hypothetical correct response.
+    Every group is normalized after appending one non-gradient reward ``r_max``;
+    the returned tensor contains advantages only for real rows.
     """
-    scores = token_level_rewards.sum(dim=-1)
-    virtual = 1.0
-    if config is not None:
-        virtual = float(config.get("ngrpo_virtual_reward", 1.0) or 1.0)
 
+    scores = token_level_rewards.sum(dim=-1)
+    r_max = float(config.get("ngrpo_r_max", 1.0) if config is not None else 1.0)
     with torch.no_grad():
-        out = scores.clone()
+        out = scores.new_zeros(scores.shape)
         for rows in _group_scores(scores, index).values():
             group = scores[rows]
-            if group.numel() == 1:
-                out[rows[0]] = 0.0
-                continue
-            if bool((group > 0).any()):
-                mean, std = group.mean(), group.std()
-            else:
-                # All-wrong: append the virtual success and recompute the group
-                # statistics against it. Every real response then sits below the
-                # mean, so the group yields a uniform negative advantage rather
-                # than the zero GRPO would assign.
-                augmented = torch.cat([group, group.new_tensor([virtual])])
-                mean, std = augmented.mean(), augmented.std()
+            augmented = torch.cat([group, group.new_tensor([r_max])])
+            mean = augmented.mean()
+            std = _population_std(augmented)
             centered = group - mean
             out[rows] = centered / (std + epsilon) if norm_adv_by_std_in_grpo else centered
-        scores = out.unsqueeze(-1) * response_mask
-
-    return scores, scores
+        out = out.unsqueeze(-1) * response_mask
+    return out, out
 
 
 @register_adv_est(AdvantageEstimator.AVSPO)
@@ -400,52 +408,61 @@ def compute_avspo_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    state: Optional[AVSPOState] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """AVSPO: restore advantage variance in homogeneous groups from batch statistics.
+    """Paper-faithful AVSPO collapse calibration with optional trainer state."""
 
-    Table 1 baseline, and the paper's closest scalar-collapse competitor. Where NGRPO
-    invents a single virtual response, AVSPO replaces a collapsed group's statistics
-    with the running batch-level reward mean and std, so an all-wrong group is scored
-    against how the rest of the batch is doing rather than against itself.
-
-    This is the sharpest contrast with FEPO: AVSPO repairs the *scalar* advantage and
-    leaves the direction to the base objective, whereas FEPO leaves the scalar
-    advantage untouched and supplies a direction learned from recurrent failures.
-
-    Config (`algorithm.avspo_virtual_std_floor`, default 0.1): lower bound on the
-    substituted std, so a batch that is itself homogeneous cannot produce an
-    unbounded advantage.
-    """
     scores = token_level_rewards.sum(dim=-1)
-    std_floor = 0.1
-    if config is not None:
-        std_floor = float(config.get("avspo_virtual_std_floor", 0.1) or 0.1)
+    collapse_tau = float(config.get("avspo_collapse_tau", 1e-6) if config is not None else 1e-6)
+    alpha = float(config.get("avspo_alpha", 0.5) if config is not None else 0.5)
+    anchor_reward = float(config.get("avspo_anchor_reward", 0.1) if config is not None else 0.1)
+    eta = float(config.get("avspo_adapt_eta", 0.01) if config is not None else 0.01)
+    if state is None:
+        state = AVSPOState(tau_adapt=float(config.get("avspo_adapt_tau_init", 0.5) if config is not None else 0.5))
 
+    groups = list(_group_scores(scores, index).values())
+    collapsed = [len(rows) > 0 and bool(_population_std(scores[rows]) < collapse_tau) for rows in groups]
+    acr = float(sum(collapsed) / max(len(groups), 1))
+    trigger = acr > state.tau_adapt
+    group_size = max((len(rows) for rows in groups), default=1)
+    k_virtual = max(1, min(group_size, int(np.ceil(group_size * (acr**alpha)))))
     with torch.no_grad():
-        batch_mean = scores.mean()
-        batch_std = scores.std() if scores.numel() > 1 else scores.new_tensor(0.0)
-        batch_std = torch.clamp(batch_std, min=std_floor)
-
-        out = scores.clone()
-        for rows in _group_scores(scores, index).values():
+        out = scores.new_zeros(scores.shape)
+        for rows, is_collapsed in zip(groups, collapsed, strict=True):
             group = scores[rows]
-            if group.numel() == 1:
-                out[rows[0]] = 0.0
-                continue
-            positives = (group > 0)
-            if bool(positives.any()) and not bool(positives.all()):
-                mean, std = group.mean(), group.std()
+            if trigger and is_collapsed:
+                observed = group.max()
+                if float(observed) > 0:
+                    virtual = torch.stack([observed * (1.0 - k / (k_virtual + 1.0)) for k in range(1, k_virtual + 1)])
+                else:
+                    virtual = group.new_tensor([anchor_reward * (k_virtual - k + 1) / k_virtual for k in range(1, k_virtual + 1)])
+                augmented = torch.cat([group, virtual])
             else:
-                # Collapsed group (all-wrong or all-correct): its own mean carries no
-                # information, so score it against the batch. An all-wrong group lands
-                # below batch_mean and an all-correct group above it, which is the
-                # variance AVSPO exists to restore.
-                mean, std = batch_mean, batch_std
+                augmented = group
+            mean = augmented.mean()
+            std = _population_std(augmented)
             centered = group - mean
             out[rows] = centered / (std + epsilon) if norm_adv_by_std_in_grpo else centered
-        scores = out.unsqueeze(-1) * response_mask
 
-    return scores, scores
+    mean_reward = float(scores.mean().detach().cpu()) if scores.numel() else 0.0
+    delta = None if state.previous_mean_reward is None else mean_reward - state.previous_mean_reward
+    if delta is not None:
+        state.tau_adapt += eta * (1.0 if delta > 0 else -1.0 if delta < 0 else 0.0) * (acr - state.tau_adapt)
+    state.previous_mean_reward = mean_reward
+    state.last_acr = acr
+    state.step += 1
+    state.last_metrics = {
+        "avspo/acr": acr,
+        "avspo/tau_adapt": state.tau_adapt,
+        "avspo/triggered": float(trigger),
+        "avspo/k_virtual": float(k_virtual if trigger else 0),
+        "avspo/collapsed_groups": float(sum(collapsed)),
+        "avspo/augmented_groups": float(sum(collapsed) if trigger else 0),
+        "avspo/mean_reward": mean_reward,
+        "avspo/delta_reward": 0.0 if delta is None else delta,
+    }
+    out = out.unsqueeze(-1) * response_mask
+    return out, out
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
@@ -1484,6 +1501,45 @@ def compute_policy_loss_vanilla(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
     return pg_loss, pg_metrics
+
+
+@register_policy_loss("ngrpo")
+def compute_policy_loss_ngrpo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """NGRPO's sign-dependent PPO clipping.
+
+    The positive and negative boundaries are independent: 0.24 for positive
+    advantages and 0.16 for negative advantages in the paper's main setup.
+    """
+
+    assert config is not None
+    eps_pos = float(config.get("ngrpo_epsilon_pos", config.clip_ratio_high if config.clip_ratio_high is not None else 0.24))
+    eps_neg = float(config.get("ngrpo_epsilon_neg", config.clip_ratio_low if config.clip_ratio_low is not None else 0.16))
+    log_ratio = (log_prob - old_log_prob).clamp(min=-20.0, max=20.0)
+    ratio = log_ratio.exp()
+    clipped = torch.where(
+        advantages >= 0,
+        ratio.clamp(max=1.0 + eps_pos),
+        ratio.clamp(min=1.0 - eps_neg),
+    )
+    loss_unclipped = -advantages * ratio
+    loss_clipped = -advantages * clipped
+    losses = torch.maximum(loss_unclipped, loss_clipped)
+    if rollout_is_weights is not None:
+        losses = losses * rollout_is_weights
+    pg_loss = agg_loss(loss_mat=losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info)
+    return pg_loss, {
+        "actor/pg_clipfrac": verl_F.masked_mean(loss_clipped.gt(loss_unclipped).float(), response_mask).detach().item(),
+        "actor/ppo_kl": verl_F.masked_mean(-log_ratio, response_mask).detach().item(),
+        "actor/pg_clipfrac_lower": 0.0,
+    }
 
 
 @register_policy_loss("dppo_tv")

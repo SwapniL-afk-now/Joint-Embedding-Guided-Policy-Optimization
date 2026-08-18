@@ -34,7 +34,7 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
-from verl.experimental.sdc_grpo.vllm_scoring import (
+from verl.experimental.sdc.vllm_scoring import (
     extract_response_logprobs_from_prompt_logprobs,
     sdc_vllm_adapter_spec,
 )

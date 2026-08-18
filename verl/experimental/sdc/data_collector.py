@@ -1,0 +1,191 @@
+from __future__ import annotations
+
+import math
+import random
+from collections import deque
+from dataclasses import asdict, dataclass, field
+from typing import Any, Iterable, Optional
+
+import torch
+
+
+def validate_sdc_outcome(outcome: torch.Tensor | Any) -> torch.BoolTensor:
+    """Validate one exact semantic 0/1 outcome per response row."""
+
+    values = torch.as_tensor(outcome)
+    if values.ndim == 0:
+        values = values.reshape(1)
+    elif values.ndim == 2 and values.shape[1] == 1:
+        values = values[:, 0]
+    elif values.ndim != 1:
+        raise ValueError(f"sdc_outcome must contain one scalar per row, got shape {tuple(values.shape)}")
+    values = values.detach().to(dtype=torch.float32)
+    if not bool(torch.isfinite(values).all()):
+        raise ValueError("sdc_outcome cannot contain NaN or Inf.")
+    valid = (values == 0.0) | (values == 1.0)
+    if not bool(valid.all()):
+        invalid = values[~valid].tolist()
+        raise ValueError(f"sdc_outcome must contain exact 0/1 values, received {invalid[:8]}")
+    return values.to(dtype=torch.bool)
+
+
+def extract_sdc_outcome(batch, reward_extra_infos: Optional[dict[str, Any]] = None) -> torch.BoolTensor:
+    """Read the verifier outcome without looking at shaped token rewards."""
+
+    if "sdc_outcome" in batch.batch:
+        return validate_sdc_outcome(batch.batch["sdc_outcome"])
+    if "acc" in batch.batch:
+        return validate_sdc_outcome(batch.batch["acc"])
+    extras = reward_extra_infos or {}
+    for key in ("sdc_outcome", "acc", "correct", "correctness"):
+        values = extras.get(key)
+        if values is not None:
+            return validate_sdc_outcome(values)
+    raise ValueError(
+        "SDC requires an explicit verifier correctness field (sdc_outcome/acc); "
+        "it will not infer outcomes from shaped reward tensors."
+    )
+
+
+@dataclass
+class OutcomeExample:
+    prompt: Any
+    response: Any
+    reward: int
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class OutcomeDataCollector:
+    """Bounded collector that accepts only one configured semantic outcome."""
+
+    def __init__(
+        self,
+        target_reward: int,
+        max_size: Optional[int] = None,
+        sampling: str = "recent",
+        seed: Optional[int] = None,
+    ):
+        if target_reward not in (0, 1):
+            raise ValueError("target_reward must be 0 or 1")
+        if max_size is not None and max_size <= 0:
+            raise ValueError("max_size must be positive or None")
+        if sampling not in {"recent", "uniform"}:
+            raise ValueError("sampling must be 'recent' or 'uniform'")
+        self.target_reward = int(target_reward)
+        self.max_size = max_size
+        self.sampling = sampling
+        self._rng = random.Random(seed)
+        self._examples = deque(maxlen=max_size) if sampling == "recent" else []
+        self.total_seen = 0
+
+    def __len__(self) -> int:
+        return len(self._examples)
+
+    def add(
+        self,
+        *,
+        prompt: Any,
+        response: Any,
+        reward: float | int,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        try:
+            value = float(reward)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(value) or value not in (0.0, 1.0) or int(value) != self.target_reward:
+            return False
+        example = OutcomeExample(prompt, response, self.target_reward, metadata or {})
+        self.total_seen += 1
+        if self.sampling == "recent":
+            self._examples.append(example)
+        elif self.max_size is None or len(self._examples) < self.max_size:
+            self._examples.append(example)
+        else:
+            index = self._rng.randrange(self.total_seen)
+            if index < self.max_size:
+                self._examples[index] = example
+        return True
+
+    def add_many(self, rows: Iterable[dict[str, Any]]) -> int:
+        return sum(int(self.add(**row)) for row in rows)
+
+    def sample(self, batch_size: int) -> list[OutcomeExample]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        examples = list(self._examples)
+        if len(examples) <= batch_size:
+            return examples
+        return examples[-batch_size:] if self.sampling == "recent" else self._rng.sample(examples, batch_size)
+
+    def clear(self) -> None:
+        self._examples.clear()
+
+    def consume(self, count: int) -> None:
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        if self.sampling == "recent":
+            for _ in range(min(count, len(self._examples))):
+                self._examples.popleft()
+        else:
+            del self._examples[: min(count, len(self._examples))]
+
+    def to_records(self) -> list[dict[str, Any]]:
+        return [asdict(example) for example in self._examples]
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "target_reward": self.target_reward,
+            "max_size": self.max_size,
+            "sampling": self.sampling,
+            "total_seen": self.total_seen,
+            "examples": self.to_records(),
+            "rng_state": self._rng.getstate(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if int(state.get("target_reward", self.target_reward)) != self.target_reward:
+            raise ValueError("Outcome collector checkpoint has the wrong target reward.")
+        if state.get("sampling", self.sampling) != self.sampling:
+            raise ValueError("Outcome collector checkpoint has the wrong sampling policy.")
+        self.clear()
+        for row in state.get("examples", []):
+            self.add(
+                prompt=row.get("prompt"),
+                response=row.get("response"),
+                reward=row.get("reward"),
+                metadata=row.get("metadata"),
+            )
+        self.total_seen = int(state.get("total_seen", len(self._examples)))
+        if "rng_state" in state:
+            self._rng.setstate(state["rng_state"])
+
+    def buffer_age(self, current_policy_step: int) -> float:
+        if not self._examples:
+            return 0.0
+        steps = [
+            int(
+                example.metadata.get(
+                    "global_policy_step",
+                    example.metadata.get("global_grpo_step", current_policy_step),
+                )
+            )
+            for example in self._examples
+        ]
+        return float(max(0, current_policy_step - min(steps)))
+
+
+class SuccessDataCollector(OutcomeDataCollector):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, target_reward=1, **kwargs)
+
+
+class FailureDataCollector(OutcomeDataCollector):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, target_reward=0, **kwargs)
+
+
+# Boundary compatibility for old callers.  New code must pass the verifier's
+# semantic field rather than a shaped token reward tensor.
+def binary_outcome_scores(outcome_tensor: torch.Tensor) -> torch.BoolTensor:
+    return validate_sdc_outcome(outcome_tensor)

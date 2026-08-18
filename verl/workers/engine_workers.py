@@ -743,16 +743,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sdc_init(self, sdc_config: dict):
-        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        assert "actor" in self.role, "SDC requires the actor worker"
         if self.config.actor.strategy not in ("fsdp", "fsdp2"):
             raise NotImplementedError(
-                "custom_sdc_grpo.enable=true is currently supported only for HF FSDP/FSDP2 actors."
+                "custom_sdc.enable=true is currently supported only for HF FSDP/FSDP2 actors."
             )
         return self.actor.engine.sdc_init(sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sdc_reinitialize_from_actor(self, sdc_config: dict):
-        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        assert "actor" in self.role, "SDC requires the actor worker"
         return self.actor.engine.sdc_reinitialize_from_actor(sdc_config)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -763,22 +763,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sdc_sft_update(self, success_records: list[dict], failure_records: list[dict], sdc_config: dict):
-        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        assert "actor" in self.role, "SDC requires the actor worker"
         return self.actor.engine.sdc_sft_update(success_records, failure_records, sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sdc_save_checkpoint(self, local_path: str, global_step: int, sdc_config: dict):
-        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        assert "actor" in self.role, "SDC requires the actor worker"
         return self.actor.engine.sdc_save_checkpoint(local_path, global_step, sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sdc_export_vllm_adapters(self, sdc_config: dict):
-        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        assert "actor" in self.role, "SDC requires the actor worker"
         return self.actor.engine.sdc_export_vllm_adapters(sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sdc_load(self, local_path: str, sdc_config: dict | None = None):
-        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        assert "actor" in self.role, "SDC requires the actor worker"
         return self.actor.engine.sdc_load(local_path, sdc_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)

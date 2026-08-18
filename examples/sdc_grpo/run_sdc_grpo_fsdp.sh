@@ -34,14 +34,14 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
     unset _XTRACE_WAS_ON
 fi
 
-PROJECT_NAME=${PROJECT_NAME:-verl_drgrpo_deepscaler}
+PROJECT_NAME=${PROJECT_NAME:-verl_sdc_deepscaler}
 export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
 export WANDB_SILENT=${WANDB_SILENT:-true}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
 # Default model/data/benchmark settings mirror
 # examples/jepa_grpo_trainer/run_qwen_1_5b_ray.sh so SDC-GRPO
 # is an apples-to-apples comparison against the JEPA-GRPO runs.
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-sdc_grpo_qwen25math_1_5b-${RUN_TIMESTAMP}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-sdc_${BASE_ALGO:-drgrpo}_qwen25math_1_5b-${RUN_TIMESTAMP}}
 MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
@@ -89,15 +89,14 @@ fi
 # ── SDC-GRPO hyperparameters ────────────────────────────────────────────────
 SDC_ENABLE=${SDC_ENABLE:-true}
 SDC_BETA=${SDC_BETA:-0.5}
-SDC_LOGPROB_BACKEND=${SDC_LOGPROB_BACKEND:-}
+SDC_SCORING_BACKEND=${SDC_SCORING_BACKEND:-}
 SDC_VLLM_SCORE_MICRO_BATCH_SIZE=${SDC_VLLM_SCORE_MICRO_BATCH_SIZE:-16}
 SDC_REUSE_ROLLOUT_LOGPROBS=${SDC_REUSE_ROLLOUT_LOGPROBS:-}
 SDC_VERIFY_ROLLOUT_LOGPROBS=${SDC_VERIFY_ROLLOUT_LOGPROBS:-false}
 SDC_USE_IMPORTANCE_WEIGHT=${SDC_USE_IMPORTANCE_WEIGHT:-true}
 SDC_IMPORTANCE_WEIGHT_CLIP=${SDC_IMPORTANCE_WEIGHT_CLIP:-10.0}
-SDC_BASE_MIX_GAMMA=${SDC_BASE_MIX_GAMMA:-0.9}
 SDC_MIN_SFT_UPDATES_BEFORE_USE=${SDC_MIN_SFT_UPDATES_BEFORE_USE:-1}
-SDC_SFT_UPDATE_INTERVAL=${SDC_SFT_UPDATE_INTERVAL:-5}       # run SFT every N GRPO steps
+SDC_SFT_UPDATE_INTERVAL=${SDC_SFT_UPDATE_INTERVAL:-5}       # run SFT every N policy steps
 SDC_CHECKPOINT_INTERVAL=${SDC_CHECKPOINT_INTERVAL:-10}
 SDC_SFT_LR=${SDC_SFT_LR:-1.0e-6}
 SDC_SFT_BATCH_SIZE=${SDC_SFT_BATCH_SIZE:-8}
@@ -124,30 +123,30 @@ LORA_RANK=${LORA_RANK:-512}
 LORA_ALPHA=${LORA_ALPHA:-1024}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 
-if [[ -z "${SDC_LOGPROB_BACKEND}" ]]; then
+if [[ -z "${SDC_SCORING_BACKEND}" ]]; then
     if [[ "${DRGRPO_USE_LORA}" == "true" ]]; then
-        SDC_LOGPROB_BACKEND=vllm
+        SDC_SCORING_BACKEND=vllm
     else
-        SDC_LOGPROB_BACKEND=hf
+        SDC_SCORING_BACKEND=hf
     fi
 fi
-if [[ "${SDC_LOGPROB_BACKEND}" == "vllm" && "${DRGRPO_USE_LORA}" != "true" ]]; then
-    echo "SDC_LOGPROB_BACKEND=vllm requires DRGRPO_USE_LORA=true; use hf for full fine-tuning." >&2
+if [[ "${SDC_SCORING_BACKEND}" == "vllm" && "${DRGRPO_USE_LORA}" != "true" ]]; then
+    echo "SDC_SCORING_BACKEND=vllm requires DRGRPO_USE_LORA=true; use hf for full fine-tuning." >&2
     exit 2
 fi
 
 if [[ -z "${SDC_REUSE_ROLLOUT_LOGPROBS}" ]]; then
-    if [[ "${SDC_LOGPROB_BACKEND}" == "vllm" ]]; then
+    if [[ "${SDC_SCORING_BACKEND}" == "vllm" ]]; then
         SDC_REUSE_ROLLOUT_LOGPROBS=true
     else
         SDC_REUSE_ROLLOUT_LOGPROBS=false
     fi
 fi
-if [[ "${SDC_LOGPROB_BACKEND}" == "hf" && "${SDC_REUSE_ROLLOUT_LOGPROBS}" == "true" ]]; then
+if [[ "${SDC_SCORING_BACKEND}" == "hf" && "${SDC_REUSE_ROLLOUT_LOGPROBS}" == "true" ]]; then
     echo "HF SDC scoring requires SDC_REUSE_ROLLOUT_LOGPROBS=false so all SDC references use HF log-probs." >&2
     exit 2
 fi
-if [[ "${SDC_LOGPROB_BACKEND}" == "vllm" && "${SDC_REUSE_ROLLOUT_LOGPROBS}" != "true" ]]; then
+if [[ "${SDC_SCORING_BACKEND}" == "vllm" && "${SDC_REUSE_ROLLOUT_LOGPROBS}" != "true" ]]; then
     echo "vLLM SDC scoring requires SDC_REUSE_ROLLOUT_LOGPROBS=true so the PPO reference uses rollout log-probs." >&2
     exit 2
 fi
@@ -203,9 +202,20 @@ ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-null}
 VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-null}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 
+BASE_ALGO=${BASE_ALGO:-drgrpo}
+case "${BASE_ALGO}" in
+    grpo)   BASE_ADV_ESTIMATOR=grpo;  BASE_NORM=true;  BASE_LOSS_MODE=vanilla; BASE_CLIP_LOW=${CLIP_RATIO}; BASE_CLIP_HIGH=${CLIP_RATIO} ;;
+    drgrpo) BASE_ADV_ESTIMATOR=grpo;  BASE_NORM=false; BASE_LOSS_MODE=vanilla; BASE_CLIP_LOW=${CLIP_RATIO}; BASE_CLIP_HIGH=${CLIP_RATIO} ;;
+    dapo)   BASE_ADV_ESTIMATOR=grpo;  BASE_NORM=true;  BASE_LOSS_MODE=vanilla; BASE_CLIP_LOW=0.2; BASE_CLIP_HIGH=0.28 ;;
+    ngrpo)  BASE_ADV_ESTIMATOR=ngrpo; BASE_NORM=true;  BASE_LOSS_MODE=ngrpo;  BASE_CLIP_LOW=0.16; BASE_CLIP_HIGH=0.24 ;;
+    avspo)  BASE_ADV_ESTIMATOR=avspo; BASE_NORM=true;  BASE_LOSS_MODE=vanilla; BASE_CLIP_LOW=${CLIP_RATIO}; BASE_CLIP_HIGH=${CLIP_RATIO} ;;
+    *) echo "BASE_ALGO must be grpo, drgrpo, dapo, ngrpo, or avspo" >&2; exit 2 ;;
+esac
+
 DATA=(
-    algorithm.adv_estimator=grpo
-    algorithm.norm_adv_by_std_in_grpo=False
+    algorithm.base_rl_name=${BASE_ALGO}
+    algorithm.adv_estimator=${BASE_ADV_ESTIMATOR}
+    algorithm.norm_adv_by_std_in_grpo=${BASE_NORM}
     algorithm.use_kl_in_reward=False
     data.train_files="$TRAIN_FILE"
     data.val_files=${VAL_FILES}
@@ -234,11 +244,11 @@ if [[ "${DRGRPO_USE_LORA}" == "true" ]]; then
 fi
 
 ACTOR=(
-    actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
+    actor_rollout_ref.actor.policy_loss.loss_mode=${BASE_LOSS_MODE}
     actor_rollout_ref.actor.loss_agg_mode=token-mean
     actor_rollout_ref.actor.clip_ratio=${CLIP_RATIO}
-    actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO}
-    actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO}
+    actor_rollout_ref.actor.clip_ratio_low=${BASE_CLIP_LOW}
+    actor_rollout_ref.actor.clip_ratio_high=${BASE_CLIP_HIGH}
     actor_rollout_ref.actor.clip_ratio_c=${CLIP_RATIO_C}
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
     actor_rollout_ref.actor.ppo_loss_coef=${PPO_LOSS_COEF}
@@ -251,6 +261,14 @@ ACTOR=(
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
     actor_rollout_ref.actor.fsdp_config.model_dtype=${MODEL_DTYPE}
     actor_rollout_ref.actor.data_loader_seed=${TRAIN_SEED}
+    algorithm.ngrpo_r_max=1.0
+    algorithm.ngrpo_epsilon_pos=0.24
+    algorithm.ngrpo_epsilon_neg=0.16
+    algorithm.avspo_collapse_tau=1e-6
+    algorithm.avspo_alpha=0.5
+    algorithm.avspo_anchor_reward=0.1
+    algorithm.avspo_adapt_tau_init=0.5
+    algorithm.avspo_adapt_eta=0.01
 )
 
 ROLLOUT=(
@@ -274,7 +292,7 @@ ROLLOUT=(
     +actor_rollout_ref.rollout.enable_sleep_mode=${ROLLOUT_FREE_CACHE_ENGINE}
     +actor_rollout_ref.rollout.engine_kwargs.vllm.max_loras=${ROLLOUT_MAX_LORAS}
 )
-if [[ "${SDC_LOGPROB_BACKEND}" == "vllm" && "${SDC_REUSE_ROLLOUT_LOGPROBS}" == "true" ]]; then
+if [[ "${SDC_SCORING_BACKEND}" == "vllm" && "${SDC_REUSE_ROLLOUT_LOGPROBS}" == "true" ]]; then
     # Capture per-chosen-token log-probs during generation so the old-policy
     # forward pass can be skipped in the optimized SDC path.
     ROLLOUT+=(
@@ -315,25 +333,24 @@ if [[ -n "${BEST_CKPT_METRICS}" ]]; then
 fi
 
 SDC=(
-    custom_sdc_grpo.enable="${SDC_ENABLE}"
-    custom_sdc_grpo.logprob_backend="${SDC_LOGPROB_BACKEND}"
-    custom_sdc_grpo.vllm_score_micro_batch_size="${SDC_VLLM_SCORE_MICRO_BATCH_SIZE}"
-    custom_sdc_grpo.beta="${SDC_BETA}"
-    custom_sdc_grpo.reuse_rollout_log_probs="${SDC_REUSE_ROLLOUT_LOGPROBS}"
-    custom_sdc_grpo.verify_rollout_log_probs="${SDC_VERIFY_ROLLOUT_LOGPROBS}"
-    custom_sdc_grpo.use_importance_weight="${SDC_USE_IMPORTANCE_WEIGHT}"
-    custom_sdc_grpo.importance_weight_clip="${SDC_IMPORTANCE_WEIGHT_CLIP}"
-    custom_sdc_grpo.base_mix_gamma="${SDC_BASE_MIX_GAMMA}"
-    custom_sdc_grpo.min_sft_updates_before_use="${SDC_MIN_SFT_UPDATES_BEFORE_USE}"
-    custom_sdc_grpo.sft_update_interval_grpo_steps="${SDC_SFT_UPDATE_INTERVAL}"
-    custom_sdc_grpo.checkpoint_interval_grpo_steps="${SDC_CHECKPOINT_INTERVAL}"
-    custom_sdc_grpo.sft_lr="${SDC_SFT_LR}"
-    custom_sdc_grpo.sft_batch_size="${SDC_SFT_BATCH_SIZE}"
-    custom_sdc_grpo.sft_max_token_len_per_gpu="${SDC_SFT_MAX_TOKEN_LEN_PER_GPU}"
-    custom_sdc_grpo.sft_max_updates_per_interval="${SDC_SFT_MAX_UPDATES}"
-    custom_sdc_grpo.save_to_disk_interval_grpo_steps="${SDC_SAVE_TO_DISK_INTERVAL}"
-    custom_sdc_grpo.data_max_size="${SDC_DATA_MAX_SIZE}"
-    custom_sdc_grpo.data_sampling="${SDC_DATA_SAMPLING}"
+    custom_sdc.enable="${SDC_ENABLE}"
+    custom_sdc.scoring_backend="${SDC_SCORING_BACKEND}"
+    custom_sdc.vllm_score_micro_batch_size="${SDC_VLLM_SCORE_MICRO_BATCH_SIZE}"
+    custom_sdc.beta="${SDC_BETA}"
+    custom_sdc.reuse_rollout_log_probs="${SDC_REUSE_ROLLOUT_LOGPROBS}"
+    custom_sdc.verify_rollout_log_probs="${SDC_VERIFY_ROLLOUT_LOGPROBS}"
+    custom_sdc.use_importance_weight="${SDC_USE_IMPORTANCE_WEIGHT}"
+    custom_sdc.importance_weight_clip="${SDC_IMPORTANCE_WEIGHT_CLIP}"
+    custom_sdc.min_sft_updates_before_use="${SDC_MIN_SFT_UPDATES_BEFORE_USE}"
+    custom_sdc.sft_update_interval_policy_steps="${SDC_SFT_UPDATE_INTERVAL}"
+    custom_sdc.checkpoint_interval_policy_steps="${SDC_CHECKPOINT_INTERVAL}"
+    custom_sdc.sft_lr="${SDC_SFT_LR}"
+    custom_sdc.sft_batch_size="${SDC_SFT_BATCH_SIZE}"
+    custom_sdc.sft_max_token_len_per_gpu="${SDC_SFT_MAX_TOKEN_LEN_PER_GPU}"
+    custom_sdc.sft_max_updates_per_interval="${SDC_SFT_MAX_UPDATES}"
+    custom_sdc.save_to_disk_interval_policy_steps="${SDC_SAVE_TO_DISK_INTERVAL}"
+    custom_sdc.data_max_size="${SDC_DATA_MAX_SIZE}"
+    custom_sdc.data_sampling="${SDC_DATA_SAMPLING}"
 )
 
 WASSERSTEIN=(
@@ -343,6 +360,14 @@ WASSERSTEIN=(
     actor_rollout_ref.actor.wasserstein_guidance.embed_model=${WG_EMBED_MODEL}
     actor_rollout_ref.actor.wasserstein_guidance.decode_model="${WG_DECODE_MODEL}"
 )
+
+if [[ "${BASE_ALGO}" == "dapo" ]]; then
+    DATA+=(
+        algorithm.filter_groups.enable=true
+        algorithm.filter_groups.metric=acc
+        algorithm.filter_groups.max_num_gen_batches=0
+    )
+fi
 
 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     "${DATA[@]}" \

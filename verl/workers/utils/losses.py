@@ -17,7 +17,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.experimental.sharpening_grpo.loss import compute_sharpening_grpo_loss
-from verl.experimental.sdc_grpo.sdc_loss import compute_sdc_loss
+from verl.experimental.sdc.sdc_loss import compute_sdc_loss
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -88,7 +88,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
 
     metrics = {}
 
-    sdc_config = tu.get_non_tensor_data(data=data, key="custom_sdc_grpo", default=None)
+    sdc_config = tu.get_non_tensor_data(data=data, key="custom_sdc", default=None)
 
     gpi_config = tu.get_non_tensor_data(data=data, key="custom_gpi_ce", default=None)
     gpi_enabled = bool(gpi_config and gpi_config.get("enable", False))
@@ -255,7 +255,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
             response_mask=response_mask,
             failure_mask=data["sdc_failure_mask"],
             beta=float(sdc_config.get("beta", 0.0)),
-            loss_agg_mode=loss_agg_mode,
+            loss_agg_mode="token-mean",
             global_batch_info=config.global_batch_info,
             use_importance_weight=bool(sdc_config.get("use_importance_weight", True)),
             importance_weight_clip=float(sdc_config.get("importance_weight_clip", 10.0)),

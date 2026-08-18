@@ -37,7 +37,9 @@ import pandas as pd
 
 # Byte-identical to the eval parquets (math500/amc23/aime*), so train and eval
 # prompts differ only in the problem text.
-SYSTEM_PROMPT = "You are a careful mathematical problem solver. Reason step by step and put the final answer in \\boxed{}."
+SYSTEM_PROMPT = (
+    "You are a careful mathematical problem solver. Reason step by step and put the final answer in \\boxed{}."
+)
 USER_SUFFIX = "\nSolve the problem. Show your reasoning and put the final answer in \\boxed{}."
 
 # The router key that reaches verl.experimental.fepo.math_parser.compute_math_reward,
@@ -145,7 +147,11 @@ def main() -> None:
     if not args.skip_verify:
         good = verify(df)
         bad = df[~good]
-        print(f"parse check: {int(good.sum())} ok / {len(bad)} unparseable ({100 * len(bad) / len(df):.2f}%)", flush=True)
+        print(
+            f"parse check: {int(good.sum())} ok / {len(bad)} unparseable "
+            f"({100 * len(bad) / len(df):.2f}%)",
+            flush=True,
+        )
         for _, row in bad.head(10).iterrows():
             print("  dropped ground truth:", repr(row["reward_model"]["ground_truth"]), flush=True)
         df = df[good].reset_index(drop=True)

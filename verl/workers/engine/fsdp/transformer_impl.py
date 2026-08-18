@@ -69,14 +69,13 @@ from verl.utils.ulysses import (
     ulysses_pad,
     ulysses_pad_and_slice_inputs,
 )
-from verl.experimental.sdc_grpo.sft_trainer import (
+from verl.experimental.sdc.sft_trainer import (
     configure_sft_trainable_parameters,
     encode_outcome_example,
-    mix_state_with_base,
     outcome_sft_loss,
     pair_outcome_records,
 )
-from verl.experimental.sdc_grpo.data_collector import OutcomeExample
+from verl.experimental.sdc.data_collector import OutcomeExample
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
@@ -737,9 +736,8 @@ class FSDPEngine(BaseEngine):
         if getattr(self, "_sdc_initialized", False):
             return {"sdc_initialized": True}
         if self.engine_config.strategy not in ("fsdp", "fsdp2"):
-            raise NotImplementedError("SDC-GRPO currently supports only FSDP/FSDP2 HF actors.")
+            raise NotImplementedError("SDC currently supports only FSDP/FSDP2 HF actors.")
         state = self._sdc_actor_state_cpu()
-        self._sdc_base_state_cpu = {name: value.detach().cpu().clone() for name, value in state.items()}
         self._sdc_success = self._sdc_clone_from_state(state)
         self._sdc_failure = self._sdc_clone_from_state(state)
         lr = float(sdc_config.get("sft_lr", 1e-6))
@@ -777,7 +775,7 @@ class FSDPEngine(BaseEngine):
         return self.sdc_init(sdc_config)
 
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
-        config = tu.get_non_tensor_data(data=data, key="custom_sdc_grpo", default={}) or {}
+        config = tu.get_non_tensor_data(data=data, key="custom_sdc", default={}) or {}
         self.sdc_init(config)
         padded = data.to_padded_tensor()
         device = next(self.module.parameters()).device
@@ -858,7 +856,6 @@ class FSDPEngine(BaseEngine):
                 os.makedirs(directory, exist_ok=True)
                 torch.save(model.state_dict(), os.path.join(directory, "pytorch_model.bin"))
                 torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt"))
-            torch.save(self._sdc_base_state_cpu, os.path.join(local_path, "base_state.pt"))
             torch.save(
                 {
                     "global_step": global_step,
@@ -878,10 +875,6 @@ class FSDPEngine(BaseEngine):
             "sdc_failure_model_update_count": self._sdc_failure_model_update_count,
             "sdc_models_ready": self._sdc_models_ready,
         }
-
-    def _sdc_mix_with_base(self, model, gamma: float) -> None:
-        mixed = mix_state_with_base(model.state_dict(), self._sdc_base_state_cpu, gamma=gamma)
-        model.load_state_dict(mixed, strict=False)
 
     def _sdc_sft_model(
         self,
@@ -1023,9 +1016,6 @@ class FSDPEngine(BaseEngine):
         if success_updates != failure_updates:
             raise RuntimeError("SDC success/failure refresh produced different optimizer-step counts.")
         if success_updates:
-            gamma = float(config.get("base_mix_gamma", 0.9))
-            self._sdc_mix_with_base(self._sdc_success, gamma)
-            self._sdc_mix_with_base(self._sdc_failure, gamma)
             self._sdc_sync_model_and_optimizer(self._sdc_success, self._sdc_success_optimizer)
             self._sdc_sync_model_and_optimizer(self._sdc_failure, self._sdc_failure_optimizer)
         self._sdc_success_model_update_count += success_updates
@@ -1053,7 +1043,7 @@ class FSDPEngine(BaseEngine):
 
     def sdc_export_vllm_adapters(self, config: dict):
         self.sdc_init(config)
-        if config.get("logprob_backend") != "vllm" or not self._is_lora:
+        if config.get("scoring_backend") != "vllm" or not self._is_lora:
             return {"enabled": False}
         wrapped = getattr(self.module, "_fsdp_wrapped_module", self.module); peft_config = getattr(wrapped, "peft_config", {}).get("default", None)
         if hasattr(peft_config, "to_dict"): peft_config = peft_config.to_dict()
@@ -1065,9 +1055,6 @@ class FSDPEngine(BaseEngine):
 
     def sdc_load(self, local_path: str, config: dict | None = None):
         config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
-        base_path = os.path.join(local_path, "base_state.pt")
-        if os.path.exists(base_path):
-            self._sdc_base_state_cpu = torch.load(base_path, map_location="cpu")
         self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
         for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
             directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
@@ -1637,9 +1624,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if getattr(self, "_sdc_initialized", False):
             return {"sdc_initialized": True}
         if self.engine_config.strategy not in ("fsdp", "fsdp2"):
-            raise NotImplementedError("SDC-GRPO currently supports only FSDP/FSDP2 HF actors.")
+            raise NotImplementedError("SDC currently supports only FSDP/FSDP2 HF actors.")
         state = self._sdc_actor_state_cpu()
-        self._sdc_base_state_cpu = {name: value.detach().cpu().clone() for name, value in state.items()}
         self._sdc_success = self._sdc_clone_from_state(state)
         self._sdc_failure = self._sdc_clone_from_state(state)
         lr = float(sdc_config.get("sft_lr", 1e-6))
@@ -1677,7 +1663,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return self.sdc_init(sdc_config)
 
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
-        config = tu.get_non_tensor_data(data=data, key="custom_sdc_grpo", default={}) or {}
+        config = tu.get_non_tensor_data(data=data, key="custom_sdc", default={}) or {}
         self.sdc_init(config)
         padded = data.to_padded_tensor()
         device = next(self.module.parameters()).device
@@ -1841,9 +1827,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if success_updates != failure_updates:
             raise RuntimeError("SDC success/failure refresh produced different optimizer-step counts.")
         if success_updates:
-            gamma = float(config.get("base_mix_gamma", 0.9))
-            self._sdc_mix_with_base(self._sdc_success, gamma)
-            self._sdc_mix_with_base(self._sdc_failure, gamma)
             self._sdc_sync_model_and_optimizer(self._sdc_success, self._sdc_success_optimizer)
             self._sdc_sync_model_and_optimizer(self._sdc_failure, self._sdc_failure_optimizer)
         self._sdc_success_model_update_count += success_updates
@@ -1871,7 +1854,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def sdc_export_vllm_adapters(self, config: dict):
         self.sdc_init(config)
-        if config.get("logprob_backend") != "vllm" or not self._is_lora:
+        if config.get("scoring_backend") != "vllm" or not self._is_lora:
             return {"enabled": False}
         wrapped = getattr(self.module, "_fsdp_wrapped_module", self.module); peft_config = getattr(wrapped, "peft_config", {}).get("default", None)
         if hasattr(peft_config, "to_dict"): peft_config = peft_config.to_dict()
@@ -1883,9 +1866,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def sdc_load(self, local_path: str, config: dict | None = None):
         config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
-        base_path = os.path.join(local_path, "base_state.pt")
-        if os.path.exists(base_path):
-            self._sdc_base_state_cpu = torch.load(base_path, map_location="cpu")
         self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
         for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
             directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")

@@ -830,7 +830,16 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  base_rl_name: null
   norm_adv_by_std_in_grpo: true
+  ngrpo_r_max: 1.0
+  ngrpo_epsilon_pos: 0.24
+  ngrpo_epsilon_neg: 0.16
+  avspo_collapse_tau: 1.0e-6
+  avspo_alpha: 0.5
+  avspo_anchor_reward: 0.1
+  avspo_adapt_tau_init: 0.5
+  avspo_adapt_eta: 0.01
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:
@@ -901,18 +910,17 @@ custom_gpi_ce:
   verify_offline: true
   allow_short_offline: false
   fuse_old_log_prob: true
-custom_sdc_grpo:
+custom_sdc:
   enable: false
   beta: 0.5
-  logprob_backend: hf
+  scoring_backend: hf
   vllm_score_micro_batch_size: 16
   reuse_rollout_log_probs: false
   verify_rollout_log_probs: false
   use_importance_weight: true
   importance_weight_clip: 10.0
-  base_mix_gamma: 0.9
-  sft_update_interval_grpo_steps: 5
-  checkpoint_interval_grpo_steps: 10
+  sft_update_interval_policy_steps: 5
+  checkpoint_interval_policy_steps: 10
   min_sft_updates_before_use: 1
   sft_lr: 1.0e-6
   sft_batch_size: 8
@@ -920,7 +928,8 @@ custom_sdc_grpo:
   sft_max_updates_per_interval: 1
   data_max_size: null
   data_sampling: recent
-  save_to_disk_interval_grpo_steps: 0
+  save_to_disk_interval_policy_steps: 0
+  loss_agg_mode: token-mean
 custom_sharpening_grpo:
   enable: false
   use_grpo_reward: true
@@ -1026,3 +1035,4 @@ ray_kwargs:
   ray_init:
     num_cpus: null
   timeline_json_file: null
+  loss_agg_mode: token-mean

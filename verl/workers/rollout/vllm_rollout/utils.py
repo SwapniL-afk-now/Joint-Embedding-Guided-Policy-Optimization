@@ -24,7 +24,7 @@ from typing import Any, Literal, Optional, get_args
 import torch
 from vllm.outputs import RequestOutput
 
-from verl.experimental.sdc_grpo.vllm_scoring import sdc_vllm_adapter_spec
+from verl.experimental.sdc.vllm_scoring import sdc_vllm_adapter_spec
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader

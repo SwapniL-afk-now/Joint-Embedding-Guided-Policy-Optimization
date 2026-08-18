@@ -93,6 +93,7 @@ class BatchRewardManager(AbstractRewardManager):
 
         scores = self.verify(data)
         rewards = []
+        semantic_outcomes = []
         already_printed: dict[str, Any] = {}
 
         for i in range(len(data)):
@@ -101,10 +102,12 @@ class BatchRewardManager(AbstractRewardManager):
 
             if isinstance(score, dict):
                 reward = score["score"]
+                semantic_outcomes.append(score.get("acc", score.get("correct", reward)))
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
             else:
                 reward = score
+                semantic_outcomes.append(reward)
 
             rewards.append(reward)
             reward_tensor[i, length - 1] = reward
@@ -121,6 +124,7 @@ class BatchRewardManager(AbstractRewardManager):
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
         data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
+        data.batch["sdc_outcome"] = torch.tensor(semantic_outcomes, dtype=torch.float32, device=prompt_ids.device)
 
         if return_dict:
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}

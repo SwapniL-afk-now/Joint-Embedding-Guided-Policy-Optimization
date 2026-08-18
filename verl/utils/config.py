@@ -169,8 +169,8 @@ def validate_config(
     if config.algorithm.get("use_kl_in_reward", False) and config.actor_rollout_ref.actor.use_kl_loss:
         print("NOTICE: You have both enabled in-reward kl and kl loss.")
 
-    if config.get("custom_sdc_grpo", {}).get("enable", False):
-        from verl.experimental.sdc_grpo.config import validate_sdc_config
+    if config.get("custom_sdc", {}).get("enable", False) or config.get("custom_sdc_grpo", {}).get("enable", False):
+        from verl.experimental.sdc.config import validate_sdc_config
 
         validate_sdc_config(config)
 

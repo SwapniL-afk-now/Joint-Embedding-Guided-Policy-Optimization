@@ -1,18 +1,18 @@
+import numpy as np
 import pytest
 import torch
-import numpy as np
 from omegaconf import OmegaConf
 
-from verl.experimental.sdc_grpo.config import SDCGRPOConfig, should_checkpoint, should_run_sft, validate_sdc_config
-from verl.experimental.sdc_grpo.data_collector import (
+from verl.experimental.sdc.config import SDCConfig, should_checkpoint, should_run_sft, validate_sdc_config
+from verl.experimental.sdc.data_collector import (
     FailureDataCollector,
     OutcomeDataCollector,
     SuccessDataCollector,
     binary_outcome_scores,
 )
-from verl.experimental.sdc_grpo.sdc_loss import compute_sdc_loss, contrast_quality_metrics
-from verl.experimental.sdc_grpo.sft_trainer import OutcomeSFTTrainer, outcome_sft_loss
-from verl.experimental.sdc_grpo.vllm_scoring import SDC_VLLM_ADAPTERS, extract_response_logprobs_from_prompt_logprobs
+from verl.experimental.sdc.sdc_loss import compute_sdc_loss, contrast_quality_metrics
+from verl.experimental.sdc.sft_trainer import OutcomeSFTTrainer, outcome_sft_loss
+from verl.experimental.sdc.vllm_scoring import SDC_VLLM_ADAPTERS, extract_response_logprobs_from_prompt_logprobs
 
 
 def test_sdc_loss_matches_direct_algebra_and_detaches_references():
@@ -37,7 +37,6 @@ def test_sdc_loss_matches_direct_algebra_and_detaches_references():
     assert current.grad is not None
     assert success.grad is None and failure.grad is None
     assert metrics["sdc/active_token_fraction"] == 1.0
-    assert metrics["sdc/correct_response_token_nonzero_fraction"] == 0.0
 
 
 def test_held_out_contrast_quality_uses_separate_success_and_failure_scores():
@@ -313,7 +312,10 @@ def test_collectors_accept_only_their_binary_outcome():
 
 
 def test_binary_reward_validation_rejects_fractional_rows():
-    torch.testing.assert_close(binary_outcome_scores(torch.tensor([[0.0, 0.0], [1.0, 0.0]])), torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(
+        binary_outcome_scores(torch.tensor([0.0, 1.0])),
+        torch.tensor([False, True]),
+    )
     with pytest.raises(ValueError, match="exactly 0 or 1"):
         binary_outcome_scores(torch.tensor([[0.5, 0.0]]))
 
@@ -384,20 +386,6 @@ def test_pairing_leaves_unmatched_buffer_rows_available():
     assert pair_outcome_records(success, [], max_examples=8) == ([], [])
 
 
-def test_success_and_failure_use_the_same_base_mix_and_gamma():
-    from verl.experimental.sdc_grpo.sft_trainer import mix_state_with_base
-
-    base = {"weight": torch.tensor([2.0]), "step": torch.tensor([3], dtype=torch.long)}
-    success = {"weight": torch.tensor([4.0]), "step": torch.tensor([4], dtype=torch.long)}
-    failure = {"weight": torch.tensor([8.0]), "step": torch.tensor([5], dtype=torch.long)}
-    gamma = 0.9
-    mixed_success = mix_state_with_base(success, base, gamma=gamma)
-    mixed_failure = mix_state_with_base(failure, base, gamma=gamma)
-    torch.testing.assert_close(mixed_success["weight"], torch.tensor([3.8]))
-    torch.testing.assert_close(mixed_failure["weight"], torch.tensor([7.4]))
-    assert mixed_success["step"].item() == 4 and mixed_failure["step"].item() == 5
-
-
 def test_sft_optimizer_is_separate_from_actor_optimizer():
     actor = torch.nn.Linear(2, 2)
     success = torch.nn.Linear(2, 2)
@@ -408,7 +396,7 @@ def test_sft_optimizer_is_separate_from_actor_optimizer():
 
 
 def test_readiness_schedule_and_config_validation():
-    cfg = SDCGRPOConfig(enable=True, sft_update_interval_grpo_steps=5, checkpoint_interval_grpo_steps=10)
+    cfg = SDCConfig(enable=True, sft_update_interval_policy_steps=5, checkpoint_interval_policy_steps=10)
     assert not should_run_sft(1, cfg)
     assert should_run_sft(5, cfg)
     assert not should_checkpoint(5, cfg)
@@ -417,7 +405,7 @@ def test_readiness_schedule_and_config_validation():
         {
             "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False},
             "actor_rollout_ref": {"actor": {"use_kl_loss": False}, "model": {"lora_rank": 0}},
-            "custom_sdc_grpo": {"enable": True, "logprob_backend": "hf", "reuse_rollout_log_probs": False},
+            "custom_sdc": {"enable": True, "scoring_backend": "hf", "reuse_rollout_log_probs": False},
         }
     )
     assert validate_sdc_config(root).enable

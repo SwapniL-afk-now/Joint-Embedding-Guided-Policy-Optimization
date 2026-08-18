@@ -44,15 +44,16 @@ from verl.experimental.abstract_rl.config import validate_abstract_rl_config
 from verl.experimental.gpi_ce import trainer_hooks as gpi_hooks
 from verl.experimental.gpi_ce import validate_gpi_ce_config
 from verl.experimental.sharpening_grpo.config import validate_sharpening_config
-from verl.experimental.sdc_grpo.config import (
+from verl.experimental.sdc.config import (
     should_checkpoint,
     should_run_sft,
     validate_sdc_config,
 )
-from verl.experimental.sdc_grpo.data_collector import (
+from verl.experimental.sdc.data_collector import (
     FailureDataCollector,
     SuccessDataCollector,
-    binary_outcome_scores,
+    extract_sdc_outcome,
+    validate_sdc_outcome,
 )
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
@@ -60,7 +61,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.core_algos import AVSPOState, AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -163,6 +164,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    avspo_state: Optional[AVSPOState] = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -245,11 +247,15 @@ def compute_advantage(
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
+        if adv_estimator in (AdvantageEstimator.AVSPO, "avspo"):
+            adv_kwargs["state"] = avspo_state
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if adv_estimator in (AdvantageEstimator.AVSPO, "avspo") and avspo_state is not None:
+            data.meta_info["avspo_metrics"] = dict(getattr(avspo_state, "last_metrics", {}))
     return data
 
 
@@ -373,6 +379,9 @@ class RayPPOTrainer:
         self.sdc_failure_model_update_count = 0
         self.sdc_models_ready = False
         self.sdc_parameter_metrics: dict[str, float] = {}
+        avspo_tau = float(self.config.algorithm.get("avspo_adapt_tau_init", 0.5))
+        avspo_enabled = self.config.algorithm.adv_estimator in (AdvantageEstimator.AVSPO, "avspo")
+        self.avspo_state = AVSPOState(tau_adapt=avspo_tau) if avspo_enabled else None
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1660,6 +1669,9 @@ class RayPPOTrainer:
             sdc_local_path = os.path.join(local_global_step_folder, "sdc")
             self.actor_rollout_wg.sdc_save_checkpoint(sdc_local_path, self.global_steps, self._sdc_config_dict())
             self._sdc_sync_vllm_adapters()
+        if self.avspo_state is not None:
+            os.makedirs(local_global_step_folder, exist_ok=True)
+            torch.save({"avspo": self.avspo_state.state_dict()}, os.path.join(local_global_step_folder, "algorithm_state.pt"))
 
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
@@ -1737,6 +1749,11 @@ class RayPPOTrainer:
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
 
+        algorithm_state_path = os.path.join(global_step_folder, "algorithm_state.pt")
+        if self.avspo_state is not None and os.path.exists(algorithm_state_path):
+            algorithm_state = torch.load(algorithm_state_path, map_location="cpu", weights_only=False)
+            self.avspo_state.load_state_dict(algorithm_state.get("avspo", {}))
+
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
         # load actor
@@ -1766,7 +1783,7 @@ class RayPPOTrainer:
                 f"SDC state loaded: success_updates={self.sdc_success_model_update_count} "
                 f"failure_updates={self.sdc_failure_model_update_count} ready={self.sdc_models_ready}"
             )
-            if self.sdc_config.logprob_backend == "vllm" and self.sdc_models_ready:
+            if self.sdc_config.scoring_backend == "vllm" and self.sdc_models_ready:
                 self._sdc_sync_vllm_adapters()
         elif self.sdc_enabled:
             # init_model() creates SDC clones before actor resume.  Re-clone now
@@ -2059,7 +2076,7 @@ class RayPPOTrainer:
             ),
         )
         if self.sdc_enabled:
-            tu.assign_non_tensor(batch_td, custom_sdc_grpo=self._sdc_config_dict())
+            tu.assign_non_tensor(batch_td, custom_sdc=self._sdc_config_dict())
         if self.gpi_ce_enabled:
             gpi_hooks.stamp_actor_batch(self, batch_td)
         if self.sharpening_enabled:
@@ -2120,15 +2137,15 @@ class RayPPOTrainer:
         return {
             "enable": bool(self.sdc_config.enable),
             "beta": float(self.sdc_config.beta),
-            "logprob_backend": str(self.sdc_config.logprob_backend),
+            "scoring_backend": str(self.sdc_config.scoring_backend),
             "vllm_score_micro_batch_size": int(self.sdc_config.vllm_score_micro_batch_size),
             "reuse_rollout_log_probs": bool(self.sdc_config.reuse_rollout_log_probs),
             "verify_rollout_log_probs": bool(self.sdc_config.verify_rollout_log_probs),
             "use_importance_weight": bool(self.sdc_config.use_importance_weight),
             "importance_weight_clip": float(self.sdc_config.importance_weight_clip),
-            "base_mix_gamma": float(self.sdc_config.base_mix_gamma),
-            "sft_update_interval_grpo_steps": int(self.sdc_config.sft_update_interval_grpo_steps),
-            "checkpoint_interval_grpo_steps": int(self.sdc_config.checkpoint_interval_grpo_steps),
+            "loss_agg_mode": "token-mean",
+            "sft_update_interval_policy_steps": int(self.sdc_config.sft_update_interval_policy_steps),
+            "checkpoint_interval_policy_steps": int(self.sdc_config.checkpoint_interval_policy_steps),
             "min_sft_updates_before_use": int(self.sdc_config.min_sft_updates_before_use),
             "sft_lr": float(self.sdc_config.sft_lr),
             "sft_batch_size": int(self.sdc_config.sft_batch_size),
@@ -2136,11 +2153,11 @@ class RayPPOTrainer:
             "sft_max_updates_per_interval": int(self.sdc_config.sft_max_updates_per_interval),
             "max_prompt_length": int(self.config.data.get("max_prompt_length", 1024)),
             "max_response_length": int(self.config.data.get("max_response_length", 2048)),
-            "save_to_disk_interval_grpo_steps": int(self.sdc_config.save_to_disk_interval_grpo_steps),
+            "save_to_disk_interval_policy_steps": int(self.sdc_config.save_to_disk_interval_policy_steps),
             "sdc_success_model_update_count": int(self.sdc_success_model_update_count),
             "sdc_failure_model_update_count": int(self.sdc_failure_model_update_count),
             "sdc_models_ready": bool(self.sdc_models_ready),
-            "global_grpo_step": int(self.global_steps),
+            "global_policy_step": int(self.global_steps),
             "success_buffer_state": (
                 self.sdc_success_collector.state_dict() if self.sdc_success_collector is not None else None
             ),
@@ -2167,12 +2184,12 @@ class RayPPOTrainer:
             self.sdc_success_model_update_count >= min_updates
             and self.sdc_failure_model_update_count >= min_updates
         )
-        adapter_ready = self.sdc_config.logprob_backend != "vllm" or self.sdc_vllm_adapters_ready
+        adapter_ready = self.sdc_config.scoring_backend != "vllm" or self.sdc_vllm_adapters_ready
         self.sdc_models_ready = bool(counts_ready and adapter_ready)
         return self.sdc_models_ready
 
     def _sdc_sync_vllm_adapters(self) -> bool:
-        if self.sdc_config.logprob_backend != "vllm":
+        if self.sdc_config.scoring_backend != "vllm":
             return False
         payload = self._sdc_select_payload(self.actor_rollout_wg.sdc_export_vllm_adapters(self._sdc_config_dict()))
         if payload is None:
@@ -2188,14 +2205,16 @@ class RayPPOTrainer:
     def _sdc_can_score_with_vllm(self) -> bool:
         return bool(
             self.sdc_enabled
-            and self.sdc_config.logprob_backend == "vllm"
+            and self.sdc_config.scoring_backend == "vllm"
             and self.sdc_vllm_adapters_ready
             and self.sdc_llm_client is not None
         )
 
     def _sdc_annotate_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> None:
-        rewards = binary_outcome_scores(reward_tensor)
-        batch.batch["sdc_failure_mask"] = (rewards == 0.0).to(device=batch.batch["response_mask"].device)
+        del reward_tensor
+        outcome = validate_sdc_outcome(batch.batch["sdc_outcome"])
+        batch.batch["sdc_outcome"] = outcome.to(device=batch.batch["response_mask"].device)
+        batch.batch["sdc_failure_mask"] = ~batch.batch["sdc_outcome"]
 
     def _sdc_build_vllm_score_inputs(self, batch: DataProto):
         prompts = batch.batch["prompts"].detach().cpu()
@@ -2251,7 +2270,7 @@ class RayPPOTrainer:
             batch.batch["sdc_failure_log_probs"] = outputs["failure"]
             return
         batch_td = batch.to_tensordict()
-        tu.assign_non_tensor(batch_td, custom_sdc_grpo=self._sdc_config_dict())
+        tu.assign_non_tensor(batch_td, custom_sdc=self._sdc_config_dict())
         output = self.actor_rollout_wg.sdc_compute_success_failure_log_probs(batch_td)
         success = tu.get(output, "sdc_success_log_probs")
         failure = tu.get(output, "sdc_failure_log_probs")
@@ -2263,20 +2282,20 @@ class RayPPOTrainer:
     def _sdc_collect_outcomes(self, batch: DataProto, reward_tensor: torch.Tensor) -> tuple[int, int]:
         if not self.sdc_enabled or self.sdc_success_collector is None or self.sdc_failure_collector is None:
             return 0, 0
-        rewards = binary_outcome_scores(reward_tensor).cpu().tolist()
+        outcome = validate_sdc_outcome(batch.batch["sdc_outcome"]).cpu().tolist()
         prompts = batch.batch["prompts"].detach().cpu()
         responses = batch.batch["responses"].detach().cpu()
         response_mask = batch.batch["response_mask"].detach().cpu()
-        uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [""] * len(rewards))]
+        uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [""] * len(outcome))]
         success_count = failure_count = 0
-        for i, reward in enumerate(rewards):
+        for i, reward in enumerate(outcome):
             response_len = int(response_mask[i].sum().item())
-            row = dict(prompt=self.tokenizer.decode(prompts[i], skip_special_tokens=True), response=self.tokenizer.decode(responses[i, :response_len], skip_special_tokens=True), reward=int(reward), metadata={"uid": uids[i], "global_grpo_step": self.global_steps})
+            row = dict(prompt=self.tokenizer.decode(prompts[i], skip_special_tokens=True), response=self.tokenizer.decode(responses[i, :response_len], skip_special_tokens=True), reward=int(reward), metadata={"uid": uids[i], "global_policy_step": self.global_steps})
             if reward == 1.0:
                 success_count += int(self.sdc_success_collector.add(**row))
             elif reward == 0.0:
                 failure_count += int(self.sdc_failure_collector.add(**row))
-            else:  # binary_outcome_scores() should have raised before this point.
+            else:  # validate_sdc_outcome() should have raised before this point.
                 raise AssertionError(f"Unexpected non-binary SDC reward after validation: {reward}")
         return success_count, failure_count
 
@@ -2304,7 +2323,7 @@ class RayPPOTrainer:
                 raise RuntimeError("SDC success/failure refresh consumed different buffer sizes.")
             self.sdc_success_collector.consume(consumed_success)
             self.sdc_failure_collector.consume(consumed_failure)
-        if self.sdc_config.logprob_backend == "vllm" and (success_updates or failure_updates):
+        if self.sdc_config.scoring_backend == "vllm" and (success_updates or failure_updates):
             self._sdc_sync_vllm_adapters()
         self._sdc_refresh_ready()
         return {
@@ -2319,7 +2338,7 @@ class RayPPOTrainer:
         if not self.sdc_enabled:
             return {}
         return {
-            "sdc/global_grpo_step": float(self.global_steps),
+            "sdc/global_policy_step": float(self.global_steps),
             "sdc/success_buffer_size": float(len(self.sdc_success_collector) if self.sdc_success_collector else 0),
             "sdc/failure_buffer_size": float(len(self.sdc_failure_collector) if self.sdc_failure_collector else 0),
             "sdc/success_buffer_age": (
@@ -2548,6 +2567,17 @@ class RayPPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
+                        # Keep the verifier's semantic correctness separate from
+                        # token-level/base reward shaping (DAPO overlong penalties,
+                        # KL shaping, or virtual baseline rewards).
+                        if self.sdc_enabled:
+                            outcome_source = dict(reward_extra_infos_dict)
+                            if "sdc_outcome" in batch.batch:
+                                outcome_source = {}
+                            batch.batch["sdc_outcome"] = extract_sdc_outcome(batch, outcome_source).to(
+                                device=batch.batch["responses"].device
+                            )
+
                         # Collect both binary outcomes before any optional DAPO
                         # filtering so rejected rows can still refresh the symmetric
                         # success/failure SFT buffers. The actor mask is attached
@@ -2736,7 +2766,9 @@ class RayPPOTrainer:
                                 num_repeat=self.config.actor_rollout_ref.rollout.n,
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                 config=self.config.algorithm,
+                                avspo_state=self.avspo_state,
                             )
+                            metrics.update(batch.meta_info.get("avspo_metrics", {}))
                         # All vllm work is done — sleep now so the backward pass gets the
                         # freed KV cache memory (unless we already slept right after gen).
                         if not slept_after_gen:
@@ -2837,10 +2869,31 @@ class RayPPOTrainer:
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
                 # training metrics
+                filter_groups_cfg = self.config.algorithm.get("filter_groups", {}) or {}
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
+                    }
+                )
+                base_name = str(self.config.algorithm.get("base_rl_name", "")).lower()
+                if not base_name:
+                    base_name = str(self.config.algorithm.adv_estimator).lower()
+                    if base_name == "grpo" and not bool(norm_adv_by_std_in_grpo):
+                        base_name = "drgrpo"
+                actor_policy_loss = self.config.actor_rollout_ref.actor.policy_loss
+                metrics.update(
+                    {
+                        "base_rl/name": base_name,
+                        "base_rl/adv_estimator": str(self.config.algorithm.adv_estimator),
+                        "base_rl/loss_mode": str(actor_policy_loss.get("loss_mode", "vanilla")),
+                        "base_rl/norm_adv_by_std": float(bool(norm_adv_by_std_in_grpo)),
+                        "base_rl/clip_low": float(self.config.actor_rollout_ref.actor.clip_ratio_low or self.config.actor_rollout_ref.actor.clip_ratio),
+                        "base_rl/clip_high": float(self.config.actor_rollout_ref.actor.clip_ratio_high or self.config.actor_rollout_ref.actor.clip_ratio),
+                        "base_rl/loss_agg_mode": str(self.config.actor_rollout_ref.actor.loss_agg_mode),
+                        "base_rl/dynamic_sampling": float(bool(filter_groups_cfg.get("enable", False))),
+                        "sdc/enabled": float(self.sdc_enabled),
+                        "sdc/beta": float(self.sdc_config.beta if self.sdc_enabled else 0.0),
                     }
                 )
                 # collect metrics
