@@ -69,7 +69,14 @@ from verl.utils.ulysses import (
     ulysses_pad,
     ulysses_pad_and_slice_inputs,
 )
-from verl.experimental.sdc_grpo.sft_trainer import outcome_sft_loss
+from verl.experimental.sdc_grpo.sft_trainer import (
+    configure_sft_trainable_parameters,
+    encode_outcome_example,
+    mix_state_with_base,
+    outcome_sft_loss,
+    pair_outcome_records,
+)
+from verl.experimental.sdc_grpo.data_collector import OutcomeExample
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
@@ -685,8 +692,7 @@ class FSDPEngine(BaseEngine):
         loaded = sdc_cast_state_to_dest(state, module.state_dict(), next(module.parameters()).dtype, device)
         module.load_state_dict(loaded, strict=False)
         module.train(True)
-        for param in module.parameters():
-            param.requires_grad_(True)
+        configure_sft_trainable_parameters(module, lora_enabled=self._is_lora)
         return module
 
     @staticmethod
@@ -713,23 +719,62 @@ class FSDPEngine(BaseEngine):
         module.train(was_training)
         return result.detach()
 
+    @staticmethod
+    def _sdc_parameter_counts(model, optimizer) -> dict[str, int]:
+        parameters = list(model.parameters())
+        optimizer_parameters = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        return {
+            "total": sum(parameter.numel() for parameter in parameters),
+            "trainable": sum(parameter.numel() for parameter in parameters if parameter.requires_grad),
+            "optimizer": sum(parameter.numel() for parameter in parameters if id(parameter) in optimizer_parameters),
+        }
+
     def sdc_init(self, sdc_config: dict):
         if getattr(self, "_sdc_initialized", False):
             return {"sdc_initialized": True}
         if self.engine_config.strategy not in ("fsdp", "fsdp2"):
             raise NotImplementedError("SDC-GRPO currently supports only FSDP/FSDP2 HF actors.")
         state = self._sdc_actor_state_cpu()
+        self._sdc_base_state_cpu = {name: value.detach().cpu().clone() for name, value in state.items()}
         self._sdc_success = self._sdc_clone_from_state(state)
         self._sdc_failure = self._sdc_clone_from_state(state)
         lr = float(sdc_config.get("sft_lr", 1e-6))
-        self._sdc_success_optimizer = torch.optim.AdamW(self._sdc_success.parameters(), lr=lr)
-        self._sdc_failure_optimizer = torch.optim.AdamW(self._sdc_failure.parameters(), lr=lr)
+        self._sdc_success_optimizer = torch.optim.AdamW(
+            (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad), lr=lr
+        )
+        self._sdc_failure_optimizer = torch.optim.AdamW(
+            (parameter for parameter in self._sdc_failure.parameters() if parameter.requires_grad), lr=lr
+        )
         self._sdc_success_model_update_count = int(sdc_config.get("sdc_success_model_update_count", 0))
         self._sdc_failure_model_update_count = int(sdc_config.get("sdc_failure_model_update_count", 0))
         self._sdc_models_ready = bool(sdc_config.get("sdc_models_ready", False))
         self._sdc_tokenizer = None
         self._sdc_initialized = True
-        return {"sdc_initialized": True}
+        actor_counts = {
+            "total": sum(parameter.numel() for parameter in self.module.parameters()),
+            "trainable": sum(parameter.numel() for parameter in self.module.parameters() if parameter.requires_grad),
+        }
+        success_counts = self._sdc_parameter_counts(self._sdc_success, self._sdc_success_optimizer)
+        failure_counts = self._sdc_parameter_counts(self._sdc_failure, self._sdc_failure_optimizer)
+        return {
+            "sdc_initialized": True,
+            "sdc/actor_total_parameters": actor_counts["total"],
+            "sdc/actor_trainable_parameters": actor_counts["trainable"],
+            "sdc/success_total_parameters": success_counts["total"],
+            "sdc/success_trainable_parameters": success_counts["trainable"],
+            "sdc/success_optimizer_parameters": success_counts["optimizer"],
+            "sdc/failure_total_parameters": failure_counts["total"],
+            "sdc/failure_trainable_parameters": failure_counts["trainable"],
+            "sdc/failure_optimizer_parameters": failure_counts["optimizer"],
+        }
+
+    def sdc_reinitialize_from_actor(self, sdc_config: dict):
+        self._sdc_initialized = False
+        return self.sdc_init(sdc_config)
 
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
         config = tu.get_non_tensor_data(data=data, key="custom_sdc_grpo", default={}) or {}
@@ -756,40 +801,251 @@ class FSDPEngine(BaseEngine):
                 self._sdc_tokenizer.pad_token = self._sdc_tokenizer.eos_token
         return self._sdc_tokenizer
 
-    def _sdc_sft_model(self, model, optimizer, records: list[dict], prefix: str, config: dict):
-        if not records:
-            return {f"sdc/{prefix}_sft_updates": 0.0}
-        tokenizer = self._sdc_get_tokenizer()
-        device = next(self.module.parameters()).device
-        batch_size = int(config.get("sft_batch_size", 8)); max_updates = int(config.get("sft_max_updates_per_interval", 1)); max_length = int(config.get("max_response_length", 2048))
+    def _sdc_match_records(self, success_records: list[dict], failure_records: list[dict], config: dict):
+        max_prompt_length = int(config.get("max_prompt_length", 1024))
+        max_response_length = int(config.get("max_response_length", 2048))
         token_budget = int(config.get("sft_max_token_len_per_gpu", 0) or 0)
+        max_length = max_prompt_length + max_response_length
+        batch_size = int(config.get("sft_batch_size", 8))
         if token_budget > 0:
             batch_size = min(batch_size, max(1, token_budget // max_length))
-        total, updates = 0.0, 0
+        return pair_outcome_records(
+            success_records,
+            failure_records,
+            max_examples=batch_size * int(config.get("sft_max_updates_per_interval", 1)),
+        )
+
+    def _sdc_response_token_count(self, records: list[dict], config: dict) -> int:
+        tokenizer = self._sdc_get_tokenizer()
+        max_prompt_length = int(config.get("max_prompt_length", 1024))
+        max_response_length = int(config.get("max_response_length", 2048))
+        return sum(
+            int(
+                encode_outcome_example(
+                    OutcomeExample(**record),
+                    tokenizer,
+                    max_prompt_length=max_prompt_length,
+                    max_response_length=max_response_length,
+                )[1].sum()
+            )
+            for record in records
+        )
+
+    def _sdc_sync_model_and_optimizer(self, model, optimizer) -> None:
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        for parameter in model.parameters():
+            torch.distributed.broadcast(parameter.data, src=0)
+        for buffer in model.buffers():
+            torch.distributed.broadcast(buffer.data, src=0)
+        for state in optimizer.state.values():
+            for value in state.values():
+                if torch.is_tensor(value):
+                    torch.distributed.broadcast(value.data, src=0)
+
+    def _sdc_write_checkpoint(self, local_path: str, global_step: int, config: dict):
+        """Write replicated SFT state once, then release every worker together."""
+
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        is_rank_zero = not distributed or torch.distributed.get_rank() == 0
+        if is_rank_zero:
+            os.makedirs(local_path, exist_ok=True)
+            for name, model, optimizer in (
+                ("success", self._sdc_success, self._sdc_success_optimizer),
+                ("failure", self._sdc_failure, self._sdc_failure_optimizer),
+            ):
+                directory = os.path.join(local_path, f"{name}_sft")
+                os.makedirs(directory, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(directory, "pytorch_model.bin"))
+                torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt"))
+            torch.save(self._sdc_base_state_cpu, os.path.join(local_path, "base_state.pt"))
+            torch.save(
+                {
+                    "global_step": global_step,
+                    "sdc_success_model_update_count": self._sdc_success_model_update_count,
+                    "sdc_failure_model_update_count": self._sdc_failure_model_update_count,
+                    "sdc_models_ready": self._sdc_models_ready,
+                    "success_buffer_state": config.get("success_buffer_state"),
+                    "failure_buffer_state": config.get("failure_buffer_state"),
+                },
+                os.path.join(local_path, "sdc_state.pt"),
+            )
+        if distributed:
+            torch.distributed.barrier()
+        return {
+            "sdc_saved": True,
+            "sdc_success_model_update_count": self._sdc_success_model_update_count,
+            "sdc_failure_model_update_count": self._sdc_failure_model_update_count,
+            "sdc_models_ready": self._sdc_models_ready,
+        }
+
+    def _sdc_mix_with_base(self, model, gamma: float) -> None:
+        mixed = mix_state_with_base(model.state_dict(), self._sdc_base_state_cpu, gamma=gamma)
+        model.load_state_dict(mixed, strict=False)
+
+    def _sdc_sft_model(
+        self,
+        model,
+        optimizer,
+        records: list[dict],
+        prefix: str,
+        config: dict,
+        response_token_budget: int | None = None,
+    ):
+        empty = {
+            f"sdc/{prefix}_sft_updates": 0.0,
+            f"sdc/{prefix}_sft_loss": 0.0,
+            f"sdc/{prefix}_sft_response_tokens": 0.0,
+            f"sdc/{prefix}_sft_examples": 0.0,
+        }
+        if not records:
+            return empty
+        tokenizer = self._sdc_get_tokenizer()
+        device = next(self.module.parameters()).device
+        max_prompt_length = int(config.get("max_prompt_length", 1024))
+        max_response_length = int(config.get("max_response_length", 2048))
+        max_total_length = max_prompt_length + max_response_length
+        batch_size = int(config.get("sft_batch_size", 8))
+        max_updates = int(config.get("sft_max_updates_per_interval", 1))
+        token_budget = int(config.get("sft_max_token_len_per_gpu", 0) or 0)
+        if token_budget > 0:
+            batch_size = min(batch_size, max(1, token_budget // max_total_length))
+        total_loss = 0.0
+        total_response_tokens = 0
+        updates = 0
         for start in range(0, min(len(records), batch_size * max_updates), batch_size):
-            chunks = records[start : start + batch_size]; rows = []; masks = []
+            chunks = records[start : start + batch_size]
+            rows, masks = [], []
             for record in chunks:
-                prompt = [{"role": "user", "content": str(record["prompt"])}]
-                full = prompt + [{"role": "assistant", "content": str(record["response"])}]
-                prompt_ids = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
-                ids = torch.as_tensor(tokenizer.apply_chat_template(full, add_generation_prompt=False, tokenize=True)[:max_length], dtype=torch.long)
-                mask = torch.zeros_like(ids); mask[min(len(prompt_ids), ids.numel()) :] = 1; rows.append(ids); masks.append(mask)
-            width = max(row.numel() for row in rows); pad_id = tokenizer.pad_token_id or 0
-            ids = torch.full((len(rows), width), pad_id, dtype=torch.long, device=device); attention = torch.zeros_like(ids); response = torch.zeros_like(ids)
-            for i, row in enumerate(rows):
-                ids[i, : row.numel()] = row.to(device); attention[i, : row.numel()] = 1; response[i, : row.numel()] = masks[i].to(device)
-            output = model(input_ids=ids, attention_mask=attention, use_cache=False); logits = output.logits[:, :-1]; labels = ids[:, 1:]
-            token_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False).view(labels.shape); mask = response[:, 1:].bool(); loss = outcome_sft_loss(token_lp, mask)
-            optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step(); total += float(loss.detach().cpu()); updates += 1
-        return {f"sdc/{prefix}_sft_updates": float(updates), f"sdc/{prefix}_sft_loss": total / max(updates, 1)}
+                row, response_mask = encode_outcome_example(
+                    OutcomeExample(**record),
+                    tokenizer,
+                    max_prompt_length=max_prompt_length,
+                    max_response_length=max_response_length,
+                )
+                rows.append(row)
+                masks.append(response_mask)
+            if response_token_budget is not None:
+                remaining = max(0, response_token_budget - total_response_tokens)
+                for index, mask in enumerate(masks):
+                    keep = min(int(mask.sum()), remaining)
+                    if keep < int(mask.sum()):
+                        clipped = torch.zeros_like(mask)
+                        positions = mask.nonzero(as_tuple=False).flatten()[:keep]
+                        clipped[positions] = 1
+                        masks[index] = clipped
+                    remaining -= keep
+            width = max(row.numel() for row in rows)
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+            input_ids = torch.full((len(rows), width), pad_id, dtype=torch.long, device=device)
+            attention = torch.zeros_like(input_ids)
+            response = torch.zeros_like(input_ids)
+            for index, row in enumerate(rows):
+                input_ids[index, : row.numel()] = row.to(device)
+                attention[index, : row.numel()] = 1
+                response[index, : row.numel()] = masks[index].to(device)
+            output = model(input_ids=input_ids, attention_mask=attention, use_cache=False)
+            logits = output.logits[:, :-1]
+            labels = input_ids[:, 1:]
+            token_log_probs = logprobs_from_logits(
+                logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
+            ).view(labels.shape)
+            loss = outcome_sft_loss(token_log_probs, response[:, 1:].bool())
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach().cpu())
+            total_response_tokens += int(response.sum().detach().cpu())
+            updates += 1
+        return {
+            f"sdc/{prefix}_sft_updates": float(updates),
+            f"sdc/{prefix}_sft_loss": total_loss / max(updates, 1),
+            f"sdc/{prefix}_sft_response_tokens": float(total_response_tokens),
+            f"sdc/{prefix}_sft_examples": float(min(len(records), batch_size * max_updates)),
+        }
 
     def sdc_sft_update(self, success_records: list[dict], failure_records: list[dict], config: dict):
         self.sdc_init(config)
-        success = self._sdc_sft_model(self._sdc_success, self._sdc_success_optimizer, success_records, "success", config)
-        failure = self._sdc_sft_model(self._sdc_failure, self._sdc_failure_optimizer, failure_records, "failure", config)
-        self._sdc_success_model_update_count += int(success["sdc/success_sft_updates"]); self._sdc_failure_model_update_count += int(failure["sdc/failure_sft_updates"])
-        minimum = int(config.get("min_sft_updates_before_use", 1)); self._sdc_models_ready = self._sdc_success_model_update_count >= minimum and self._sdc_failure_model_update_count >= minimum
-        return {**success, **failure, "sdc/success_model_update_count": float(self._sdc_success_model_update_count), "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count), "sdc/models_ready": float(self._sdc_models_ready)}
+        if not success_records or not failure_records:
+            return {
+                "sdc/success_sft_updates": 0.0,
+                "sdc/failure_sft_updates": 0.0,
+                "sdc/success_sft_response_tokens": 0.0,
+                "sdc/failure_sft_response_tokens": 0.0,
+                "sdc/success_sft_examples": 0.0,
+                "sdc/failure_sft_examples": 0.0,
+                "sdc/sft_pair_skipped_unmatched": 1.0,
+                "sdc/success_model_update_count": float(self._sdc_success_model_update_count),
+                "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
+                "sdc/models_ready": float(self._sdc_models_ready),
+            }
+        success_records, failure_records = self._sdc_match_records(success_records, failure_records, config)
+        if not success_records or not failure_records:
+            return {
+                "sdc/success_sft_updates": 0.0,
+                "sdc/failure_sft_updates": 0.0,
+                "sdc/sft_pair_skipped_unmatched": 1.0,
+                "sdc/success_model_update_count": float(self._sdc_success_model_update_count),
+                "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
+                "sdc/models_ready": float(self._sdc_models_ready),
+            }
+        common_response_tokens = min(
+            self._sdc_response_token_count(success_records, config),
+            self._sdc_response_token_count(failure_records, config),
+        )
+        if common_response_tokens <= 0:
+            return {
+                "sdc/success_sft_updates": 0.0,
+                "sdc/failure_sft_updates": 0.0,
+                "sdc/sft_pair_skipped_unmatched": 1.0,
+                "sdc/success_model_update_count": float(self._sdc_success_model_update_count),
+                "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
+                "sdc/models_ready": float(self._sdc_models_ready),
+            }
+        success = self._sdc_sft_model(
+            self._sdc_success,
+            self._sdc_success_optimizer,
+            success_records,
+            "success",
+            config,
+            response_token_budget=common_response_tokens,
+        )
+        failure = self._sdc_sft_model(
+            self._sdc_failure,
+            self._sdc_failure_optimizer,
+            failure_records,
+            "failure",
+            config,
+            response_token_budget=common_response_tokens,
+        )
+        success_updates = int(success["sdc/success_sft_updates"])
+        failure_updates = int(failure["sdc/failure_sft_updates"])
+        if success_updates != failure_updates:
+            raise RuntimeError("SDC success/failure refresh produced different optimizer-step counts.")
+        if success_updates:
+            gamma = float(config.get("base_mix_gamma", 0.9))
+            self._sdc_mix_with_base(self._sdc_success, gamma)
+            self._sdc_mix_with_base(self._sdc_failure, gamma)
+            self._sdc_sync_model_and_optimizer(self._sdc_success, self._sdc_success_optimizer)
+            self._sdc_sync_model_and_optimizer(self._sdc_failure, self._sdc_failure_optimizer)
+        self._sdc_success_model_update_count += success_updates
+        self._sdc_failure_model_update_count += failure_updates
+        minimum = int(config.get("min_sft_updates_before_use", 1))
+        self._sdc_models_ready = (
+            self._sdc_success_model_update_count >= minimum
+            and self._sdc_failure_model_update_count >= minimum
+        )
+        return {
+            **success,
+            **failure,
+            "sdc/sft_pair_skipped_unmatched": 0.0,
+            "sdc/sft_pair_response_tokens": min(
+                success["sdc/success_sft_response_tokens"], failure["sdc/failure_sft_response_tokens"]
+            ),
+            "sdc/success_model_update_count": float(self._sdc_success_model_update_count),
+            "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
+            "sdc/models_ready": float(self._sdc_models_ready),
+        }
 
     def _sdc_peft_state(self, model):
         from peft.utils.save_and_load import get_peft_model_state_dict
@@ -804,15 +1060,14 @@ class FSDPEngine(BaseEngine):
         return {"enabled": True, "peft_config": peft_config, "success": self._sdc_peft_state(self._sdc_success), "failure": self._sdc_peft_state(self._sdc_failure)}
 
     def sdc_save_checkpoint(self, local_path: str, global_step: int, config: dict):
-        self.sdc_init(config); os.makedirs(local_path, exist_ok=True)
-        for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
-            directory = os.path.join(local_path, f"{name}_sft"); os.makedirs(directory, exist_ok=True); torch.save(model.state_dict(), os.path.join(directory, "pytorch_model.bin"))
-            if bool(config.get("save_sft_optimizers", True)): torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt"))
-        torch.save({"global_step": global_step, "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}, os.path.join(local_path, "sdc_state.pt"))
-        return {"sdc_saved": True, "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}
+        self.sdc_init(config)
+        return self._sdc_write_checkpoint(local_path, global_step, config)
 
     def sdc_load(self, local_path: str, config: dict | None = None):
-        config = config or {}; self.sdc_init(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        base_path = os.path.join(local_path, "base_state.pt")
+        if os.path.exists(base_path):
+            self._sdc_base_state_cpu = torch.load(base_path, map_location="cpu")
         self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
         for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
             directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
@@ -820,7 +1075,14 @@ class FSDPEngine(BaseEngine):
             if os.path.exists(optimizer_path):
                 optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
                 self._sdc_move_optimizer_state(optimizer, next(model.parameters()).device)
-        return {"sdc_loaded": os.path.exists(state_path), "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}
+        return {
+            "sdc_loaded": os.path.exists(state_path),
+            "sdc_success_model_update_count": self._sdc_success_model_update_count,
+            "sdc_failure_model_update_count": self._sdc_failure_model_update_count,
+            "sdc_models_ready": self._sdc_models_ready,
+            "success_buffer_state": state.get("success_buffer_state"),
+            "failure_buffer_state": state.get("failure_buffer_state"),
+        }
     def save_checkpoint(
         self,
         local_path: str,
@@ -1330,8 +1592,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         loaded = sdc_cast_state_to_dest(state, module.state_dict(), next(module.parameters()).dtype, device)
         module.load_state_dict(loaded, strict=False)
         module.train(True)
-        for param in module.parameters():
-            param.requires_grad_(True)
+        configure_sft_trainable_parameters(module, lora_enabled=self._is_lora)
         return module
 
     @staticmethod
@@ -1358,23 +1619,62 @@ class FSDPEngineWithLMHead(FSDPEngine):
         module.train(was_training)
         return result.detach()
 
+    @staticmethod
+    def _sdc_parameter_counts(model, optimizer) -> dict[str, int]:
+        parameters = list(model.parameters())
+        optimizer_parameters = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        return {
+            "total": sum(parameter.numel() for parameter in parameters),
+            "trainable": sum(parameter.numel() for parameter in parameters if parameter.requires_grad),
+            "optimizer": sum(parameter.numel() for parameter in parameters if id(parameter) in optimizer_parameters),
+        }
+
     def sdc_init(self, sdc_config: dict):
         if getattr(self, "_sdc_initialized", False):
             return {"sdc_initialized": True}
         if self.engine_config.strategy not in ("fsdp", "fsdp2"):
             raise NotImplementedError("SDC-GRPO currently supports only FSDP/FSDP2 HF actors.")
         state = self._sdc_actor_state_cpu()
+        self._sdc_base_state_cpu = {name: value.detach().cpu().clone() for name, value in state.items()}
         self._sdc_success = self._sdc_clone_from_state(state)
         self._sdc_failure = self._sdc_clone_from_state(state)
         lr = float(sdc_config.get("sft_lr", 1e-6))
-        self._sdc_success_optimizer = torch.optim.AdamW(self._sdc_success.parameters(), lr=lr)
-        self._sdc_failure_optimizer = torch.optim.AdamW(self._sdc_failure.parameters(), lr=lr)
+        self._sdc_success_optimizer = torch.optim.AdamW(
+            (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad), lr=lr
+        )
+        self._sdc_failure_optimizer = torch.optim.AdamW(
+            (parameter for parameter in self._sdc_failure.parameters() if parameter.requires_grad), lr=lr
+        )
         self._sdc_success_model_update_count = int(sdc_config.get("sdc_success_model_update_count", 0))
         self._sdc_failure_model_update_count = int(sdc_config.get("sdc_failure_model_update_count", 0))
         self._sdc_models_ready = bool(sdc_config.get("sdc_models_ready", False))
         self._sdc_tokenizer = None
         self._sdc_initialized = True
-        return {"sdc_initialized": True}
+        actor_counts = {
+            "total": sum(parameter.numel() for parameter in self.module.parameters()),
+            "trainable": sum(parameter.numel() for parameter in self.module.parameters() if parameter.requires_grad),
+        }
+        success_counts = self._sdc_parameter_counts(self._sdc_success, self._sdc_success_optimizer)
+        failure_counts = self._sdc_parameter_counts(self._sdc_failure, self._sdc_failure_optimizer)
+        return {
+            "sdc_initialized": True,
+            "sdc/actor_total_parameters": actor_counts["total"],
+            "sdc/actor_trainable_parameters": actor_counts["trainable"],
+            "sdc/success_total_parameters": success_counts["total"],
+            "sdc/success_trainable_parameters": success_counts["trainable"],
+            "sdc/success_optimizer_parameters": success_counts["optimizer"],
+            "sdc/failure_total_parameters": failure_counts["total"],
+            "sdc/failure_trainable_parameters": failure_counts["trainable"],
+            "sdc/failure_optimizer_parameters": failure_counts["optimizer"],
+        }
+
+    def sdc_reinitialize_from_actor(self, sdc_config: dict):
+        self._sdc_initialized = False
+        return self.sdc_init(sdc_config)
 
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
         config = tu.get_non_tensor_data(data=data, key="custom_sdc_grpo", default={}) or {}
@@ -1401,40 +1701,169 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 self._sdc_tokenizer.pad_token = self._sdc_tokenizer.eos_token
         return self._sdc_tokenizer
 
-    def _sdc_sft_model(self, model, optimizer, records: list[dict], prefix: str, config: dict):
+    def _sdc_sft_model(
+        self,
+        model,
+        optimizer,
+        records: list[dict],
+        prefix: str,
+        config: dict,
+        response_token_budget: int | None = None,
+    ):
+        empty = {
+            f"sdc/{prefix}_sft_updates": 0.0,
+            f"sdc/{prefix}_sft_loss": 0.0,
+            f"sdc/{prefix}_sft_response_tokens": 0.0,
+            f"sdc/{prefix}_sft_examples": 0.0,
+        }
         if not records:
-            return {f"sdc/{prefix}_sft_updates": 0.0}
+            return empty
         tokenizer = self._sdc_get_tokenizer()
         device = next(self.module.parameters()).device
-        batch_size = int(config.get("sft_batch_size", 8)); max_updates = int(config.get("sft_max_updates_per_interval", 1)); max_length = int(config.get("max_response_length", 2048))
+        max_prompt_length = int(config.get("max_prompt_length", 1024))
+        max_response_length = int(config.get("max_response_length", 2048))
+        max_total_length = max_prompt_length + max_response_length
+        batch_size = int(config.get("sft_batch_size", 8))
+        max_updates = int(config.get("sft_max_updates_per_interval", 1))
         token_budget = int(config.get("sft_max_token_len_per_gpu", 0) or 0)
         if token_budget > 0:
-            batch_size = min(batch_size, max(1, token_budget // max_length))
-        total, updates = 0.0, 0
+            batch_size = min(batch_size, max(1, token_budget // max_total_length))
+        total_loss = 0.0
+        total_response_tokens = 0
+        updates = 0
         for start in range(0, min(len(records), batch_size * max_updates), batch_size):
-            chunks = records[start : start + batch_size]; rows = []; masks = []
+            chunks = records[start : start + batch_size]
+            rows, masks = [], []
             for record in chunks:
-                prompt = [{"role": "user", "content": str(record["prompt"])}]
-                full = prompt + [{"role": "assistant", "content": str(record["response"])}]
-                prompt_ids = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
-                ids = torch.as_tensor(tokenizer.apply_chat_template(full, add_generation_prompt=False, tokenize=True)[:max_length], dtype=torch.long)
-                mask = torch.zeros_like(ids); mask[min(len(prompt_ids), ids.numel()) :] = 1; rows.append(ids); masks.append(mask)
-            width = max(row.numel() for row in rows); pad_id = tokenizer.pad_token_id or 0
-            ids = torch.full((len(rows), width), pad_id, dtype=torch.long, device=device); attention = torch.zeros_like(ids); response = torch.zeros_like(ids)
-            for i, row in enumerate(rows):
-                ids[i, : row.numel()] = row.to(device); attention[i, : row.numel()] = 1; response[i, : row.numel()] = masks[i].to(device)
-            output = model(input_ids=ids, attention_mask=attention, use_cache=False); logits = output.logits[:, :-1]; labels = ids[:, 1:]
-            token_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False).view(labels.shape); mask = response[:, 1:].bool(); loss = outcome_sft_loss(token_lp, mask)
-            optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step(); total += float(loss.detach().cpu()); updates += 1
-        return {f"sdc/{prefix}_sft_updates": float(updates), f"sdc/{prefix}_sft_loss": total / max(updates, 1)}
+                row, response_mask = encode_outcome_example(
+                    OutcomeExample(**record),
+                    tokenizer,
+                    max_prompt_length=max_prompt_length,
+                    max_response_length=max_response_length,
+                )
+                rows.append(row)
+                masks.append(response_mask)
+            if response_token_budget is not None:
+                remaining = max(0, response_token_budget - total_response_tokens)
+                for index, mask in enumerate(masks):
+                    keep = min(int(mask.sum()), remaining)
+                    if keep < int(mask.sum()):
+                        clipped = torch.zeros_like(mask)
+                        positions = mask.nonzero(as_tuple=False).flatten()[:keep]
+                        clipped[positions] = 1
+                        masks[index] = clipped
+                    remaining -= keep
+            width = max(row.numel() for row in rows)
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+            input_ids = torch.full((len(rows), width), pad_id, dtype=torch.long, device=device)
+            attention = torch.zeros_like(input_ids)
+            response = torch.zeros_like(input_ids)
+            for index, row in enumerate(rows):
+                input_ids[index, : row.numel()] = row.to(device)
+                attention[index, : row.numel()] = 1
+                response[index, : row.numel()] = masks[index].to(device)
+            output = model(input_ids=input_ids, attention_mask=attention, use_cache=False)
+            logits = output.logits[:, :-1]
+            labels = input_ids[:, 1:]
+            token_log_probs = logprobs_from_logits(
+                logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
+            ).view(labels.shape)
+            loss = outcome_sft_loss(token_log_probs, response[:, 1:].bool())
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach().cpu())
+            total_response_tokens += int(response.sum().detach().cpu())
+            updates += 1
+        return {
+            f"sdc/{prefix}_sft_updates": float(updates),
+            f"sdc/{prefix}_sft_loss": total_loss / max(updates, 1),
+            f"sdc/{prefix}_sft_response_tokens": float(total_response_tokens),
+            f"sdc/{prefix}_sft_examples": float(min(len(records), batch_size * max_updates)),
+        }
 
     def sdc_sft_update(self, success_records: list[dict], failure_records: list[dict], config: dict):
         self.sdc_init(config)
-        success = self._sdc_sft_model(self._sdc_success, self._sdc_success_optimizer, success_records, "success", config)
-        failure = self._sdc_sft_model(self._sdc_failure, self._sdc_failure_optimizer, failure_records, "failure", config)
-        self._sdc_success_model_update_count += int(success["sdc/success_sft_updates"]); self._sdc_failure_model_update_count += int(failure["sdc/failure_sft_updates"])
-        minimum = int(config.get("min_sft_updates_before_use", 1)); self._sdc_models_ready = self._sdc_success_model_update_count >= minimum and self._sdc_failure_model_update_count >= minimum
-        return {**success, **failure, "sdc/success_model_update_count": float(self._sdc_success_model_update_count), "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count), "sdc/models_ready": float(self._sdc_models_ready)}
+        if not success_records or not failure_records:
+            return {
+                "sdc/success_sft_updates": 0.0,
+                "sdc/failure_sft_updates": 0.0,
+                "sdc/success_sft_response_tokens": 0.0,
+                "sdc/failure_sft_response_tokens": 0.0,
+                "sdc/success_sft_examples": 0.0,
+                "sdc/failure_sft_examples": 0.0,
+                "sdc/sft_pair_skipped_unmatched": 1.0,
+                "sdc/success_model_update_count": float(self._sdc_success_model_update_count),
+                "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
+                "sdc/models_ready": float(self._sdc_models_ready),
+            }
+        success_records, failure_records = self._sdc_match_records(success_records, failure_records, config)
+        if not success_records or not failure_records:
+            return {
+                "sdc/success_sft_updates": 0.0,
+                "sdc/failure_sft_updates": 0.0,
+                "sdc/sft_pair_skipped_unmatched": 1.0,
+                "sdc/success_model_update_count": float(self._sdc_success_model_update_count),
+                "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
+                "sdc/models_ready": float(self._sdc_models_ready),
+            }
+        common_response_tokens = min(
+            self._sdc_response_token_count(success_records, config),
+            self._sdc_response_token_count(failure_records, config),
+        )
+        if common_response_tokens <= 0:
+            return {
+                "sdc/success_sft_updates": 0.0,
+                "sdc/failure_sft_updates": 0.0,
+                "sdc/sft_pair_skipped_unmatched": 1.0,
+                "sdc/success_model_update_count": float(self._sdc_success_model_update_count),
+                "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
+                "sdc/models_ready": float(self._sdc_models_ready),
+            }
+        success = self._sdc_sft_model(
+            self._sdc_success,
+            self._sdc_success_optimizer,
+            success_records,
+            "success",
+            config,
+            response_token_budget=common_response_tokens,
+        )
+        failure = self._sdc_sft_model(
+            self._sdc_failure,
+            self._sdc_failure_optimizer,
+            failure_records,
+            "failure",
+            config,
+            response_token_budget=common_response_tokens,
+        )
+        success_updates = int(success["sdc/success_sft_updates"])
+        failure_updates = int(failure["sdc/failure_sft_updates"])
+        if success_updates != failure_updates:
+            raise RuntimeError("SDC success/failure refresh produced different optimizer-step counts.")
+        if success_updates:
+            gamma = float(config.get("base_mix_gamma", 0.9))
+            self._sdc_mix_with_base(self._sdc_success, gamma)
+            self._sdc_mix_with_base(self._sdc_failure, gamma)
+            self._sdc_sync_model_and_optimizer(self._sdc_success, self._sdc_success_optimizer)
+            self._sdc_sync_model_and_optimizer(self._sdc_failure, self._sdc_failure_optimizer)
+        self._sdc_success_model_update_count += success_updates
+        self._sdc_failure_model_update_count += failure_updates
+        minimum = int(config.get("min_sft_updates_before_use", 1))
+        self._sdc_models_ready = (
+            self._sdc_success_model_update_count >= minimum
+            and self._sdc_failure_model_update_count >= minimum
+        )
+        return {
+            **success,
+            **failure,
+            "sdc/sft_pair_skipped_unmatched": 0.0,
+            "sdc/sft_pair_response_tokens": min(
+                success["sdc/success_sft_response_tokens"], failure["sdc/failure_sft_response_tokens"]
+            ),
+            "sdc/success_model_update_count": float(self._sdc_success_model_update_count),
+            "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
+            "sdc/models_ready": float(self._sdc_models_ready),
+        }
 
     def _sdc_peft_state(self, model):
         from peft.utils.save_and_load import get_peft_model_state_dict
@@ -1449,15 +1878,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return {"enabled": True, "peft_config": peft_config, "success": self._sdc_peft_state(self._sdc_success), "failure": self._sdc_peft_state(self._sdc_failure)}
 
     def sdc_save_checkpoint(self, local_path: str, global_step: int, config: dict):
-        self.sdc_init(config); os.makedirs(local_path, exist_ok=True)
-        for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
-            directory = os.path.join(local_path, f"{name}_sft"); os.makedirs(directory, exist_ok=True); torch.save(model.state_dict(), os.path.join(directory, "pytorch_model.bin"))
-            if bool(config.get("save_sft_optimizers", True)): torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt"))
-        torch.save({"global_step": global_step, "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}, os.path.join(local_path, "sdc_state.pt"))
-        return {"sdc_saved": True, "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}
+        self.sdc_init(config)
+        return self._sdc_write_checkpoint(local_path, global_step, config)
 
     def sdc_load(self, local_path: str, config: dict | None = None):
-        config = config or {}; self.sdc_init(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        base_path = os.path.join(local_path, "base_state.pt")
+        if os.path.exists(base_path):
+            self._sdc_base_state_cpu = torch.load(base_path, map_location="cpu")
         self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
         for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
             directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
@@ -1465,7 +1893,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if os.path.exists(optimizer_path):
                 optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
                 self._sdc_move_optimizer_state(optimizer, next(model.parameters()).device)
-        return {"sdc_loaded": os.path.exists(state_path), "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready}
+        return {"sdc_loaded": os.path.exists(state_path), "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready, "success_buffer_state": state.get("success_buffer_state"), "failure_buffer_state": state.get("failure_buffer_state")}
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...

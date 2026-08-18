@@ -25,7 +25,7 @@ def _call(correct, wrong, teacher, detach, margin=0.0, repel_weight=1.0):
     )
 
 
-def test_detach_blocks_gradient_to_the_anchor_only():
+def test_detach_blocks_gradient_to_the_frozen_target_only():
     torch.manual_seed(0)
     d, m = 16, 6
     for detach, anchor_gets_grad in ((True, False), (False, True)):

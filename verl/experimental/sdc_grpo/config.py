@@ -22,6 +22,7 @@ class SDCGRPOConfig:
     verify_rollout_log_probs: bool = False
     use_importance_weight: bool = True
     importance_weight_clip: float = 10.0
+    base_mix_gamma: float = 0.9
 
     sft_update_interval_grpo_steps: int = 5
     checkpoint_interval_grpo_steps: int = 10
@@ -34,8 +35,6 @@ class SDCGRPOConfig:
     data_max_size: Optional[int] = None
     data_sampling: str = "recent"
     save_to_disk_interval_grpo_steps: int = 0
-    save_sft_optimizers: bool = True
-    disable_builtin_kl: bool = True
 
     @classmethod
     def from_config(cls, config: DictConfig | dict | None) -> "SDCGRPOConfig":
@@ -74,11 +73,10 @@ def validate_sdc_config(config: DictConfig | dict) -> SDCGRPOConfig:
 
     if estimator != "grpo":
         raise ValueError("custom_sdc_grpo requires algorithm.adv_estimator='grpo'.")
-    if custom.disable_builtin_kl:
-        if bool(algorithm.get("use_kl_in_reward", False)):
-            raise ValueError("SDC-GRPO requires algorithm.use_kl_in_reward=false.")
-        if bool(actor.get("use_kl_loss", False)):
-            raise ValueError("SDC-GRPO requires actor_rollout_ref.actor.use_kl_loss=false.")
+    if bool(algorithm.get("use_kl_in_reward", False)):
+        raise ValueError("SDC-GRPO requires algorithm.use_kl_in_reward=false.")
+    if bool(actor.get("use_kl_loss", False)):
+        raise ValueError("SDC-GRPO requires actor_rollout_ref.actor.use_kl_loss=false.")
     if custom.beta < 0:
         raise ValueError("custom_sdc_grpo.beta must be non-negative.")
     if custom.logprob_backend not in {"hf", "vllm"}:
@@ -93,6 +91,10 @@ def validate_sdc_config(config: DictConfig | dict) -> SDCGRPOConfig:
         raise ValueError("custom_sdc_grpo.vllm_score_micro_batch_size must be positive.")
     if custom.importance_weight_clip < 0:
         raise ValueError("custom_sdc_grpo.importance_weight_clip must be non-negative.")
+    if not custom.use_importance_weight:
+        raise ValueError("custom_sdc_grpo.use_importance_weight=false would remove the actor-dependent SDC gradient; keep it true.")
+    if not 0.0 < custom.base_mix_gamma <= 1.0:
+        raise ValueError("custom_sdc_grpo.base_mix_gamma must be in (0, 1].")
     if custom.min_sft_updates_before_use < 1:
         raise ValueError("custom_sdc_grpo.min_sft_updates_before_use must be >= 1.")
     if custom.sft_update_interval_grpo_steps <= 0 or custom.checkpoint_interval_grpo_steps <= 0:

@@ -2,7 +2,7 @@
 # Abstract-reasoning compression GRPO on Qwen2.5-Math-1.5B-Instruct.
 #
 # Config is deliberately identical to the reference GRPO run
-# `tafr-repro-math15b/tafr-sweep-repro-b10-20260805` (same dataset, batch sizes,
+# `reference-grpo-math15b/grpo-sweep-repro-b10-20260805` (same dataset, batch sizes,
 # lr, rollout.n, seeds, val parquets, greedy val, best-ckpt metric, wandb project),
 # so the arms below are comparable to it and to each other.
 #
@@ -93,7 +93,7 @@ if [[ "$FILL_GAP" == "1" ]]; then
   [[ "$BOOTSTRAP" == "0" ]] && BOOTSTRAP=$TOTAL_STEPS
 fi
 LOGGER=${LOGGER:-'["console","wandb"]'}
-PROJECT=${PROJECT:-tafr-repro-math15b}
+PROJECT=${PROJECT:-abstractrl-repro-math15b}
 EXPERIMENT=${EXPERIMENT:-abstractrl-${ARM}-$(date +%Y%m%d)}
 
 DATA=/workspace/jepa-grpo-cache/data/dsr_math345/train.parquet

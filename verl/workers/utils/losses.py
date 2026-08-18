@@ -263,7 +263,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         )
         policy_loss = policy_loss + sdc_loss
         metrics.update(Metric.from_dict(sdc_stats, aggregation=AggregationType.MEAN))
-        metrics["sdc/loss_grpo"] = Metric(value=pg_loss, aggregation=metric_aggregation)
     # add entropy loss
     if entropy is not None:
         entropy_loss = agg_loss(

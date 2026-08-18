@@ -910,6 +910,7 @@ custom_sdc_grpo:
   verify_rollout_log_probs: false
   use_importance_weight: true
   importance_weight_clip: 10.0
+  base_mix_gamma: 0.9
   sft_update_interval_grpo_steps: 5
   checkpoint_interval_grpo_steps: 10
   min_sft_updates_before_use: 1
@@ -920,8 +921,6 @@ custom_sdc_grpo:
   data_max_size: null
   data_sampling: recent
   save_to_disk_interval_grpo_steps: 0
-  save_sft_optimizers: true
-  disable_builtin_kl: true
 custom_sharpening_grpo:
   enable: false
   use_grpo_reward: true

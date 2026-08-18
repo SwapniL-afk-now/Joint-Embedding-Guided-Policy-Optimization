@@ -750,7 +750,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
         return self.actor.engine.sdc_init(sdc_config)
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sdc_reinitialize_from_actor(self, sdc_config: dict):
+        assert "actor" in self.role, "SDC-GRPO requires the actor worker"
+        return self.actor.engine.sdc_reinitialize_from_actor(sdc_config)
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="purple", role="sdc_success_failure_log_probs")
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:

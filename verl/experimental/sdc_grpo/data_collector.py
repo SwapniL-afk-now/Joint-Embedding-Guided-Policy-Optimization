@@ -5,6 +5,8 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
 
+import torch
+
 
 @dataclass
 class OutcomeExample:
@@ -12,6 +14,24 @@ class OutcomeExample:
     response: Any
     reward: int
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def binary_outcome_scores(reward_tensor: torch.Tensor) -> torch.Tensor:
+    """Collapse token scores to rows and reject every non-binary outcome."""
+
+    if reward_tensor.ndim == 1:
+        scores = reward_tensor
+    else:
+        scores = reward_tensor.reshape(reward_tensor.shape[0], -1).sum(dim=-1)
+    scores = scores.detach().float()
+    valid = (scores == 0.0) | (scores == 1.0)
+    if not bool(valid.all()):
+        invalid = scores[~valid].tolist()
+        raise ValueError(
+            "SDC-GRPO requires every scalar outcome reward to be exactly 0 or 1; "
+            f"received invalid values {invalid[:8]}"
+        )
+    return scores
 
 
 class OutcomeDataCollector:
@@ -63,8 +83,54 @@ class OutcomeDataCollector:
     def clear(self) -> None:
         self._examples.clear()
 
+    def consume(self, count: int) -> None:
+        """Remove the oldest successfully paired examples after an SFT update."""
+
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        if self.sampling == "recent":
+            for _ in range(min(count, len(self._examples))):
+                self._examples.popleft()
+        else:
+            del self._examples[: min(count, len(self._examples))]
+
     def to_records(self) -> list[dict[str, Any]]:
         return [asdict(example) for example in self._examples]
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return a serializable snapshot, including pending examples and RNG state."""
+
+        return {
+            "target_reward": self.target_reward,
+            "max_size": self.max_size,
+            "sampling": self.sampling,
+            "total_seen": self.total_seen,
+            "examples": self.to_records(),
+            "rng_state": self._rng.getstate(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if int(state.get("target_reward", self.target_reward)) != self.target_reward:
+            raise ValueError("Outcome collector checkpoint has the wrong target reward.")
+        if state.get("sampling", self.sampling) != self.sampling:
+            raise ValueError("Outcome collector checkpoint has the wrong sampling policy.")
+        self.clear()
+        for row in state.get("examples", []):
+            self.add(
+                prompt=row.get("prompt"),
+                response=row.get("response"),
+                reward=row.get("reward"),
+                metadata=row.get("metadata"),
+            )
+        self.total_seen = int(state.get("total_seen", len(self._examples)))
+        if "rng_state" in state:
+            self._rng.setstate(state["rng_state"])
+
+    def buffer_age(self, current_step: int) -> float:
+        if not self._examples:
+            return 0.0
+        steps = [int(example.metadata.get("global_grpo_step", current_step)) for example in self._examples]
+        return float(max(0, current_step - min(steps)))
 
 
 class SuccessDataCollector(OutcomeDataCollector):

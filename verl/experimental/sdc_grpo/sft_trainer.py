@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import torch
 from torch import nn
@@ -22,6 +22,84 @@ def outcome_sft_loss(log_prob: torch.Tensor, response_mask: torch.Tensor) -> tor
     sequence_loss = -(log_prob * mask).sum(dim=-1) / token_count
     valid = (mask.sum(dim=-1) > 0).to(log_prob.dtype)
     return (sequence_loss * valid).sum() / valid.sum().clamp_min(1.0)
+
+
+def encode_outcome_example(
+    example: OutcomeExample,
+    tokenizer,
+    *,
+    max_prompt_length: int,
+    max_response_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode an outcome example without using the response limit as total length.
+
+    The prompt is truncated independently from the left, while the assistant
+    response keeps its own limit. This preserves response-token supervision for
+    a long prompt plus a long response.
+    """
+
+    prompt = {"role": "user", "content": str(example.prompt)}
+    assistant = {"role": "assistant", "content": str(example.response)}
+    prompt_ids = list(tokenizer.apply_chat_template([prompt], add_generation_prompt=True, tokenize=True))
+    full_ids = list(tokenizer.apply_chat_template([prompt, assistant], add_generation_prompt=False, tokenize=True))
+    response_ids = full_ids[len(prompt_ids) : len(prompt_ids) + max_response_length]
+    prompt_ids = prompt_ids[-max_prompt_length:]
+    ids = torch.as_tensor(prompt_ids + response_ids, dtype=torch.long)
+    response_mask = torch.zeros_like(ids)
+    response_mask[len(prompt_ids) :] = 1
+    return ids, response_mask
+
+
+def configure_sft_trainable_parameters(module: nn.Module, *, lora_enabled: bool) -> list[nn.Parameter]:
+    """Keep PEFT base weights frozen while retaining adapter trainability."""
+
+    if lora_enabled:
+        trainable = [parameter for parameter in module.parameters() if parameter.requires_grad]
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+        for parameter in trainable:
+            parameter.requires_grad_(True)
+    else:
+        for parameter in module.parameters():
+            parameter.requires_grad_(True)
+        trainable = list(module.parameters())
+    if not trainable:
+        raise ValueError("SDC SFT model has no trainable parameters.")
+    return trainable
+
+
+def pair_outcome_records(
+    success_records: list[dict],
+    failure_records: list[dict],
+    *,
+    max_examples: int,
+) -> tuple[list[dict], list[dict]]:
+    """Select the same number of examples without consuming either buffer."""
+
+    if not success_records or not failure_records or max_examples <= 0:
+        return [], []
+    count = min(len(success_records), len(failure_records), max_examples)
+    return success_records[:count], failure_records[:count]
+
+
+def mix_state_with_base(
+    current_state: Mapping[str, torch.Tensor],
+    base_state: Mapping[str, torch.Tensor],
+    *,
+    gamma: float,
+) -> dict[str, torch.Tensor]:
+    """Apply the same common-base interpolation to one outcome model."""
+
+    if not 0.0 < gamma <= 1.0:
+        raise ValueError("gamma must be in (0, 1].")
+    mixed = {}
+    for name, value in current_state.items():
+        base = base_state.get(name)
+        if base is None or not torch.is_floating_point(value):
+            mixed[name] = value
+        else:
+            mixed[name] = gamma * value.detach() + (1.0 - gamma) * base.to(value.device, value.dtype)
+    return mixed
 
 
 class OutcomeSFTTrainer:
@@ -51,16 +129,33 @@ class OutcomeSFTTrainer:
         return SFTStepResult(float(loss.detach().cpu()), int(shifted_mask.sum().cpu()), int(input_ids.shape[0]))
 
     @staticmethod
-    def build_text_batch(examples: Iterable[OutcomeExample], tokenizer, max_length: int):
+    def build_text_batch(
+        examples: Iterable[OutcomeExample],
+        tokenizer,
+        max_length: int | None = None,
+        *,
+        max_prompt_length: int | None = None,
+        max_response_length: int | None = None,
+    ):
         encoded_rows, response_masks = [], []
         for example in examples:
-            prompt = {"role": "user", "content": example.prompt}
-            assistant = {"role": "assistant", "content": example.response}
-            prompt_ids = tokenizer.apply_chat_template([prompt], add_generation_prompt=True, tokenize=True)
-            full_ids = tokenizer.apply_chat_template([prompt, assistant], add_generation_prompt=False, tokenize=True)
-            ids = torch.as_tensor(full_ids[:max_length], dtype=torch.long)
-            mask = torch.zeros_like(ids)
-            mask[min(len(prompt_ids), ids.numel()):] = 1
+            if max_prompt_length is not None and max_response_length is not None:
+                ids, mask = encode_outcome_example(
+                    example,
+                    tokenizer,
+                    max_prompt_length=max_prompt_length,
+                    max_response_length=max_response_length,
+                )
+            else:
+                if max_length is None:
+                    raise ValueError("Provide max_length or separate prompt/response limits.")
+                prompt = {"role": "user", "content": example.prompt}
+                assistant = {"role": "assistant", "content": example.response}
+                prompt_ids = tokenizer.apply_chat_template([prompt], add_generation_prompt=True, tokenize=True)
+                full_ids = tokenizer.apply_chat_template([prompt, assistant], add_generation_prompt=False, tokenize=True)
+                ids = torch.as_tensor(full_ids[:max_length], dtype=torch.long)
+                mask = torch.zeros_like(ids)
+                mask[min(len(prompt_ids), ids.numel()) :] = 1
             encoded_rows.append(ids)
             response_masks.append(mask)
         if not encoded_rows:

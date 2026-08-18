@@ -49,7 +49,11 @@ from verl.experimental.sdc_grpo.config import (
     should_run_sft,
     validate_sdc_config,
 )
-from verl.experimental.sdc_grpo.data_collector import FailureDataCollector, SuccessDataCollector
+from verl.experimental.sdc_grpo.data_collector import (
+    FailureDataCollector,
+    SuccessDataCollector,
+    binary_outcome_scores,
+)
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -368,6 +372,7 @@ class RayPPOTrainer:
         self.sdc_success_model_update_count = 0
         self.sdc_failure_model_update_count = 0
         self.sdc_models_ready = False
+        self.sdc_parameter_metrics: dict[str, float] = {}
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1318,7 +1323,14 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
         if self.sdc_enabled:
-            self.actor_rollout_wg.sdc_init(self._sdc_config_dict())
+            sdc_init_output = self._sdc_rank0_result(
+                self.actor_rollout_wg.sdc_init(self._sdc_config_dict()), operation="initialization"
+            )
+            self.sdc_parameter_metrics = {
+                key: float(value)
+                for key, value in sdc_init_output.items()
+                if key.startswith("sdc/") and isinstance(value, (int, float))
+            }
 
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
@@ -1544,6 +1556,13 @@ class RayPPOTrainer:
                         shutil.rmtree(best_local_path)
                     shutil.copytree(saved_actor_path, best_local_path)
                     print(f"Copied best checkpoint actor payload to [{dir_name}] from [{improved[0][1]}]")
+            if self.sdc_enabled:
+                for _metric, dir_name, _combined, _avg_at_k, _pass_at_k in improved:
+                    self.actor_rollout_wg.sdc_save_checkpoint(
+                        os.path.join(self.config.trainer.default_local_dir, dir_name, "sdc"),
+                        self.global_steps,
+                        self._sdc_config_dict(),
+                    )
         finally:
             self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -1634,7 +1653,10 @@ class RayPPOTrainer:
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
 
-        if self.sdc_enabled and should_checkpoint(self.global_steps, self.sdc_config):
+        # Actor and SDC state must describe the same post-update step.  Whenever
+        # an actor checkpoint is written, persist both outcome models, both
+        # optimizers, readiness counters, and pending buffers.
+        if self.sdc_enabled:
             sdc_local_path = os.path.join(local_global_step_folder, "sdc")
             self.actor_rollout_wg.sdc_save_checkpoint(sdc_local_path, self.global_steps, self._sdc_config_dict())
             self._sdc_sync_vllm_adapters()
@@ -1736,12 +1758,24 @@ class RayPPOTrainer:
                 sdc_load_output.get("sdc_failure_model_update_count", self.sdc_failure_model_update_count)
             )
             self.sdc_models_ready = bool(sdc_load_output.get("sdc_models_ready", self.sdc_models_ready))
+            if self.sdc_success_collector is not None and sdc_load_output.get("success_buffer_state"):
+                self.sdc_success_collector.load_state_dict(sdc_load_output["success_buffer_state"])
+            if self.sdc_failure_collector is not None and sdc_load_output.get("failure_buffer_state"):
+                self.sdc_failure_collector.load_state_dict(sdc_load_output["failure_buffer_state"])
             print(
                 f"SDC state loaded: success_updates={self.sdc_success_model_update_count} "
                 f"failure_updates={self.sdc_failure_model_update_count} ready={self.sdc_models_ready}"
             )
             if self.sdc_config.logprob_backend == "vllm" and self.sdc_models_ready:
                 self._sdc_sync_vllm_adapters()
+        elif self.sdc_enabled:
+            # init_model() creates SDC clones before actor resume.  Re-clone now
+            # so a checkpoint without an SDC sidecar still starts both outcome
+            # models from the restored actor, never from pre-resume weights.
+            self.actor_rollout_wg.sdc_reinitialize_from_actor(self._sdc_config_dict())
+            self.sdc_success_model_update_count = 0
+            self.sdc_failure_model_update_count = 0
+            self.sdc_models_ready = False
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
@@ -2092,6 +2126,7 @@ class RayPPOTrainer:
             "verify_rollout_log_probs": bool(self.sdc_config.verify_rollout_log_probs),
             "use_importance_weight": bool(self.sdc_config.use_importance_weight),
             "importance_weight_clip": float(self.sdc_config.importance_weight_clip),
+            "base_mix_gamma": float(self.sdc_config.base_mix_gamma),
             "sft_update_interval_grpo_steps": int(self.sdc_config.sft_update_interval_grpo_steps),
             "checkpoint_interval_grpo_steps": int(self.sdc_config.checkpoint_interval_grpo_steps),
             "min_sft_updates_before_use": int(self.sdc_config.min_sft_updates_before_use),
@@ -2099,12 +2134,19 @@ class RayPPOTrainer:
             "sft_batch_size": int(self.sdc_config.sft_batch_size),
             "sft_max_token_len_per_gpu": int(self.sdc_config.sft_max_token_len_per_gpu),
             "sft_max_updates_per_interval": int(self.sdc_config.sft_max_updates_per_interval),
+            "max_prompt_length": int(self.config.data.get("max_prompt_length", 1024)),
             "max_response_length": int(self.config.data.get("max_response_length", 2048)),
             "save_to_disk_interval_grpo_steps": int(self.sdc_config.save_to_disk_interval_grpo_steps),
-            "save_sft_optimizers": bool(self.sdc_config.save_sft_optimizers),
             "sdc_success_model_update_count": int(self.sdc_success_model_update_count),
             "sdc_failure_model_update_count": int(self.sdc_failure_model_update_count),
             "sdc_models_ready": bool(self.sdc_models_ready),
+            "global_grpo_step": int(self.global_steps),
+            "success_buffer_state": (
+                self.sdc_success_collector.state_dict() if self.sdc_success_collector is not None else None
+            ),
+            "failure_buffer_state": (
+                self.sdc_failure_collector.state_dict() if self.sdc_failure_collector is not None else None
+            ),
         }
 
     def _sdc_select_payload(self, output):
@@ -2152,7 +2194,7 @@ class RayPPOTrainer:
         )
 
     def _sdc_annotate_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> None:
-        rewards = reward_tensor.sum(dim=-1).detach().float()
+        rewards = binary_outcome_scores(reward_tensor)
         batch.batch["sdc_failure_mask"] = (rewards == 0.0).to(device=batch.batch["response_mask"].device)
 
     def _sdc_build_vllm_score_inputs(self, batch: DataProto):
@@ -2221,21 +2263,21 @@ class RayPPOTrainer:
     def _sdc_collect_outcomes(self, batch: DataProto, reward_tensor: torch.Tensor) -> tuple[int, int]:
         if not self.sdc_enabled or self.sdc_success_collector is None or self.sdc_failure_collector is None:
             return 0, 0
-        rewards = reward_tensor.sum(dim=-1).detach().cpu().float().tolist()
+        rewards = binary_outcome_scores(reward_tensor).cpu().tolist()
         prompts = batch.batch["prompts"].detach().cpu()
         responses = batch.batch["responses"].detach().cpu()
         response_mask = batch.batch["response_mask"].detach().cpu()
         uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [""] * len(rewards))]
         success_count = failure_count = 0
         for i, reward in enumerate(rewards):
-            if float(reward) not in (0.0, 1.0):
-                continue
             response_len = int(response_mask[i].sum().item())
             row = dict(prompt=self.tokenizer.decode(prompts[i], skip_special_tokens=True), response=self.tokenizer.decode(responses[i, :response_len], skip_special_tokens=True), reward=int(reward), metadata={"uid": uids[i], "global_grpo_step": self.global_steps})
             if reward == 1.0:
                 success_count += int(self.sdc_success_collector.add(**row))
-            else:
+            elif reward == 0.0:
                 failure_count += int(self.sdc_failure_collector.add(**row))
+            else:  # binary_outcome_scores() should have raised before this point.
+                raise AssertionError(f"Unexpected non-binary SDC reward after validation: {reward}")
         return success_count, failure_count
 
     def _sdc_run_sft_if_due(self) -> dict[str, float]:
@@ -2251,12 +2293,17 @@ class RayPPOTrainer:
         metrics = self._sdc_rank0_result(output, operation="SFT")
         success_updates = int(metrics.get("sdc/success_sft_updates", 0.0))
         failure_updates = int(metrics.get("sdc/failure_sft_updates", 0.0))
-        if success_updates > 0:
-            self.sdc_success_collector.clear()
+        if success_updates != failure_updates:
+            raise RuntimeError("SDC success/failure refresh returned different optimizer-step counts.")
+        if success_updates > 0 and failure_updates > 0:
             self.sdc_success_model_update_count += success_updates
-        if failure_updates > 0:
-            self.sdc_failure_collector.clear()
             self.sdc_failure_model_update_count += failure_updates
+            consumed_success = int(metrics.get("sdc/success_sft_examples", 0.0))
+            consumed_failure = int(metrics.get("sdc/failure_sft_examples", 0.0))
+            if consumed_success != consumed_failure:
+                raise RuntimeError("SDC success/failure refresh consumed different buffer sizes.")
+            self.sdc_success_collector.consume(consumed_success)
+            self.sdc_failure_collector.consume(consumed_failure)
         if self.sdc_config.logprob_backend == "vllm" and (success_updates or failure_updates):
             self._sdc_sync_vllm_adapters()
         self._sdc_refresh_ready()
@@ -2275,9 +2322,16 @@ class RayPPOTrainer:
             "sdc/global_grpo_step": float(self.global_steps),
             "sdc/success_buffer_size": float(len(self.sdc_success_collector) if self.sdc_success_collector else 0),
             "sdc/failure_buffer_size": float(len(self.sdc_failure_collector) if self.sdc_failure_collector else 0),
+            "sdc/success_buffer_age": (
+                self.sdc_success_collector.buffer_age(self.global_steps) if self.sdc_success_collector else 0.0
+            ),
+            "sdc/failure_buffer_age": (
+                self.sdc_failure_collector.buffer_age(self.global_steps) if self.sdc_failure_collector else 0.0
+            ),
             "sdc/success_collected_this_step": float(collected[0]),
             "sdc/failure_collected_this_step": float(collected[1]),
             "sdc/models_ready": float(self.sdc_models_ready),
+            **self.sdc_parameter_metrics,
             **self.sdc_last_logprob_metrics,
         }
 
@@ -2494,15 +2548,12 @@ class RayPPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
-                        # Buffer failures and compute the group difficulty gate on the RAW
-                        # group, BEFORE DAPO filtering. This ordering is required, not
-                        # cosmetic: DAPO discards homogeneous groups, and all-wrong groups
-                        # are exactly the failures FEPO exists to learn from. Filtering
-                        # first would starve the failure buffer of the very signal the
-                        # method is built on, and would compute g on a group whose
-                        # composition the filter had already changed.
+                        # Collect both binary outcomes before any optional DAPO
+                        # filtering so rejected rows can still refresh the symmetric
+                        # success/failure SFT buffers. The actor mask is attached
+                        # again after DAPO below, when reward rows have their final
+                        # order.
                         sdc_collected = self._sdc_collect_outcomes(batch, reward_tensor)
-                        self._sdc_annotate_actor_batch(batch, reward_tensor)
 
                         # DAPO dynamic sampling. Returns None when too few qualified
                         # groups have accumulated, meaning "generate another batch before
@@ -2513,6 +2564,7 @@ class RayPPOTrainer:
                             needs_more_rollouts = True
                         else:
                             batch, reward_tensor, reward_extra_infos_dict, dapo_filter_metrics = dapo_result
+                            self._sdc_annotate_actor_batch(batch, reward_tensor)
                             metrics.update(dapo_filter_metrics)
                             if dapo_filter_metrics:
                                 batch.meta_info["global_token_num"] = torch.sum(
@@ -2706,6 +2758,19 @@ class RayPPOTrainer:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
 
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+
+                        # Run the paired success/failure SFT refresh before checkpointing
+                        # and before weight sync. The checkpoint then captures the same
+                        # post-SFT state that the next rollout will receive.
+                        metrics.update(self._sdc_run_sft_if_due())
+                        metrics.update(self._sdc_schedule_metrics(sdc_collected))
+
+                        # SDC SFT runs while vLLM is asleep: the SFT forward/backward
+                        # gets the freed rollout memory instead of OOMing against an
+                        # awake engine. The subsequent update_weights pushes the
+                        # post-GRPO + post-SFT actor weights to vLLM.
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
@@ -2732,18 +2797,6 @@ class RayPPOTrainer:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
-
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-
-                        # Run failure-SFT BEFORE the weight sync: at this point vLLM is
-                        # still asleep (slept after the GRPO update), so the SFT
-                        # forward/backward gets the freed rollout memory instead of OOMing
-                        # against an awake engine. Doing it here also means the subsequent
-                        # update_weights pushes the POST-SFT actor weights to vLLM, so the
-                        # next rollout reflects the SFT update.
-                        metrics.update(self._sdc_run_sft_if_due())
-                        metrics.update(self._sdc_schedule_metrics(sdc_collected))
 
                         # update weights from trainer to rollout (wakes vLLM, syncs the
                         # post-GRPO + post-SFT actor weights)
