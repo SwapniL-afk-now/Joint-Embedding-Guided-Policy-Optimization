@@ -64,7 +64,9 @@ def build_sdc_checkpoint_state(
     success_model_update_count: int,
     failure_model_update_count: int,
     models_ready: bool,
-    base_state: Mapping[str, torch.Tensor],
+    base_state: Mapping[str, torch.Tensor] | None = None,
+    base_adapter_state: Mapping[str, torch.Tensor] | None = None,
+    adapter_only: bool = False,
     base_mix_gamma: float,
     success_buffer_state=None,
     failure_buffer_state=None,
@@ -77,7 +79,11 @@ def build_sdc_checkpoint_state(
         "sdc_failure_model_update_count": int(failure_model_update_count),
         "sdc_models_ready": bool(models_ready),
         "base_mix_gamma": float(base_mix_gamma),
-        "sdc_base_state_cpu": clone_frozen_state(base_state),
+        "sdc_base_state_cpu": clone_frozen_state(base_state) if base_state is not None else None,
+        "sdc_base_adapter_state_cpu": (
+            clone_frozen_state(base_adapter_state) if base_adapter_state is not None else None
+        ),
+        "sdc_adapter_only": bool(adapter_only),
         "success_buffer_state": success_buffer_state,
         "failure_buffer_state": failure_buffer_state,
     }

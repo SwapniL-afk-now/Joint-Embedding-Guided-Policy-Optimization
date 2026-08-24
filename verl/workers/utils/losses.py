@@ -121,6 +121,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
                 fields.append(field)
     sdc_enabled = bool(sdc_config and sdc_config.get("enable", False))
     if sdc_enabled:
+        active_token_count = tu.get_non_tensor_data(
+            data=data, key="sdc_active_token_count", default=None
+        )
+        if active_token_count is not None:
+            config.global_batch_info["sdc_active_token_count"] = active_token_count
+        config.global_batch_info["reduce_diagnostics"] = bool(
+            sdc_config.get("distributed_metrics", False)
+        )
+    if sdc_enabled:
         for field in ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs"):
             if field in data:
                 fields.append(field)

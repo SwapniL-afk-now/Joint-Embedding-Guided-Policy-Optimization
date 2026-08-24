@@ -101,13 +101,22 @@ def compute_sdc_loss(
     count = local_count.clone()
     info = global_batch_info or {}
     dp_size = int(info.get("dp_size", 1) or 1)
-    if dp_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+    # The engine computes this once per forward/backward batch, before it
+    # creates micro-batches. Reusing it here removes one all-reduce per
+    # micro-batch while preserving the exact global token denominator.
+    precomputed_count = info.get("sdc_active_token_count")
+    if precomputed_count is not None:
+        count = torch.as_tensor(precomputed_count, device=log_prob.device, dtype=log_prob.dtype)
+    elif dp_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.all_reduce(count)
     count = count.clamp_min(1.0)
     loss = float(beta) * (token_loss * mask).sum() / count * dp_size
 
-    # Metrics must use global numerator/denominator pairs.  They are detached
-    # diagnostics and deliberately do not participate in the actor gradient.
+    # Metrics are local diagnostics by default. The engine aggregates the
+    # returned values once per training batch, so doing the historical
+    # all-reduce/all-gather sequence here would add several collectives to
+    # every micro-batch. Exact global reduction can still be requested for
+    # callers that need it outside the normal actor path.
     active_contrast = (success - failure)[mask]
     valid_sequences = mask.any(dim=-1)
     sequence_values = ((success - failure) * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1)
@@ -123,26 +132,49 @@ def compute_sdc_loss(
             valid_sequences.to(log_prob.dtype).sum(),
         ]
     )
-    (
-        global_token_loss_sum,
-        global_active_count,
-        global_response_count,
-        global_importance_sum,
-        global_log_ratio_clipped_count,
-        global_importance_clip_count,
-        global_sequence_sum,
-        global_sequence_count,
-    ) = _all_reduce_detached(local_metric_sums)
+    if bool(info.get("reduce_diagnostics", False)):
+        (
+            global_token_loss_sum,
+            global_active_count,
+            global_response_count,
+            global_importance_sum,
+            global_log_ratio_clipped_count,
+            global_importance_clip_count,
+            global_sequence_sum,
+            global_sequence_count,
+        ) = _all_reduce_detached(local_metric_sums)
+    else:
+        (
+            global_token_loss_sum,
+            global_active_count,
+            global_response_count,
+            global_importance_sum,
+            global_log_ratio_clipped_count,
+            global_importance_clip_count,
+            global_sequence_sum,
+            global_sequence_count,
+        ) = local_metric_sums
     global_has_active = bool(global_active_count.item() > 0)
     if not global_has_active:
         return zero, _zero_metrics()
     global_active_count = global_active_count.clamp_min(1.0)
     global_response_count = global_response_count.clamp_min(1.0)
     global_sequence_count = global_sequence_count.clamp_min(1.0)
-    global_contrast_max = _all_reduce_max_detached(
-        active_contrast.max() if active_contrast.numel() else torch.tensor(float("-inf"), device=log_prob.device)
+    local_contrast_max = (
+        active_contrast.max()
+        if active_contrast.numel()
+        else torch.tensor(float("-inf"), device=log_prob.device)
     )
-    global_active_contrast = _all_gather_detached_values(active_contrast)
+    global_contrast_max = (
+        _all_reduce_max_detached(local_contrast_max)
+        if bool(info.get("reduce_diagnostics", False))
+        else local_contrast_max.detach()
+    )
+    global_active_contrast = (
+        _all_gather_detached_values(active_contrast)
+        if bool(info.get("reduce_diagnostics", False))
+        else active_contrast.detach()
+    )
     metrics = {
         "sdc/loss": float((float(beta) * global_token_loss_sum / global_active_count).cpu()),
         "sdc/active_token_fraction": float((global_active_count / global_response_count).cpu()),

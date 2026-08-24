@@ -168,6 +168,7 @@ custom_sdc:
   data_sampling: recent
   save_to_disk_interval_policy_steps: 0
   loss_agg_mode: token-mean
+  distributed_metrics: false
 
 # config for Sequence Sharpening GRPO
 custom_sharpening_grpo:

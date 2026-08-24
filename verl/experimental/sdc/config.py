@@ -34,6 +34,10 @@ class SDCConfig:
     data_sampling: str = "recent"
     save_to_disk_interval_policy_steps: int = 0
     loss_agg_mode: str = "token-mean"
+    # Keep exact distributed diagnostic reduction opt-in. The actor engine
+    # already aggregates returned metrics once per training batch; reducing
+    # them inside every micro-batch is unnecessarily expensive.
+    distributed_metrics: bool = False
 
     def __post_init__(self):
         if not 0.0 <= float(self.base_mix_gamma) <= 1.0:

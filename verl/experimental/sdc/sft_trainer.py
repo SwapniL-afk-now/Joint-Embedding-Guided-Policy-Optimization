@@ -31,12 +31,16 @@ def encode_outcome_example(
     max_prompt_length: int,
     max_response_length: int,
 ):
-    prompt = {"role": "user", "content": str(example.prompt)}
-    assistant = {"role": "assistant", "content": str(example.response)}
-    prompt_ids = list(tokenizer.apply_chat_template([prompt], add_generation_prompt=True, tokenize=True))
-    full_ids = list(tokenizer.apply_chat_template([prompt, assistant], add_generation_prompt=False, tokenize=True))
-    response_ids = full_ids[len(prompt_ids) : len(prompt_ids) + max_response_length]
-    prompt_ids = prompt_ids[-max_prompt_length:]
+    if example.prompt_ids is not None and example.response_ids is not None:
+        prompt_ids = list(example.prompt_ids)[-max_prompt_length:]
+        response_ids = list(example.response_ids)[:max_response_length]
+    else:
+        prompt = {"role": "user", "content": str(example.prompt)}
+        assistant = {"role": "assistant", "content": str(example.response)}
+        prompt_ids = list(tokenizer.apply_chat_template([prompt], add_generation_prompt=True, tokenize=True))
+        full_ids = list(tokenizer.apply_chat_template([prompt, assistant], add_generation_prompt=False, tokenize=True))
+        response_ids = full_ids[len(prompt_ids) : len(prompt_ids) + max_response_length]
+        prompt_ids = prompt_ids[-max_prompt_length:]
     ids = torch.as_tensor(prompt_ids + response_ids, dtype=torch.long)
     response_mask = torch.zeros_like(ids)
     response_mask[len(prompt_ids) :] = 1

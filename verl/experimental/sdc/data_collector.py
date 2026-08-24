@@ -53,6 +53,10 @@ class OutcomeExample:
     response: Any
     reward: int
     metadata: dict[str, Any] = field(default_factory=dict)
+    # When available, keep the already-tokenized prompt/response. This avoids
+    # decode -> chat-template -> tokenize churn before every SFT refresh.
+    prompt_ids: Optional[list[int]] = None
+    response_ids: Optional[list[int]] = None
 
 
 class OutcomeDataCollector:
@@ -88,6 +92,8 @@ class OutcomeDataCollector:
         response: Any,
         reward: float | int,
         metadata: Optional[dict[str, Any]] = None,
+        prompt_ids: Optional[list[int]] = None,
+        response_ids: Optional[list[int]] = None,
     ) -> bool:
         try:
             value = float(reward)
@@ -95,7 +101,14 @@ class OutcomeDataCollector:
             return False
         if not math.isfinite(value) or value not in (0.0, 1.0) or int(value) != self.target_reward:
             return False
-        example = OutcomeExample(prompt, response, self.target_reward, metadata or {})
+        example = OutcomeExample(
+            prompt,
+            response,
+            self.target_reward,
+            metadata or {},
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+        )
         self.total_seen += 1
         if self.sampling == "recent":
             self._examples.append(example)
@@ -155,6 +168,8 @@ class OutcomeDataCollector:
                 response=row.get("response"),
                 reward=row.get("reward"),
                 metadata=row.get("metadata"),
+                prompt_ids=row.get("prompt_ids"),
+                response_ids=row.get("response_ids"),
             )
         self.total_seen = int(state.get("total_seen", len(self._examples)))
         if "rng_state" in state:

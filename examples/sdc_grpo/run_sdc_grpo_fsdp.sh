@@ -241,6 +241,11 @@ if [[ "${DRGRPO_USE_LORA}" == "true" ]]; then
         actor_rollout_ref.model.lora_alpha=${LORA_ALPHA}
         actor_rollout_ref.model.target_modules=${LORA_TARGET_MODULES}
     )
+else
+    # Keep the full-finetuning mode explicit instead of relying on the model
+    # config's current default. The actor uses FSDP1 below; SDC clones and
+    # updates every success/failure parameter when lora_rank is zero.
+    MODEL+=(actor_rollout_ref.model.lora_rank=0)
 fi
 
 ACTOR=(

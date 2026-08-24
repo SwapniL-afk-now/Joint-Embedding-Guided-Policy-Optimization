@@ -2155,6 +2155,7 @@ class RayPPOTrainer:
             "max_prompt_length": int(self.config.data.get("max_prompt_length", 1024)),
             "max_response_length": int(self.config.data.get("max_response_length", 2048)),
             "save_to_disk_interval_policy_steps": int(self.sdc_config.save_to_disk_interval_policy_steps),
+            "distributed_metrics": bool(self.sdc_config.distributed_metrics),
             "sdc_success_model_update_count": int(self.sdc_success_model_update_count),
             "sdc_failure_model_update_count": int(self.sdc_failure_model_update_count),
             "sdc_models_ready": bool(self.sdc_models_ready),
@@ -2286,12 +2287,25 @@ class RayPPOTrainer:
         outcome = validate_sdc_outcome(batch.batch["sdc_outcome"]).cpu().tolist()
         prompts = batch.batch["prompts"].detach().cpu()
         responses = batch.batch["responses"].detach().cpu()
+        attention_mask = batch.batch["attention_mask"].detach().cpu()
         response_mask = batch.batch["response_mask"].detach().cpu()
         uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [""] * len(outcome))]
         success_count = failure_count = 0
+        prompt_width = prompts.shape[-1]
         for i, reward in enumerate(outcome):
             response_len = int(response_mask[i].sum().item())
-            row = dict(prompt=self.tokenizer.decode(prompts[i], skip_special_tokens=True), response=self.tokenizer.decode(responses[i, :response_len], skip_special_tokens=True), reward=int(reward), metadata={"uid": uids[i], "global_policy_step": self.global_steps})
+            prompt_ids = prompts[i][attention_mask[i, :prompt_width].bool()].tolist()
+            response_ids = responses[i, :response_len].tolist()
+            row = dict(
+                # Keep empty text placeholders for compatibility with older
+                # checkpoints; SFT consumes the IDs directly when present.
+                prompt="",
+                response="",
+                prompt_ids=[int(token) for token in prompt_ids],
+                response_ids=[int(token) for token in response_ids],
+                reward=int(reward),
+                metadata={"uid": uids[i], "global_policy_step": self.global_steps},
+            )
             if reward == 1.0:
                 success_count += int(self.sdc_success_collector.add(**row))
             elif reward == 0.0:
