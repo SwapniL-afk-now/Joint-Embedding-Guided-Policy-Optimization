@@ -379,6 +379,12 @@ class RayPPOTrainer:
         self.sdc_failure_model_update_count = 0
         self.sdc_models_ready = False
         self.sdc_parameter_metrics: dict[str, float] = {}
+        # Online discriminator-quality probing: EMA-smoothed AUC proxy and the
+        # reliability gate derived from it (consumed by compute_sdc_loss via
+        # custom_sdc["sdc_reliability_gate"]).
+        self.sdc_reliability_gate = 1.0
+        self.sdc_quality_auc_ema: float | None = None
+        self.sdc_quality_auc_last: float | None = None
         # Per-step shared row context (CPU token ids / lengths) for SDC
         # marshalling; keyed by response-mask tensor identity.
         self._sdc_row_ctx: dict | None = None
@@ -714,6 +720,7 @@ class RayPPOTrainer:
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
                 # wake up rollout model
                 # replace with wake_up method once supported
+                self._sdc_release_sidecar_residency()
                 self.checkpoint_manager.update_weights(self.global_steps)
 
             # unpad
@@ -1581,6 +1588,7 @@ class RayPPOTrainer:
                         self._sdc_config_dict(include_buffer_states=True),
                     )
         finally:
+            self._sdc_release_sidecar_residency()
             self.checkpoint_manager.update_weights(self.global_steps)
 
         for metric, dir_name, combined, avg_at_k, pass_at_k in improved:
@@ -2170,6 +2178,7 @@ class RayPPOTrainer:
             "sdc_success_model_update_count": int(self.sdc_success_model_update_count),
             "sdc_failure_model_update_count": int(self.sdc_failure_model_update_count),
             "sdc_models_ready": bool(self.sdc_models_ready),
+            "sdc_reliability_gate": float(self.sdc_reliability_gate),
             "global_policy_step": int(self.global_steps),
         }
         # Outcome buffers are large; ship them only for checkpoint
@@ -2197,6 +2206,19 @@ class RayPPOTrainer:
         if not isinstance(output, dict):
             raise RuntimeError(f"SDC {operation} returned no rank-0 metrics dictionary")
         return output
+
+    def _sdc_release_sidecar_residency(self) -> None:
+        """Offload resident-mode SDC sidecars from GPU before vLLM wakes up.
+
+        Only acts when ``custom_sdc.sidecar_residency == 'resident'``. The
+        default 'auto_offload' mode already releases inside every scoring/SFT
+        pass and is untouched by this call.
+        """
+        if not self.sdc_enabled:
+            return
+        if getattr(self.sdc_config, "sidecar_residency", "auto_offload") != "resident":
+            return
+        self.actor_rollout_wg.sdc_release_residency()
 
     def _sdc_refresh_ready(self) -> bool:
         min_updates = int(self.sdc_config.min_sft_updates_before_use)
@@ -2329,6 +2351,165 @@ class RayPPOTrainer:
             for name in ("success", "failure")
         }
 
+    @staticmethod
+    def _sdc_auc_proxy(failed_means, success_means) -> float:
+        """Mann-Whitney AUC statistic: P(failed > success) + 0.5 * P(tie).
+
+        ``failed_means`` / ``success_means`` are per-sequence discriminant
+        scores for failure-labeled and success-labeled rows; higher means
+        "more failure-like". Perfect separation (every failed score above
+        every success score) returns 1.0, reversed separation 0.0. Uses a
+        vectorized broadcast compare over all cross pairs (group sizes are at
+        most ~2048 x 64 here); returns NaN when either group is empty.
+        """
+        failed = torch.as_tensor(failed_means, dtype=torch.float64).reshape(-1)
+        success = torch.as_tensor(success_means, dtype=torch.float64).reshape(-1)
+        if failed.numel() == 0 or success.numel() == 0:
+            return float("nan")
+        failed_grid = failed.unsqueeze(0)
+        success_grid = success.unsqueeze(1)
+        wins = (failed_grid > success_grid).sum()
+        ties = (failed_grid == success_grid).sum()
+        total = failed.numel() * success.numel()
+        return float((wins.double() + 0.5 * ties.double()).item() / total)
+
+    def _sdc_probe_discriminator_quality(self, batch: DataProto) -> None:
+        """Measure an online AUC proxy for SDC discriminator quality.
+
+        Deterministically samples up to K=64 success rows from this batch and
+        scores ONLY those probe rows under BOTH teachers using the same backend
+        path as failure scoring (vLLM multi scoring or the HF FSDP workers).
+        The per-sequence contrast c_seq = mean(success_lp - failure_lp) over
+        response tokens is computed for both groups: the failed group from the
+        main scoring outputs, the success group from the probes. Its negation
+        d_seq = mean(failure_lp - success_lp) is higher where the failure
+        teacher wins, so AUC = P(d_failed > d_success) approaches 1.0 exactly
+        when the paired teachers separate outcomes. The raw AUC is folded into
+        an EMA and mapped to gate = clamp(2 * (EMA - 0.5), 0, 1), which is read
+        back by compute_sdc_loss through custom_sdc["sdc_reliability_gate"].
+
+        Failures never crash training: any probe error is logged once and the
+        previous gate is kept.
+        """
+        try:
+            outcome = batch.batch["sdc_outcome"].detach().to(torch.bool)
+            response_mask = batch.batch["response_mask"]
+            success_indices = outcome.nonzero(as_tuple=False).squeeze(-1)
+            if success_indices.numel() == 0:
+                return
+            # Deterministic probe sampling keyed by policy step.
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(self.global_steps))
+            k = min(64, int(success_indices.numel()))
+            perm = torch.randperm(int(success_indices.numel()), generator=generator)
+            probe_rows = [int(i) for i in success_indices[perm[:k]].tolist()]
+
+            ctx = self._sdc_step_row_context(batch)
+            sequences = [ctx["sequence_ids"][i] for i in probe_rows]
+            prompt_lens = [len(ctx["prompt_ids"][i]) for i in probe_rows]
+            response_lens = [len(seq) - plen for seq, plen in zip(sequences, prompt_lens, strict=True)]
+            keep = [j for j, rlen in enumerate(response_lens) if rlen > 0]
+            if not keep:
+                return
+            probe_rows = [probe_rows[j] for j in keep]
+            sequences = [sequences[j] for j in keep]
+            prompt_lens = [prompt_lens[j] for j in keep]
+            response_lens = [response_lens[j] for j in keep]
+
+            if self._sdc_can_score_with_vllm():
+                rows = self.sdc_llm_client.score_sdc_logprobs_multi(
+                    sequences=sequences,
+                    prompt_lens=prompt_lens,
+                    response_lens=response_lens,
+                    adapters=("success", "failure"),
+                )
+
+                def _probe_row_means(scored_rows):
+                    means = []
+                    for row, expected in zip(scored_rows, response_lens, strict=True):
+                        if len(row) != expected:
+                            raise ValueError(
+                                f"SDC quality probe returned a row of length {len(row)}, expected {expected}."
+                            )
+                        means.append(sum(row) / expected)
+                    return torch.tensor(means, dtype=torch.float64)
+
+                probe_success_means = _probe_row_means(rows["success"])
+                probe_failure_means = _probe_row_means(rows["failure"])
+            else:
+                prompt_width = int(batch.batch["prompts"].shape[-1])
+                response_width = int(response_mask.shape[-1])
+                count = len(probe_rows)
+                input_ids = torch.zeros(
+                    (count, prompt_width + response_width), dtype=batch.batch["input_ids"].dtype
+                )
+                attention_mask = torch.zeros(
+                    (count, prompt_width + response_width), dtype=batch.batch["attention_mask"].dtype
+                )
+                probe_response_mask = torch.zeros((count, response_width), dtype=response_mask.dtype)
+                for slot, row_index in enumerate(probe_rows):
+                    plen = prompt_lens[slot]
+                    rlen = response_lens[slot]
+                    # Left-pad prompts so the prompt/response boundary sits at
+                    # column prompt_width, matching the shifted-label indexing
+                    # in transformer_impl._sdc_model_log_probs.
+                    input_ids[slot, prompt_width - plen : prompt_width] = torch.as_tensor(
+                        ctx["prompt_ids"][row_index], dtype=input_ids.dtype
+                    )
+                    input_ids[slot, prompt_width : prompt_width + rlen] = torch.as_tensor(
+                        sequences[slot][plen:], dtype=input_ids.dtype
+                    )
+                    attention_mask[slot, prompt_width - plen : prompt_width + rlen] = 1
+                    probe_response_mask[slot, :rlen] = 1
+                # Uniform padded TensorDict; every probe row is active under
+                # both teachers.
+                probe_td = tu.get_tensordict(
+                    {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "response_mask": probe_response_mask,
+                        "sdc_failure_mask": torch.ones(count, dtype=torch.bool),
+                    }
+                )
+                tu.assign_non_tensor(probe_td, custom_sdc=self._sdc_config_dict())
+                output = self.actor_rollout_wg.sdc_compute_success_failure_log_probs(probe_td)
+                p_success = tu.get(output, "sdc_success_log_probs")
+                p_failure = tu.get(output, "sdc_failure_log_probs")
+                if p_success is None or p_failure is None:
+                    raise RuntimeError("SDC worker did not return both success and failure log-prob tensors")
+                p_success = p_success.to(response_mask.device).float()
+                p_failure = p_failure.to(response_mask.device).float()
+                mask = probe_response_mask.to(p_success.device).float()
+                lens = mask.sum(-1).clamp(min=1)
+                probe_success_means = ((p_success * mask).sum(-1) / lens).double().cpu()
+                probe_failure_means = ((p_failure * mask).sum(-1) / lens).double().cpu()
+
+            # Failed-group contrasts from the main scoring outputs.
+            resp_lens = response_mask.detach().sum(-1).clamp(min=1).to(batch.batch["sdc_success_log_probs"].device)
+            contrast = (batch.batch["sdc_success_log_probs"] - batch.batch["sdc_failure_log_probs"]) * (
+                response_mask.to(batch.batch["sdc_success_log_probs"].device)
+            )
+            failed_idx = batch.batch["sdc_failure_mask"].nonzero(as_tuple=False).squeeze(-1)
+            failed_scores = (-(contrast[failed_idx] / resp_lens[failed_idx])).double().detach().cpu()
+            # Success-group contrasts from the probes; d = -c so that a
+            # discriminant score is HIGHER when the failure teacher wins.
+            success_scores = (probe_failure_means - probe_success_means).double()
+
+            auc = self._sdc_auc_proxy(failed_scores, success_scores)
+            if not math.isfinite(auc):
+                return
+            self.sdc_quality_auc_last = float(auc)
+            self.sdc_quality_auc_ema = (
+                float(auc) if self.sdc_quality_auc_ema is None else 0.9 * self.sdc_quality_auc_ema + 0.1 * float(auc)
+            )
+            self.sdc_reliability_gate = float(min(max(2.0 * (self.sdc_quality_auc_ema - 0.5), 0.0), 1.0))
+        except Exception:
+            if not getattr(self, "_sdc_probe_error_logged", False):
+                logger.exception("SDC discriminator-quality probe failed; keeping previous reliability gate.")
+                self._sdc_probe_error_logged = True
+        else:
+            self._sdc_probe_error_logged = False
+
     def _sdc_compute_model_log_probs(self, batch: DataProto) -> None:
         shape = batch.batch["response_mask"]
         empty = torch.zeros_like(shape, dtype=torch.float32)
@@ -2340,6 +2521,7 @@ class RayPPOTrainer:
             outputs = self._sdc_compute_vllm_log_probs_multi(batch)
             batch.batch["sdc_success_log_probs"] = outputs["success"]
             batch.batch["sdc_failure_log_probs"] = outputs["failure"]
+            self._sdc_probe_discriminator_quality(batch)
             return
         batch_td = batch.to_tensordict()
         tu.assign_non_tensor(batch_td, custom_sdc=self._sdc_config_dict())
@@ -2350,6 +2532,7 @@ class RayPPOTrainer:
             raise RuntimeError("SDC worker did not return both success and failure log-prob tensors")
         batch.batch["sdc_success_log_probs"] = success.to(shape.device).float()
         batch.batch["sdc_failure_log_probs"] = failure.to(shape.device).float()
+        self._sdc_probe_discriminator_quality(batch)
 
     def _sdc_collect_outcomes(self, batch: DataProto, reward_tensor: torch.Tensor) -> tuple[int, int]:
         if not self.sdc_enabled or self.sdc_success_collector is None or self.sdc_failure_collector is None:
@@ -2456,6 +2639,10 @@ class RayPPOTrainer:
             "sdc/success_collected_this_step": float(collected[0]),
             "sdc/failure_collected_this_step": float(collected[1]),
             "sdc/models_ready": float(self.sdc_models_ready),
+            "sdc/quality_auc_proxy": (
+                float(self.sdc_quality_auc_last) if self.sdc_quality_auc_last is not None else 0.5
+            ),
+            "sdc/reliability_gate": float(self.sdc_reliability_gate),
             **self.sdc_parameter_metrics,
             **self.sdc_last_logprob_metrics,
         }
@@ -2509,6 +2696,7 @@ class RayPPOTrainer:
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
+        self._sdc_release_sidecar_residency()
         self.checkpoint_manager.update_weights(self.global_steps)
         self._sdc_sync_vllm_adapters()
 
@@ -2914,6 +3102,7 @@ class RayPPOTrainer:
                     # implement critic warmup
                     if self.config.trainer.critic_warmup > self.global_steps:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
+                        self._sdc_release_sidecar_residency()
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
                         # update actor
@@ -2962,6 +3151,7 @@ class RayPPOTrainer:
 
                         # update weights from trainer to rollout (wakes vLLM, syncs the
                         # post-GRPO + post-SFT actor weights)
+                        self._sdc_release_sidecar_residency()
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
 

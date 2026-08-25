@@ -39,8 +39,12 @@ hyperparameter.
 - Training writes `sdc/timing/*` metrics (scoring, success/failure SFT,
   base mixing, model sync, checkpoint save) — use them to locate remaining
   bottlenecks before optimizing anything.
-- Health gates while training: `sdc/quality_auc` should stay well above 0.5
-  (it certifies the contrast signal is informative), and
-  `sdc/importance_weight_clip_fraction` should stay low.
+- Health gates while training: `sdc/quality_auc_proxy` (measured online each
+  step) should stay well above 0.5 — it certifies the contrast signal is
+  informative and directly drives `sdc/reliability_gate`, which fades the
+  auxiliary term out automatically when the discriminator degrades. Also
+  watch `sdc/importance_weight_clip_fraction` (keep low) and
+  `sdc/zero_contrast_fraction` (should be ~0; nonzero means a scoring
+  backend silently wrote zeros).
 - Everything under `examples/sdc*/presets` serves other base algorithms
   (DAPO, Dr.GRPO, NGRPO, AVSPO) and is not part of the default path.

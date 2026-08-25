@@ -781,6 +781,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "SDC requires the actor worker"
         return self.actor.engine.sdc_load(local_path, sdc_config)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sdc_release_residency(self):
+        assert "actor" in self.role, "SDC requires the actor worker"
+        return self.actor.engine.sdc_release_residency()
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.

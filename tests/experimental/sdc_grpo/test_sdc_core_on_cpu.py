@@ -15,9 +15,18 @@ from verl.experimental.sdc.sft_trainer import OutcomeSFTTrainer, outcome_sft_los
 from verl.experimental.sdc.vllm_scoring import SDC_VLLM_ADAPTERS, extract_response_logprobs_from_prompt_logprobs
 
 
+def _canonical_normalized_contrast(failure: torch.Tensor, success: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+    """Recompute the canonical centered/RMS-normalized contrast independently."""
+
+    contrast = (failure.detach() - success.detach())[active]
+    if contrast.numel() > 1:
+        contrast = contrast - contrast.mean()
+    return contrast / contrast.pow(2).mean().sqrt().clamp_min(1e-8)
+
+
 def test_sdc_loss_matches_direct_algebra_and_detaches_references():
     current = torch.tensor([[-1.0, -2.0]], requires_grad=True)
-    old = torch.tensor([[-1.5, -2.5]])
+    old = torch.tensor([[-1.5, -2.0]])
     success = torch.tensor([[-3.0, -4.0]], requires_grad=True)
     failure = torch.tensor([[-2.0, -1.0]], requires_grad=True)
     response_mask = torch.tensor([[1, 1]], dtype=torch.bool)
@@ -31,7 +40,10 @@ def test_sdc_loss_matches_direct_algebra_and_detaches_references():
         beta=0.5,
         loss_agg_mode="token-mean",
     )
-    expected = 0.5 * (((current - old).exp()) * (failure.detach() - success.detach())).mean()
+    normalized_contrast = _canonical_normalized_contrast(
+        failure, success, torch.ones_like(response_mask, dtype=torch.bool)
+    )
+    expected = 0.5 * ((current - old).exp()[0] * normalized_contrast).sum() / 2
     torch.testing.assert_close(loss, expected)
     loss.backward()
     assert current.grad is not None
@@ -71,8 +83,11 @@ def test_sdc_gradient_matches_importance_weighted_algebra():
         importance_weight_clip=0.0,
     )
     loss.backward()
-    expected = beta * (current.detach() - old).exp() * (failure - success) / 2.0
-    torch.testing.assert_close(current.grad, expected)
+    contrast = (failure - success)[0]
+    centered = contrast - contrast.mean()
+    normalized_contrast = centered / centered.pow(2).mean().sqrt().clamp_min(1e-8)
+    expected = beta * (current.detach() - old).exp()[0] * normalized_contrast / 2.0
+    torch.testing.assert_close(current.grad[0], expected)
 
 
 def test_sdc_reference_swap_negates_loss_and_gradient():
@@ -134,19 +149,28 @@ def test_sdc_rejects_disabled_importance_weight():
 
 
 def test_sdc_uses_active_failed_token_count_for_normalization():
+    log_prob = torch.tensor([[0.0, 0.5], [0.0, 0.0]], requires_grad=True)
+    old_log_prob = torch.zeros_like(log_prob)
+    success = torch.zeros_like(log_prob)
+    # Non-uniform contrast on the single failed row: centering gives
+    # [-0.5, +0.5] and RMS normalizes it to [-1, +1].
+    failure = torch.tensor([[1.0, 2.0], [0.0, 0.0]])
     loss, _ = compute_sdc_loss(
-        log_prob=torch.zeros(2, 2, requires_grad=True),
-        old_log_prob=torch.zeros(2, 2),
-        success_log_prob=torch.zeros(2, 2),
-        failure_log_prob=torch.ones(2, 2),
-        response_mask=torch.ones(2, 2, dtype=torch.bool),
+        log_prob=log_prob,
+        old_log_prob=old_log_prob,
+        success_log_prob=success,
+        failure_log_prob=failure,
+        response_mask=torch.ones_like(log_prob, dtype=torch.bool),
         failure_mask=torch.tensor([True, False]),
         beta=1.0,
         loss_agg_mode="token-mean",
         global_batch_info={"batch_num_tokens": 100, "dp_size": 1},
         importance_weight_clip=0.0,
     )
-    assert loss.item() == 1.0
+    # Denominator is the ACTIVE FAILED token count (2), not batch_num_tokens.
+    ratios = (log_prob.detach() - old_log_prob).exp()[0]
+    expected = float((ratios * torch.tensor([-1.0, 1.0])).sum() / 2)
+    torch.testing.assert_close(loss, torch.tensor(expected))
 
 
 def test_sdc_row_mask_and_reference_rows_survive_reordering():
@@ -199,11 +223,13 @@ def test_all_zero_group_has_zero_grpo_but_nonzero_sdc_gradient():
     assert torch.all(grpo_log_prob.grad == 0)
 
     sdc_log_prob = torch.zeros_like(rewards, requires_grad=True)
+    # Non-uniform contrast so the centered signal does not cancel exactly.
+    sdc_failure = torch.tensor([[0.0, 1.0], [0.0, 1.0]])
     sdc_loss, _ = compute_sdc_loss(
         log_prob=sdc_log_prob,
         old_log_prob=torch.zeros_like(rewards),
         success_log_prob=torch.zeros_like(rewards),
-        failure_log_prob=torch.ones_like(rewards),
+        failure_log_prob=sdc_failure,
         response_mask=response_mask,
         failure_mask=torch.tensor([True, True]),
         beta=1.0,
@@ -221,7 +247,7 @@ def test_sdc_uses_only_reward_zero_rows_and_zero_fills_inactive_rows():
         log_prob=values,
         old_log_prob=refs,
         success_log_prob=torch.full_like(values, -2.0),
-        failure_log_prob=torch.full_like(values, -1.0),
+        failure_log_prob=torch.tensor([[-1.0, -3.0], [-1.0, -3.0]]),
         response_mask=torch.ones_like(values, dtype=torch.bool),
         failure_mask=torch.tensor([True, False]),
         beta=1.0,
@@ -316,7 +342,7 @@ def test_binary_reward_validation_rejects_fractional_rows():
         binary_outcome_scores(torch.tensor([0.0, 1.0])),
         torch.tensor([False, True]),
     )
-    with pytest.raises(ValueError, match="exactly 0 or 1"):
+    with pytest.raises(ValueError, match="one scalar per row"):
         binary_outcome_scores(torch.tensor([[0.5, 0.0]]))
 
 
@@ -422,3 +448,85 @@ def test_hf_and_vllm_response_slice_use_the_same_token_span():
     assert extract_response_logprobs_from_prompt_logprobs(
         prompt_logprobs=prompt_logprobs, prompt_len=3, response_len=2
     ) == [-1.0, -1.5]
+
+
+# --- Canonical normalization invariants (T1-T4) ---
+
+
+def _invariant_fixture(scale: float = 1.0, failure_offset: float = 0.0):
+    current = torch.tensor([[0.2, -0.1, 0.3]], requires_grad=True)
+    old = torch.tensor([[0.05, -0.02, 0.11]])
+    success = torch.tensor([[-0.4, -0.5, -0.6]])
+    failure = success + scale * (torch.tensor([[0.6, 0.2, 0.9]]) - success) + failure_offset
+    return current, old, success, failure
+
+
+def _run_invariant(current, old, success, failure, *, gate=1.0):
+    loss, _ = compute_sdc_loss(
+        log_prob=current,
+        old_log_prob=old,
+        success_log_prob=success,
+        failure_log_prob=failure,
+        response_mask=torch.ones_like(current, dtype=torch.bool),
+        failure_mask=torch.tensor([True]),
+        beta=0.5,
+        importance_weight_clip=0.0,
+        reliability_gate=gate,
+    )
+    return loss
+
+
+@pytest.mark.parametrize("k", [-1.5, 0.0, 2.25])
+def test_sdc_centering_makes_loss_invariant_to_failure_reference_offset(k):
+    base = _run_invariant(*_invariant_fixture())
+    shifted = _run_invariant(*_invariant_fixture(failure_offset=k))
+    # Centering removes the common-mode offset of log(pi_F/pi_S).
+    torch.testing.assert_close(shifted, base, rtol=0.0, atol=1e-5)
+
+
+def test_sdc_rms_normalization_makes_loss_invariant_to_contrast_scale():
+    base = _run_invariant(*_invariant_fixture(scale=1.0))
+    scaled = _run_invariant(*_invariant_fixture(scale=4.0))
+    # Detached RMS division rescales both numerator and denominator.
+    torch.testing.assert_close(scaled, base, rtol=0.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("gate", [0.0, 0.25, 1.0])
+def test_sdc_reliability_gate_scales_loss_and_gradient_linearly(gate):
+    def run(gate_value, backward=False):
+        current, old, success, failure = _invariant_fixture()
+        loss = _run_invariant(current, old, success, failure, gate=gate_value)
+        if backward:
+            loss.backward()
+        return loss.detach(), current.grad
+
+    base_loss, base_grad = run(1.0, backward=True)
+    gated_loss, gated_grad = run(gate, backward=True)
+    torch.testing.assert_close(gated_loss, gate * base_loss)
+    if gate == 0.0:
+        assert gated_loss.item() == 0.0
+        torch.testing.assert_close(gated_grad, torch.zeros_like(gated_grad))
+    else:
+        torch.testing.assert_close(gated_grad, gate * base_grad)
+
+
+@pytest.mark.parametrize("direction", [1.0, -1.0])
+def test_single_active_token_skips_centering_and_keeps_sign_direction(direction):
+    current = torch.tensor([[0.3]], requires_grad=True)
+    loss, metrics = compute_sdc_loss(
+        log_prob=current,
+        old_log_prob=torch.zeros(1, 1),
+        success_log_prob=torch.zeros(1, 1),
+        failure_log_prob=torch.full((1, 1), direction),
+        response_mask=torch.ones(1, 1, dtype=torch.bool),
+        failure_mask=torch.tensor([True]),
+        beta=0.5,
+        importance_weight_clip=0.0,
+    )
+    # Centering is skipped for a single active token; RMS normalizes the
+    # contrast to its sign, so |loss| == beta*|ratio|/N with sign preserved.
+    expected = 0.5 * float(current.detach().exp()) * direction
+    torch.testing.assert_close(loss, torch.tensor(expected))
+    assert metrics["sdc/contrast_center"] == 0.0
+    loss.backward()
+    torch.testing.assert_close(current.grad, torch.full_like(current, expected))

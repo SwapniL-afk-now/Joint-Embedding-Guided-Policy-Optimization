@@ -12,6 +12,8 @@ def _zero_metrics() -> dict[str, float]:
         "sdc/importance_weight_mean": 1.0,
         "sdc/log_ratio_clipped_fraction": 0.0,
         "sdc/importance_weight_clip_fraction": 0.0,
+        "sdc/reliability_gate": 1.0,
+        "sdc/zero_contrast_fraction": 0.0,
         "sdc/contrast_p10": 0.0,
         "sdc/contrast_p50": 0.0,
         "sdc/contrast_p90": 0.0,
@@ -66,6 +68,7 @@ def compute_sdc_loss(
     use_importance_weight: bool = True,
     importance_weight_clip: float = 10.0,
     models_ready: bool = True,
+    reliability_gate: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the locked SDC auxiliary on failed response tokens only.
 
@@ -117,23 +120,36 @@ def compute_sdc_loss(
         weight_clipped_a = ratio_a.ne(clipped_ratio_a)
         ratio_a = clipped_ratio_a
 
-    # Locked algebra: + beta E[pi_theta/pi_old * log(pi_F/pi_S)].
+    # Canonical algebra:
+    #   + beta * reliability_gate * E[pi_theta/pi_old * normalize(log pi_F - log pi_S)]
+    # where normalize() = (x - detached_mean) / detached_RMS over active failed
+    # tokens. See the normalization comment below.
     contrast = failure_a - success_a
-    contrast_center_t = torch.zeros((), device=log_prob.device, dtype=torch.float32)
-    contrast_rms_t = torch.zeros((), device=log_prob.device, dtype=torch.float32)
     # Canonical normalization, always on. Statistics are detached over the
     # SAME active mask used by the loss sum: they rescale the gradient, never
     # feed it. Centering strips the common-mode offset of log(pi_F/pi_S)
     # (sign structure preserved; removes the uniform failed-token-mass push
     # that overlaps KL-to-old). RMS division keeps beta scale-stable as the
-    # teacher gap sharpens.
-    norm_mask = resp.to(log_prob.dtype)
-    norm_count = norm_mask.sum().clamp_min(1.0)
-    contrast_center_t = (contrast.detach() * norm_mask).sum() / norm_count
+    # teacher gap sharpens. With a single active token, centering would zero
+    # the only signal, so it is skipped there; RMS still normalizes to sign.
+    # Stats accumulate in fp32 regardless of log_prob dtype (bf16 under mixed
+    # precision would lose precision as failed-token mass grows); they are
+    # detached, so the cast costs nothing numerically or in autograd.
+    norm_mask = resp.to(torch.float32)
+    norm_count = norm_mask.sum()
+    # Branchless single-active-token guard: with exactly one active token the
+    # mean equals that token's contrast and centering would zero the only
+    # signal. Computed on-device so no host sync is added per micro-batch.
+    centering_scale = (norm_count > 1).to(log_prob.dtype)
+    contrast_center_t = ((contrast.detach() * norm_mask).sum() / norm_count.clamp_min(1.0)) * centering_scale
     contrast = contrast - contrast_center_t
-    contrast_rms_t = ((contrast.detach() ** 2) * norm_mask).sum().div(norm_count).sqrt().clamp_min(1e-8)
+    contrast_rms_t = ((contrast.detach() ** 2) * norm_mask).sum().div(norm_count.clamp_min(1.0)).sqrt().clamp_min(1e-8)
     contrast = contrast / contrast_rms_t
-    token_loss_a = ratio_a * contrast
+    # Reliability gate: a detached scalar in [0, 1] computed trainer-side from
+    # the measured online discrimination AUC (EMA-smoothed). An uninformative
+    # discriminator fades the auxiliary term out instead of injecting noise;
+    # default 1.0 preserves behavior until first measurement.
+    token_loss_a = ratio_a * contrast * reliability_gate
     local_count = resp.to(log_prob.dtype).sum()
     if precomputed_count is not None:
         count = torch.as_tensor(precomputed_count, device=log_prob.device, dtype=log_prob.dtype)
@@ -141,7 +157,11 @@ def compute_sdc_loss(
         count = local_count.detach().clone()
         if dp_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(count)
-    loss = float(beta) * (token_loss_a * resp).sum() / count.clamp_min(1.0) * dp_size
+    # torch.where instead of multiply-by-mask: NaN/Inf from a scoring backend
+    # at an inactive position must not poison the sum (nan*0 = nan).
+    loss = float(beta) * torch.where(resp, token_loss_a, torch.zeros_like(token_loss_a)).sum() / count.clamp_min(
+        1.0
+    ) * dp_size
 
     # Metrics are local diagnostics by default. The engine aggregates the
     # returned values once per training batch, so doing the historical
@@ -152,12 +172,23 @@ def compute_sdc_loss(
     # All scalar diagnostics are stacked into one detached fp32 tensor and
     # synced with a single .cpu() instead of ~10 blocking host transfers.
     valid_rows = resp.any(dim=-1)
+    # Diagnostics use the success-failure orientation: positive values mean the
+    # token looks SUCCESS-like, i.e. they are the NEGATIVE of the loss-side
+    # contrast (failure - success). Threshold on these accordingly.
     contrast_full = success_a - failure_a
-    sequence_values = (contrast_full * resp).sum(dim=-1) / resp.sum(dim=-1).clamp_min(1)
+    zero_mask = resp & (contrast_full == 0)
+    # Exactly-zero active contrasts are the designed INACTIVE sentinel; on
+    # active rows they usually mean a scoring backend silently wrote zeros.
+    # Tracked so silent scoring corruption is visible instead of diluting
+    # the loss toward zero.
+    zero_contrast_count_t = (zero_mask.to(log_prob.dtype) * resp.to(log_prob.dtype)).sum()
+    sequence_values = torch.where(resp, contrast_full, torch.zeros_like(contrast_full)).sum(dim=-1) / resp.sum(
+        dim=-1
+    ).clamp_min(1)
     active_contrast = contrast_full[resp]
     local_metric_sums = torch.stack(
         [
-            (token_loss_a.detach() * resp).to(torch.float32).sum(),
+            torch.where(resp, token_loss_a.detach(), torch.zeros_like(token_loss_a)).to(torch.float32).sum(),
             local_count.to(torch.float32),
             response_mask_bool.to(torch.float32).sum(),
             (ratio_a.detach() * resp).to(torch.float32).sum(),
@@ -165,6 +196,7 @@ def compute_sdc_loss(
             weight_clipped_a.to(torch.float32).sum(),
             sequence_values[valid_rows].to(torch.float32).sum(),
             valid_rows.to(torch.float32).sum(),
+            zero_contrast_count_t.to(torch.float32),
         ]
     ).detach()
     metric_sums = _all_reduce_detached(local_metric_sums) if reduce_diagnostics else local_metric_sums
@@ -177,6 +209,7 @@ def compute_sdc_loss(
         global_importance_clip_count,
         global_sequence_sum,
         global_sequence_count,
+        global_zero_contrast_count,
     ) = metric_sums.cpu().tolist()
     global_has_active = global_active_count > 0
     if not global_has_active:
@@ -227,6 +260,8 @@ def compute_sdc_loss(
         "sdc/importance_weight_mean": global_importance_sum / global_active_count,
         "sdc/log_ratio_clipped_fraction": global_log_ratio_clipped_count / global_active_count,
         "sdc/importance_weight_clip_fraction": global_importance_clip_count / global_active_count,
+        "sdc/reliability_gate": reliability_gate,
+        "sdc/zero_contrast_fraction": global_zero_contrast_count / global_active_count,
         "sdc/contrast_p10": contrast_p10,
         "sdc/contrast_p50": contrast_p50,
         "sdc/contrast_p90": contrast_p90,

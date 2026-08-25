@@ -1,9 +1,6 @@
 """Deprecated compatibility imports for :mod:`verl.experimental.sdc`."""
 
-import torch
+from verl.experimental.sdc.data_collector import *  # noqa: F401,F403
+from verl.experimental.sdc.data_collector import binary_outcome_scores
 
-from verl.experimental.sdc.data_collector import *
-
-
-def binary_outcome_scores(outcome_tensor):
-    return validate_sdc_outcome(outcome_tensor).to(dtype=torch.float32)
+__all__ = [name for name in globals() if not name.startswith("_")]

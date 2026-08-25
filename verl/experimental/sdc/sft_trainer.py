@@ -92,7 +92,13 @@ def pair_outcome_records_prompt_matched(
         metadata = record.get("metadata")
         if not isinstance(metadata, dict):
             return None
-        return metadata.get("uid")
+        uid = metadata.get("uid")
+        # Empty/whitespace uids (e.g. a caller that stamps "" when the batch
+        # has no uid column) must not act as a shared match key across
+        # unrelated prompts.
+        if not isinstance(uid, str) or not uid.strip():
+            return None
+        return uid
 
     used_success = [False] * len(success_records)
     used_failure = [False] * len(failure_records)

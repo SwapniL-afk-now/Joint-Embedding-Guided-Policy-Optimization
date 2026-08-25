@@ -170,6 +170,12 @@ class OutcomeDataCollector:
         )
         self.total_seen += 1
         if self.sampling == "recent":
+            if self.max_size is not None and len(self._examples) >= self.max_size:
+                # Appending to a full deque silently evicts the leftmost
+                # example. Pop it FIRST: _track_steps_on_remove() must observe
+                # the post-eviction retained set when it rescans.
+                evicted = self._examples.popleft()
+                self._track_steps_on_remove([evicted])
             self._track_step_on_add(example)
             self._examples.append(example)
         elif self.max_size is None or len(self._examples) < self.max_size:
