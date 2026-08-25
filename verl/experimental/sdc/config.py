@@ -29,6 +29,7 @@ class SDCConfig:
     sft_batch_size: int = 8
     sft_max_token_len_per_gpu: int = 0
     sft_max_updates_per_interval: int = 1
+    fused_adamw: bool = False
 
     data_max_size: Optional[int] = None
     data_sampling: str = "recent"

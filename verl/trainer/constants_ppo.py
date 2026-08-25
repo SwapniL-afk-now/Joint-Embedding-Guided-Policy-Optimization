@@ -40,7 +40,11 @@ if (_major or 0) >= 10:
 # ahead of it on PYTHONPATH (breaks numba/scipy in the vLLM workers).
 _venv_site_packages = sysconfig.get_paths().get("purelib", "")
 _verl_repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_extra_pythonpath = f"{_venv_site_packages}:{_verl_repo}"
+_extra_pythonpath_entries = [_venv_site_packages, _verl_repo]
+_extra_pythonpath_entries.extend(
+    value for value in os.environ.get("VERL_EXTRA_PYTHONPATH", "").split(":") if value
+)
+_extra_pythonpath = ":".join(_extra_pythonpath_entries)
 
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
@@ -100,7 +104,20 @@ def get_ppo_ray_runtime_env():
     # Ray workers don't inherit the driver's os.environ; pass these explicitly.
     # WANDB_RUN_ID is read by Tracking inside the TaskRunner actor; without it here a
     # resumed training run starts a *new* wandb run instead of continuing the old one.
-    for key in ("WANDB_API_KEY", "HF_TOKEN", "LD_PRELOAD", "WANDB_RUN_ID"):
+    for key in (
+        "WANDB_API_KEY",
+        "HF_TOKEN",
+        "LD_PRELOAD",
+        "WANDB_RUN_ID",
+        "PYTHONPATH",
+        "VERL_EXTRA_PYTHONPATH",
+        "LD_LIBRARY_PATH",
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "CUDACXX",
+        "CPATH",
+        "TRITON_CACHE_DIR",
+    ):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

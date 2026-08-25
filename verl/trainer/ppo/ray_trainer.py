@@ -379,6 +379,10 @@ class RayPPOTrainer:
         self.sdc_failure_model_update_count = 0
         self.sdc_models_ready = False
         self.sdc_parameter_metrics: dict[str, float] = {}
+        # init_workers() initializes the SDC models before fit() loads a
+        # checkpoint. Fresh workers therefore need a defined policy step; a
+        # regular global_step_* checkpoint overwrites it in _load_checkpoint().
+        self.global_steps = 0
         avspo_tau = float(self.config.algorithm.get("avspo_adapt_tau_init", 0.5))
         avspo_enabled = self.config.algorithm.adv_estimator in (AdvantageEstimator.AVSPO, "avspo")
         self.avspo_state = AVSPOState(tau_adapt=avspo_tau) if avspo_enabled else None
@@ -2152,6 +2156,7 @@ class RayPPOTrainer:
             "sft_batch_size": int(self.sdc_config.sft_batch_size),
             "sft_max_token_len_per_gpu": int(self.sdc_config.sft_max_token_len_per_gpu),
             "sft_max_updates_per_interval": int(self.sdc_config.sft_max_updates_per_interval),
+            "fused_adamw": bool(self.sdc_config.fused_adamw),
             "max_prompt_length": int(self.config.data.get("max_prompt_length", 1024)),
             "max_response_length": int(self.config.data.get("max_response_length", 2048)),
             "save_to_disk_interval_policy_steps": int(self.sdc_config.save_to_disk_interval_policy_steps),
@@ -2655,6 +2660,24 @@ class RayPPOTrainer:
                             "SDC rollout_log_probs must have the same [batch, response_length] shape as response_mask"
                         )
                     verify_rollout = reuse_rollout and self.sdc_config.verify_rollout_log_probs
+                    actor_config = self.config.actor_rollout_ref.actor
+                    requested_fuse_old_log_prob = bool(actor_config.get("fuse_old_log_prob", False))
+                    configured_ppo_mini_batch_size = int(actor_config.get("ppo_mini_batch_size", 0) or 0)
+                    configured_ppo_epochs = int(actor_config.get("ppo_epochs", 1) or 1)
+                    rollout_rows = configured_ppo_mini_batch_size * int(self.config.actor_rollout_ref.rollout.n)
+                    batch_rows = int(batch.batch.batch_size[0])
+                    fuse_old_log_prob = (
+                        requested_fuse_old_log_prob
+                        and configured_ppo_epochs == 1
+                        and rollout_rows >= batch_rows
+                    )
+                    if requested_fuse_old_log_prob and not fuse_old_log_prob:
+                        print(
+                            "[fuse_old_log_prob] disabled: requires ppo_epochs=1 and "
+                            f"ppo_mini_batch_size * rollout.n >= actor batch rows "
+                            f"({rollout_rows} < {batch_rows}); falling back to a separate old_log_prob forward.",
+                            flush=True,
+                        )
                     if reuse_rollout and "old_log_probs" not in batch.batch:
                         batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
                     if reuse_rollout and not verify_rollout:
@@ -2667,6 +2690,12 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
+                    elif fuse_old_log_prob:
+                        # With one PPO epoch and one logical mini-batch, the actor is
+                        # unchanged between rollout and update. The training forward
+                        # therefore supplies old_log_prob.detach() exactly; this skips
+                        # a full extra actor inference pass without changing the ratio.
+                        metrics["actor/fused_old_log_prob"] = 1.0
                     elif self.gpi_ce_enabled and self.gpi_ce_config.fuse_old_log_prob:
                         # Skip the old-policy forward entirely. With ppo_epochs=1 and one
                         # optimizer step, theta_old == theta during the update, so the
@@ -2706,7 +2735,7 @@ class RayPPOTrainer:
 
                                 metrics.update(calculate_debug_metrics(batch))
 
-                    if not (self.gpi_ce_enabled and self.gpi_ce_config.fuse_old_log_prob):
+                    if not (self.gpi_ce_enabled and self.gpi_ce_config.fuse_old_log_prob) and not fuse_old_log_prob:
                         assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.sdc_enabled:

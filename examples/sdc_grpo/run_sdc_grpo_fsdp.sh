@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Match the GXPO reference run: this SDC entrypoint is fixed to physical GPUs
+# 0 and 1, not whichever devices happen to be inherited by the shell.
+export CUDA_VISIBLE_DEVICES=0,1
+
 # vLLM imports matplotlib through its CLI module. Training is non-interactive;
 # force a headless backend so inherited Jupyter MPLBACKEND values cannot abort
 # worker startup.
@@ -12,11 +16,15 @@ export MPLBACKEND=Agg
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 WORKSPACE_ROOT=$(cd -- "${REPO_ROOT}/.." && pwd)
-PYTHON_BIN=${PYTHON_BIN:-python3}
+if [[ -z "${PYTHON_BIN:-}" && -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
+else
+    PYTHON_BIN=${PYTHON_BIN:-python3}
+fi
 
 cd "$REPO_ROOT"
 
-# Reduce CUDA fragmentation on the colocated (vLLM + FSDP) single GPU.
+# Reduce CUDA fragmentation on the colocated (vLLM + FSDP) GPUs.
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:512}
 
 if [[ -f "${REPO_ROOT}/.env" ]]; then
@@ -34,33 +42,104 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
     unset _XTRACE_WAS_ON
 fi
 
+# Keep .env settings from silently moving this reference run to another GPU
+# pair.
+export CUDA_VISIBLE_DEVICES=0,1
+
+# Use the same local model and prepared parquet assets as the GXPO reference
+# launcher. These paths remain overridable for another machine.
+GXPO_REFERENCE_ROOT=${GXPO_REFERENCE_ROOT:-${WORKSPACE_ROOT}/gradient-extrapolation-based-policy-optimization-gxpo-speed-audit}
+GXPO_DATA_ROOT=${GXPO_DATA_ROOT:-${GXPO_REFERENCE_ROOT}/Code/SFPO/data}
+
+# Reuse the verified GXPO CUDA/FlashAttention2/Liger runtime. The SDC venv
+# contains the matching CUDA 13 libraries, while the GXPO venv contains the
+# tested FlashAttention2 and Liger Python packages. Keep SDC's own site-packages
+# first so its PyTorch/Transformers versions remain authoritative.
+LOCAL_CUDA_LIB_ROOT=${LOCAL_CUDA_LIB_ROOT:-${REPO_ROOT}/.venv/lib/python3.12/site-packages/nvidia}
+for LOCAL_CUDA_LIB_DIR in \
+    "${LOCAL_CUDA_LIB_ROOT}/cu13/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/cublas/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/cuda_cupti/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/cuda_nvrtc/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/cuda_runtime/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/cudnn/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/cufft/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/curand/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/cusolver/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/cusparse/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/nccl/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/nvjitlink/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/nvshmem/lib" \
+    "${LOCAL_CUDA_LIB_ROOT}/nvtx/lib"; do
+    if [[ -d "${LOCAL_CUDA_LIB_DIR}" ]]; then
+        export LD_LIBRARY_PATH="${LOCAL_CUDA_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    fi
+done
+GXPO_SITE_PACKAGES=${GXPO_SITE_PACKAGES:-${GXPO_REFERENCE_ROOT}/.venv/lib/python3.12/site-packages}
+if [[ -d "${GXPO_SITE_PACKAGES}/flash_attn" && -d "${GXPO_SITE_PACKAGES}/liger_kernel" ]]; then
+    SDC_SITE_PACKAGES=${SDC_SITE_PACKAGES:-${REPO_ROOT}/.venv/lib/python3.12/site-packages}
+    export VERL_EXTRA_PYTHONPATH="${GXPO_SITE_PACKAGES}"
+    export PYTHONPATH="${SDC_SITE_PACKAGES}:${GXPO_SITE_PACKAGES}${PYTHONPATH:+:${PYTHONPATH}}"
+else
+    echo "Missing verified GXPO FlashAttention2/Liger packages under ${GXPO_SITE_PACKAGES}" >&2
+    exit 2
+fi
+TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-${REPO_ROOT}/.cache/triton}
+export TRITON_CACHE_DIR
+mkdir -p "${TRITON_CACHE_DIR}"
+
+GXPO_CUDA_HOME=${GXPO_CUDA_HOME:-${GXPO_REFERENCE_ROOT}/.cuda-toolkit}
+if [[ -x "${GXPO_CUDA_HOME}/bin/nvcc" ]]; then
+    export CUDA_HOME="${GXPO_CUDA_HOME}"
+    export CUDA_PATH="${GXPO_CUDA_HOME}"
+    export CUDACXX="${GXPO_CUDA_HOME}/bin/nvcc"
+    export PATH="${GXPO_CUDA_HOME}/bin:${PATH}"
+fi
+
+# Triton JIT-compiles a small CUDA driver helper when vLLM starts. The host
+# Python 3.12 runtime omits system development headers, so reuse the matching
+# local header bundle already staged with the GXPO environment.
+PYTHON_DEV_INCLUDE_ROOT=${PYTHON_DEV_INCLUDE_ROOT:-${GXPO_REFERENCE_ROOT}/.python-dev/usr/include}
+if [[ -f "${PYTHON_DEV_INCLUDE_ROOT}/python3.12/Python.h" ]]; then
+    export CPATH="${PYTHON_DEV_INCLUDE_ROOT}/python3.12:${PYTHON_DEV_INCLUDE_ROOT}${CPATH:+:${CPATH}}"
+fi
+
 PROJECT_NAME=${PROJECT_NAME:-verl_sdc_deepscaler}
 export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
 export WANDB_SILENT=${WANDB_SILENT:-true}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
-# Default model/data/benchmark settings mirror
-# examples/jepa_grpo_trainer/run_qwen_1_5b_ray.sh so SDC-GRPO
-# is an apples-to-apples comparison against the JEPA-GRPO runs.
+# Default model/data/benchmark settings mirror the GXPO reference launcher.
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-sdc_${BASE_ALGO:-drgrpo}_qwen25math_1_5b-${RUN_TIMESTAMP}}
-MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
+MODEL_PATH=${MODEL_PATH:-${GXPO_REFERENCE_ROOT}/models/Qwen2.5-Math-1.5B-Instruct}
 NNODES=${NNODES:-1}
-NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
+NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-2}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-2}
 ROLLOUT_AGENT_NUM_WORKERS=${ROLLOUT_AGENT_NUM_WORKERS:-1}
 
-# Match the wesserstein trainer's exact training and testing datasets.
-TRAIN_DATASET=${TRAIN_DATASET:-zhuzilin/dapo-math-17k}
+# Match GXPO's exact prepared training and validation assets.
+TRAIN_DATASET=${TRAIN_DATASET:-haizhongzheng/DAPO-Math-17K-cleaned}
 TRAIN_DATASET_CONFIG=${TRAIN_DATASET_CONFIG:-default}
 TRAIN_SPLIT=${TRAIN_SPLIT:-train}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:--1}
-TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/amcaime32k/train.parquet}
+TRAIN_DAPO_FILE=${TRAIN_DAPO_FILE:-${GXPO_DATA_ROOT}/dapo_math/train.parquet}
+TRAIN_LIGHTEVAL_FILE=${TRAIN_LIGHTEVAL_FILE:-${GXPO_DATA_ROOT}/lighteval-math/train.parquet}
+TRAIN_FILE=${TRAIN_FILE:-${TRAIN_DAPO_FILE}}
+TRAIN_FILES=${TRAIN_FILES:-"[${TRAIN_DAPO_FILE},${TRAIN_LIGHTEVAL_FILE}]"}
 PREPARE_TRAIN_DATA=${PREPARE_TRAIN_DATA:-false}
 
-EVAL_DATA_DIR=${EVAL_DATA_DIR:-/workspace/jepa-grpo-cache/eval_data}
-PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-true}
+# The GXPO benchmark parquets disagree on nested ground-truth types and some
+# shared auxiliary columns, which Hugging Face Datasets cannot concatenate.
+# These cached copies retain the RL fields while normalizing the schema and
+# canonical data_source names used by validation and best-checkpoint selection.
+SDC_VAL_CACHE_ROOT=${SDC_VAL_CACHE_ROOT:-${REPO_ROOT}/data/sdc_validation_normalized}
+MATH500_FILE=${MATH500_FILE:-${SDC_VAL_CACHE_ROOT}/math500.parquet}
+AIME24_FILE=${AIME24_FILE:-${SDC_VAL_CACHE_ROOT}/aime2024.parquet}
+AIME25_FILE=${AIME25_FILE:-${SDC_VAL_CACHE_ROOT}/aime2025.parquet}
+AMC23_FILE=${AMC23_FILE:-${SDC_VAL_CACHE_ROOT}/amc23.parquet}
+MINERVA_FILE=${MINERVA_FILE:-${SDC_VAL_CACHE_ROOT}/minervamath.parquet}
+OLYMPIADBENCH_FILE=${OLYMPIADBENCH_FILE:-${SDC_VAL_CACHE_ROOT}/olympiadbench.parquet}
 if [[ -z "${VAL_FILES:-}" ]]; then
-    # Same in-training core-math subset as the JEPA-GRPO run.
-    VAL_FILES="[${EVAL_DATA_DIR}/aime24.parquet,${EVAL_DATA_DIR}/aime25.parquet,${EVAL_DATA_DIR}/aime26.parquet,${EVAL_DATA_DIR}/amc23.parquet]"
+    VAL_FILES="[${MATH500_FILE},${AIME24_FILE},${AIME25_FILE},${AMC23_FILE},${MINERVA_FILE},${OLYMPIADBENCH_FILE}]"
 fi
 
 if [[ "${PREPARE_TRAIN_DATA}" == "true" && ! -f "${TRAIN_FILE}" ]]; then
@@ -73,18 +152,15 @@ if [[ "${PREPARE_TRAIN_DATA}" == "true" && ! -f "${TRAIN_FILE}" ]]; then
         --output "${TRAIN_FILE}"
 fi
 
-if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
-    mkdir -p "${EVAL_DATA_DIR}"
-    if [[ ! -f "${EVAL_DATA_DIR}/amc23.parquet" ]]; then
-        "$PYTHON_BIN" -m verl.experimental.fepo.data --dataset math-ai/amc23 --split test --output "${EVAL_DATA_DIR}/amc23.parquet"
+for required_file in \
+    "${TRAIN_DAPO_FILE}" "${TRAIN_LIGHTEVAL_FILE}" \
+    "${MATH500_FILE}" "${AIME24_FILE}" "${AIME25_FILE}" \
+    "${AMC23_FILE}" "${MINERVA_FILE}" "${OLYMPIADBENCH_FILE}"; do
+    if [[ ! -f "${required_file}" ]]; then
+        echo "Missing GXPO reference dataset: ${required_file}" >&2
+        exit 2
     fi
-    if [[ ! -f "${EVAL_DATA_DIR}/aime24.parquet" ]]; then
-        "$PYTHON_BIN" -m verl.experimental.fepo.data --dataset math-ai/aime24 --split test --output "${EVAL_DATA_DIR}/aime24.parquet"
-    fi
-    if [[ ! -f "${EVAL_DATA_DIR}/aime25.parquet" ]]; then
-        "$PYTHON_BIN" -m verl.experimental.fepo.data --dataset math-ai/aime25 --split test --output "${EVAL_DATA_DIR}/aime25.parquet"
-    fi
-fi
+done
 
 # ── SDC-GRPO hyperparameters ────────────────────────────────────────────────
 SDC_ENABLE=${SDC_ENABLE:-true}
@@ -94,30 +170,52 @@ SDC_VLLM_SCORE_MICRO_BATCH_SIZE=${SDC_VLLM_SCORE_MICRO_BATCH_SIZE:-16}
 SDC_REUSE_ROLLOUT_LOGPROBS=${SDC_REUSE_ROLLOUT_LOGPROBS:-}
 SDC_VERIFY_ROLLOUT_LOGPROBS=${SDC_VERIFY_ROLLOUT_LOGPROBS:-false}
 SDC_USE_IMPORTANCE_WEIGHT=${SDC_USE_IMPORTANCE_WEIGHT:-true}
-SDC_IMPORTANCE_WEIGHT_CLIP=${SDC_IMPORTANCE_WEIGHT_CLIP:-10.0}
-SDC_MIN_SFT_UPDATES_BEFORE_USE=${SDC_MIN_SFT_UPDATES_BEFORE_USE:-1}
+SDC_IMPORTANCE_WEIGHT_CLIP=${SDC_IMPORTANCE_WEIGHT_CLIP:-5.0}
+SDC_BASE_MIX_GAMMA=${SDC_BASE_MIX_GAMMA:-0.9}
+# Let both outcome models see two balanced refreshes before their log-prob
+# contrast contributes to the actor loss.
+SDC_MIN_SFT_UPDATES_BEFORE_USE=${SDC_MIN_SFT_UPDATES_BEFORE_USE:-2}
 SDC_SFT_UPDATE_INTERVAL=${SDC_SFT_UPDATE_INTERVAL:-5}       # run SFT every N policy steps
-SDC_CHECKPOINT_INTERVAL=${SDC_CHECKPOINT_INTERVAL:-10}
-SDC_SFT_LR=${SDC_SFT_LR:-1.0e-6}
+SDC_CHECKPOINT_INTERVAL=${SDC_CHECKPOINT_INTERVAL:-20}
+SDC_SFT_LR=${SDC_SFT_LR:-1.0e-5}
 SDC_SFT_BATCH_SIZE=${SDC_SFT_BATCH_SIZE:-8}
-SDC_SFT_MAX_TOKEN_LEN_PER_GPU=${SDC_SFT_MAX_TOKEN_LEN_PER_GPU:-}
+# 8 rows * (1024 prompt + 3072 response) tokens. The implementation uses the
+# worst-case padded length to derive the effective SFT batch size.
+SDC_SFT_MAX_TOKEN_LEN_PER_GPU=${SDC_SFT_MAX_TOKEN_LEN_PER_GPU:-32768}
 SDC_SFT_MAX_UPDATES=${SDC_SFT_MAX_UPDATES:-1}
 SDC_SAVE_TO_DISK_INTERVAL=${SDC_SAVE_TO_DISK_INTERVAL:-0}
-SDC_DATA_MAX_SIZE=${SDC_DATA_MAX_SIZE:-null}
+SDC_DATA_MAX_SIZE=${SDC_DATA_MAX_SIZE:-8192}
 SDC_DATA_SAMPLING=${SDC_DATA_SAMPLING:-recent}
+SDC_FUSED_ADAMW=${SDC_FUSED_ADAMW:-true}
 
-TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}
+# Match the GXPO actor optimization stack. These are explicit launcher
+# settings rather than relying on model/config defaults.
+USE_LIGER=${USE_LIGER:-true}
+USE_FUSED_KERNELS=${USE_FUSED_KERNELS:-true}
+FUSED_KERNEL_BACKEND=${FUSED_KERNEL_BACKEND:-triton}
+USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-true}
+OPTIM_FUSED=${OPTIM_FUSED:-true}
+# Exact cross-rank metric reductions inside every actor microbatch are useful
+# for debugging but add synchronization to the hot path.
+SDC_DISTRIBUTED_METRICS=${SDC_DISTRIBUTED_METRICS:-false}
+
+TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-256}
 NUM_GENERATIONS=${NUM_GENERATIONS:-8}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
+# One full logical PPO batch avoids repeated optimizer/FSDP synchronization boundaries.
+# Dynamic token batching still splits this batch for memory safety.
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-256}
+FUSE_OLD_LOG_PROB=${FUSE_OLD_LOG_PROB:-true}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
-# SFT token budget mirrors the actor-update budget unless overridden above.
-SDC_SFT_MAX_TOKEN_LEN_PER_GPU=${SDC_SFT_MAX_TOKEN_LEN_PER_GPU:-${PPO_MAX_TOKEN_LEN_PER_GPU}}
+# Larger per-GPU token budget reduces dynamic microbatching and FSDP synchronization overhead on 98 GiB GPUs.
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-49152}
+# Use the same verified FlashAttention2 path as GXPO. The CUDA 13 runtime
+# libraries and package path are configured above before Ray workers start.
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
-# Load HF actors in bf16; fp32 is incompatible with FlashAttention 2 on Llama/DeepSeek.
-MODEL_DTYPE=${MODEL_DTYPE:-bf16}
+# Match GXPO's FSDP1 setup: keep master parameters in FP32 while FSDP's
+# mixed-precision policy performs BF16 forward/reduction work.
+MODEL_DTYPE=${MODEL_DTYPE:-fp32}
 DRGRPO_USE_LORA=${DRGRPO_USE_LORA:-false}
 LORA_RANK=${LORA_RANK:-512}
 LORA_ALPHA=${LORA_ALPHA:-1024}
@@ -161,19 +259,21 @@ ROLLOUT_TP=${ROLLOUT_TP:-1}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.7}
 ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
 VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
-ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-2048}
-ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-131072}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}
+ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-98304}
 if [[ -z "${ROLLOUT_MAX_LORAS:-}" ]]; then
     ROLLOUT_MAX_LORAS=3
 fi
 ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-True}
-VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-8}
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-128}
-VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
-VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
-VAL_TOP_P=${VAL_TOP_P:-0.95}
-VALIDATION_SEEDS=${VALIDATION_SEEDS:-'[31415,271828,14142,16180,299792]'}
-TRAIN_SEED=${TRAIN_SEED:-31415}
+VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-1}
+# Validation is sent as one logical dataset batch by the trainer; numeric
+# val_batch_size is deprecated and does not split these benchmark files.
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-null}
+VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-False}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-0}
+VAL_TOP_P=${VAL_TOP_P:-1.0}
+VALIDATION_SEEDS=${VALIDATION_SEEDS:-'[0]'}
+TRAIN_SEED=${TRAIN_SEED:-3407}
 TRAIN_TEMPERATURE=${TRAIN_TEMPERATURE:-1.0}
 TRAIN_TOP_P=${TRAIN_TOP_P:-1.0}
 TRAIN_TOP_K=${TRAIN_TOP_K:--1}
@@ -185,16 +285,17 @@ WG_ALPHA=${WG_ALPHA:-0.2}
 WG_EMBED_MODEL=${WG_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
 WG_DECODE_MODEL=${WG_DECODE_MODEL:-${MODEL_PATH}}  # use actor tokenizer to decode response token IDs
 
-MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-666}
-SAVE_FREQ=${SAVE_FREQ:-10}
-TEST_FREQ=${TEST_FREQ:-10}
-VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}
-# best-checkpoint selection sources (matches the JEPA-GRPO run)
-BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["aime24","aime25","aime26","amc23"]'}
+MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
+SAVE_FREQ=${SAVE_FREQ:-20}
+TEST_FREQ=${TEST_FREQ:-5}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}
+# Select checkpoints over the same six validation benchmarks as GXPO.
+BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["math500","aime24","aime25","amc23","minervamath","olympiadbench"]'}
 # Selection metric(s), e.g. '["pass@1"]'. Unset keeps the trainer default ("combined",
 # = 0.5*(avg@k + pass@k)), which needs BOTH keys -- so a greedy n=1 run must set this
 # to pass@1 or no best/ checkpoint is ever written.
-BEST_CKPT_METRICS=${BEST_CKPT_METRICS:-}
+# Greedy n=1 validation has a well-defined pass@1 metric.
+BEST_CKPT_METRICS=${BEST_CKPT_METRICS:-'["pass@1"]'}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-${MAX_OPTIMIZER_STEPS}}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
@@ -217,7 +318,7 @@ DATA=(
     algorithm.adv_estimator=${BASE_ADV_ESTIMATOR}
     algorithm.norm_adv_by_std_in_grpo=${BASE_NORM}
     algorithm.use_kl_in_reward=False
-    data.train_files="$TRAIN_FILE"
+    data.train_files="$TRAIN_FILES"
     data.val_files=${VAL_FILES}
     data.train_batch_size=${TRAIN_BATCH_SIZE}
     data.val_batch_size=${VAL_BATCH_SIZE}
@@ -232,6 +333,9 @@ MODEL=(
     actor_rollout_ref.model.path="$MODEL_PATH"
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.model.enable_gradient_checkpointing=True
+    actor_rollout_ref.model.use_liger=${USE_LIGER}
+    actor_rollout_ref.model.use_fused_kernels=${USE_FUSED_KERNELS}
+    actor_rollout_ref.model.fused_kernel_options.impl_backend=${FUSED_KERNEL_BACKEND}
     +actor_rollout_ref.model.override_config.attn_implementation=${ACTOR_ATTENTION_IMPL}
 )
 
@@ -256,8 +360,11 @@ ACTOR=(
     actor_rollout_ref.actor.clip_ratio_high=${BASE_CLIP_HIGH}
     actor_rollout_ref.actor.clip_ratio_c=${CLIP_RATIO_C}
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
+    actor_rollout_ref.actor.optim.fused=${OPTIM_FUSED}
     actor_rollout_ref.actor.ppo_loss_coef=${PPO_LOSS_COEF}
+    actor_rollout_ref.actor.use_torch_compile=${USE_TORCH_COMPILE}
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
+    +actor_rollout_ref.actor.fuse_old_log_prob=${FUSE_OLD_LOG_PROB}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.actor.use_kl_loss=False
@@ -346,6 +453,7 @@ SDC=(
     custom_sdc.verify_rollout_log_probs="${SDC_VERIFY_ROLLOUT_LOGPROBS}"
     custom_sdc.use_importance_weight="${SDC_USE_IMPORTANCE_WEIGHT}"
     custom_sdc.importance_weight_clip="${SDC_IMPORTANCE_WEIGHT_CLIP}"
+    custom_sdc.base_mix_gamma="${SDC_BASE_MIX_GAMMA}"
     custom_sdc.min_sft_updates_before_use="${SDC_MIN_SFT_UPDATES_BEFORE_USE}"
     custom_sdc.sft_update_interval_policy_steps="${SDC_SFT_UPDATE_INTERVAL}"
     custom_sdc.checkpoint_interval_policy_steps="${SDC_CHECKPOINT_INTERVAL}"
@@ -356,6 +464,8 @@ SDC=(
     custom_sdc.save_to_disk_interval_policy_steps="${SDC_SAVE_TO_DISK_INTERVAL}"
     custom_sdc.data_max_size="${SDC_DATA_MAX_SIZE}"
     custom_sdc.data_sampling="${SDC_DATA_SAMPLING}"
+    custom_sdc.fused_adamw="${SDC_FUSED_ADAMW}"
+    custom_sdc.distributed_metrics="${SDC_DISTRIBUTED_METRICS}"
 )
 
 WASSERSTEIN=(

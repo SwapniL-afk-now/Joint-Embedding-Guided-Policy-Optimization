@@ -54,6 +54,13 @@ def default_compute_score(
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
+    elif data_source in ["dapo_math", "xDAN2099/lighteval-MATH"]:
+        # Exact source labels in the GXPO 1.5B training parquets. GXPO grades
+        # these assets with Math-Verify, yielding the binary outcome consumed
+        # by GRPO and the SDC success/failure collectors.
+        from . import math_verify
+
+        res = math_verify.compute_score(solution_str, ground_truth)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
         from . import math_reward
 

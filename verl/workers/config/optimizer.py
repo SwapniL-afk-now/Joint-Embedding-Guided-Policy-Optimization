@@ -105,6 +105,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
 
     optimizer: str = "AdamW"
     optimizer_impl: str = "torch.optim"
+    fused: Optional[bool] = None
     min_lr_ratio: Optional[float] = None
     # deprecate warmup_style
     warmup_style: Optional[str] = None
@@ -254,6 +255,9 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig):
 
     if config.override_optimizer_config is not None:
         optimizer_args.update(config.override_optimizer_config)
+
+    if config.fused is not None:
+        optimizer_args["fused"] = bool(config.fused)
 
     try:
         module = importlib.import_module(config.optimizer_impl)

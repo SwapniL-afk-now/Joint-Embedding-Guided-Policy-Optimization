@@ -166,6 +166,7 @@ custom_sdc:
   sft_max_updates_per_interval: 1
   data_max_size: null
   data_sampling: recent
+  fused_adamw: false
   save_to_disk_interval_policy_steps: 0
   loss_agg_mode: token-mean
   distributed_metrics: false

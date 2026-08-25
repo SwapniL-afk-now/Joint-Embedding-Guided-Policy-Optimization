@@ -120,13 +120,19 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
             if field in data:
                 fields.append(field)
     sdc_enabled = bool(sdc_config and sdc_config.get("enable", False))
+    # Keep SDC-only normalization and diagnostics out of the generic actor
+    # aggregation payload. The same generic payload is expanded into agg_loss()
+    # for PPO, entropy, and KL, whose API intentionally only accepts the common
+    # distributed-batch fields.
+    sdc_global_batch_info = config.global_batch_info
     if sdc_enabled:
+        sdc_global_batch_info = dict(config.global_batch_info)
         active_token_count = tu.get_non_tensor_data(
             data=data, key="sdc_active_token_count", default=None
         )
         if active_token_count is not None:
-            config.global_batch_info["sdc_active_token_count"] = active_token_count
-        config.global_batch_info["reduce_diagnostics"] = bool(
+            sdc_global_batch_info["sdc_active_token_count"] = active_token_count
+        sdc_global_batch_info["reduce_diagnostics"] = bool(
             sdc_config.get("distributed_metrics", False)
         )
     if sdc_enabled:
@@ -265,7 +271,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
             failure_mask=data["sdc_failure_mask"],
             beta=float(sdc_config.get("beta", 0.0)),
             loss_agg_mode="token-mean",
-            global_batch_info=config.global_batch_info,
+            global_batch_info=sdc_global_batch_info,
             use_importance_weight=bool(sdc_config.get("use_importance_weight", True)),
             importance_weight_clip=float(sdc_config.get("importance_weight_clip", 10.0)),
             models_ready=bool(sdc_config.get("sdc_models_ready", False)),

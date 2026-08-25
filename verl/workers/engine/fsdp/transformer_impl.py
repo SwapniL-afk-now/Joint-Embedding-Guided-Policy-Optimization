@@ -87,6 +87,14 @@ from .utils import create_device_mesh, get_sharding_strategy
 logger = logging.getLogger(__file__)
 
 
+def _sdc_autocast_context(device):
+    """Use BF16 for direct SDC clone forwards required by FlashAttention2."""
+
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
 def sdc_cast_state_to_dest(state: dict, dest_state: dict, param_dtype, device):
     """Cast a state dict to the destination module's per-tensor dtypes.
 
@@ -607,6 +615,60 @@ class FSDPEngine(BaseEngine):
         """
         return EngineEvalModeCtx(self, **kwargs)
 
+    def optimizer_zero_grad(self):
+        """Clear FSDP gradients and reset per-logical-batch step counters."""
+        if self.optimizer is None:
+            return
+        self.optimizer.zero_grad(set_to_none=True)
+        self._optimizer_step_calls = 0
+        self._optimizer_steps_skipped_nonfinite = 0
+
+    def optimizer_step(self, clip_grad_override: Optional[float] = None):
+        """Clip the global FSDP gradient norm and apply one optimizer step."""
+        assert self.optimizer is not None, "optimizer_step() is invalid for a forward-only FSDP engine"
+
+        max_norm = self.optimizer_config.clip_grad if clip_grad_override is None else clip_grad_override
+        max_norm = float("inf") if max_norm is None else float(max_norm)
+        scaler = getattr(self, "scaler", None)
+        if scaler is not None:
+            scaler.unscale_(self.optimizer)
+
+        version = fsdp_version(self.module)
+        if version == 1:
+            grad_norm = self.module.clip_grad_norm_(max_norm=max_norm)
+        elif version == 2:
+            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=max_norm)
+        else:
+            raise RuntimeError(f"Unsupported FSDP version for optimizer step: {version}")
+
+        grad_norm_value = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
+        finite = bool(torch.isfinite(torch.as_tensor(grad_norm_value)).item())
+        self._optimizer_step_calls = getattr(self, "_optimizer_step_calls", 0) + 1
+
+        if finite:
+            if scaler is not None:
+                scaler.step(self.optimizer)
+            else:
+                self.optimizer.step()
+        else:
+            self._optimizer_steps_skipped_nonfinite = (
+                getattr(self, "_optimizer_steps_skipped_nonfinite", 0) + 1
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            logger.warning("Skipping FSDP optimizer step because grad_norm is not finite: %s", grad_norm_value)
+
+        if scaler is not None:
+            scaler.update()
+        return grad_norm_value
+
+    def lr_scheduler_step(self):
+        """Advance the FSDP learning-rate scheduler and return its current LR."""
+        if self.lr_scheduler is None:
+            return None
+        self.lr_scheduler.step()
+        last_lr = self.lr_scheduler.get_last_lr()
+        return last_lr[0] if len(last_lr) == 1 else last_lr
+
     def get_data_parallel_rank(self):
         if self.ulysses_device_mesh is not None:
             return self.ulysses_device_mesh["dp"].get_local_rank()
@@ -767,6 +829,25 @@ class FSDPEngine(BaseEngine):
                         target_device = torch.device("cpu")
                     value.data = value.to(device=target_device, non_blocking=True)
 
+    def _sdc_prepare_models(self, include_optimizer=False):
+        """Place SDC clones on the actor device for scoring or SFT."""
+        device = next(self.module.parameters()).device
+        for model, optimizer in ((self._sdc_success, self._sdc_success_optimizer), (self._sdc_failure, self._sdc_failure_optimizer)):
+            if next(model.parameters()).device != device:
+                model.to(device)
+            if include_optimizer:
+                self._sdc_move_optimizer_state(optimizer, device)
+
+    def _sdc_offload_models(self):
+        """Release SDC clone and optimizer GPU memory before vLLM wake-up."""
+        cpu = torch.device("cpu")
+        for model, optimizer in ((self._sdc_success, self._sdc_success_optimizer), (self._sdc_failure, self._sdc_failure_optimizer)):
+            self._sdc_move_optimizer_state(optimizer, cpu)
+            model.to(cpu)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
     @staticmethod
     def _sdc_ensure_optimizer_state(optimizer) -> None:
         """Materialize AdamW state on ranks that skipped rank-zero SFT work."""
@@ -786,13 +867,29 @@ class FSDPEngine(BaseEngine):
                     state["max_exp_avg_sq"] = torch.zeros_like(parameter)
 
     def _sdc_model_log_probs(self, module, input_ids, attention_mask, response_mask):
+        self._sdc_prepare_models()
         was_training = module.training
         module.eval()
-        with torch.no_grad():
-            outputs = module(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = outputs.logits[:, :-1].contiguous()
+        with torch.no_grad(), _sdc_autocast_context(input_ids.device):
+            outputs = module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
             labels = input_ids[:, 1:].contiguous()
-            token_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False).view(labels.shape)
+            if outputs.logits is not None:
+                logits = outputs.logits[:, :-1].contiguous()
+                token_lp = logprobs_from_logits(
+                    logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
+                ).view(labels.shape)
+            elif getattr(outputs, "log_probs", None) is not None:
+                # The Triton fused actor path returns per-token log-probs rather
+                # than logits. Drop its final rolled-label position to match the
+                # ordinary shifted-label path above.
+                token_lp = outputs.log_probs.reshape(input_ids.shape)[:, :-1].contiguous()
+            else:
+                raise RuntimeError("SDC model output contains neither logits nor fused log_probs.")
             width = response_mask.shape[-1]
             prompt_width = input_ids.shape[-1] - width
             result = torch.zeros(input_ids.shape[0], width, device=input_ids.device, dtype=torch.float32)
@@ -832,11 +929,16 @@ class FSDPEngine(BaseEngine):
         self._sdc_success = self._sdc_clone_from_state(self._sdc_base_state_cpu)
         self._sdc_failure = self._sdc_clone_from_state(self._sdc_base_state_cpu)
         lr = float(sdc_config.get("sft_lr", 1e-6))
+        fused_adamw = bool(sdc_config.get("fused_adamw", False))
         self._sdc_success_optimizer = torch.optim.AdamW(
-            (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad), lr=lr
+            (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad),
+            lr=lr,
+            fused=fused_adamw,
         )
         self._sdc_failure_optimizer = torch.optim.AdamW(
-            (parameter for parameter in self._sdc_failure.parameters() if parameter.requires_grad), lr=lr
+            (parameter for parameter in self._sdc_failure.parameters() if parameter.requires_grad),
+            lr=lr,
+            fused=fused_adamw,
         )
         self._sdc_success_model_update_count = int(sdc_config.get("sdc_success_model_update_count", 0))
         self._sdc_failure_model_update_count = int(sdc_config.get("sdc_failure_model_update_count", 0))
@@ -849,6 +951,13 @@ class FSDPEngine(BaseEngine):
         }
         success_counts = self._sdc_parameter_counts(self._sdc_success, self._sdc_success_optimizer)
         failure_counts = self._sdc_parameter_counts(self._sdc_failure, self._sdc_failure_optimizer)
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if distributed and torch.distributed.get_rank() != 0 and not self._is_lora:
+            # Only rank zero interpolates SDC weights with the frozen actor.
+            # Scoring ranks retain the two synchronized models but not this
+            # extra full-model CPU snapshot.
+            self._sdc_base_state_cpu = None
+        self._sdc_offload_models()
         return {
             "sdc_initialized": True,
             "sdc/base_mix_gamma": self._sdc_base_mix_gamma,
@@ -893,6 +1002,7 @@ class FSDPEngine(BaseEngine):
             active_ids, active_attention, active_response = ids[active], attention[active], response[active]
             success[active] = self._sdc_model_log_probs(self._sdc_success, active_ids, active_attention, active_response)
             failure[active] = self._sdc_model_log_probs(self._sdc_failure, active_ids, active_attention, active_response)
+            self._sdc_offload_models()
         return TensorDict({"sdc_success_log_probs": success, "sdc_failure_log_probs": failure}, batch_size=[ids.shape[0]])
 
     def _sdc_get_tokenizer(self):
@@ -933,7 +1043,13 @@ class FSDPEngine(BaseEngine):
             for record in records
         )
 
-    def _sdc_sync_model_and_optimizer(self, model, optimizer) -> None:
+    def _sdc_sync_model_and_optimizer(
+        self,
+        model,
+        optimizer,
+        *,
+        include_optimizer: bool = True,
+    ) -> None:
         if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return
 
@@ -945,19 +1061,20 @@ class FSDPEngine(BaseEngine):
         )
         entries.extend((f"buffer:{name}", buffer.data) for name, buffer in model.named_buffers())
 
-        # Iterate optimizer state by parameter-group order and fixed state-key
-        # order. Relying on optimizer.state insertion order is unsafe when only
-        # rank zero performs the first AdamW step.
-        preferred_state_keys = ("step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq")
-        for group_index, group in enumerate(optimizer.param_groups):
-            for parameter_index, parameter in enumerate(group["params"]):
-                state = optimizer.state.get(parameter, {})
-                ordered_keys = [key for key in preferred_state_keys if key in state]
-                ordered_keys.extend(sorted(key for key in state if key not in preferred_state_keys))
-                for key in ordered_keys:
-                    value = state[key]
-                    if torch.is_tensor(value):
-                        entries.append((f"optimizer:{group_index}:{parameter_index}:{key}", value.data))
+        if include_optimizer:
+            # Iterate optimizer state by parameter-group order and fixed state-key
+            # order. Relying on optimizer.state insertion order is unsafe when only
+            # rank zero performs the first AdamW step.
+            preferred_state_keys = ("step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq")
+            for group_index, group in enumerate(optimizer.param_groups):
+                for parameter_index, parameter in enumerate(group["params"]):
+                    state = optimizer.state.get(parameter, {})
+                    ordered_keys = [key for key in preferred_state_keys if key in state]
+                    ordered_keys.extend(sorted(key for key in state if key not in preferred_state_keys))
+                    for key in ordered_keys:
+                        value = state[key]
+                        if torch.is_tensor(value):
+                            entries.append((f"optimizer:{group_index}:{parameter_index}:{key}", value.data))
 
         # Fail before launching tensor broadcasts if ranks disagree on model
         # or optimizer state. Otherwise a first-refresh mismatch can hang NCCL.
@@ -1142,13 +1259,19 @@ class FSDPEngine(BaseEngine):
             input_ids = input_ids_cpu.to(device, non_blocking=True)
             attention = attention_cpu.to(device, non_blocking=True)
             response = response_cpu.to(device, non_blocking=True)
-            output = model(input_ids=input_ids, attention_mask=attention, use_cache=False)
-            logits = output.logits[:, :-1]
-            labels = input_ids[:, 1:]
-            token_log_probs = logprobs_from_logits(
-                logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
-            ).view(labels.shape)
-            loss = outcome_sft_loss(token_log_probs, response[:, 1:].bool())
+            with _sdc_autocast_context(input_ids.device):
+                output = model(input_ids=input_ids, attention_mask=attention, use_cache=False, return_dict=True)
+                labels = input_ids[:, 1:]
+                if output.logits is not None:
+                    logits = output.logits[:, :-1]
+                    token_log_probs = logprobs_from_logits(
+                        logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
+                    ).view(labels.shape)
+                elif getattr(output, "log_probs", None) is not None:
+                    token_log_probs = output.log_probs.reshape(input_ids.shape)[:, :-1].contiguous()
+                else:
+                    raise RuntimeError("SDC SFT output contains neither logits nor fused log_probs.")
+                loss = outcome_sft_loss(token_log_probs, response[:, 1:].bool())
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -1260,9 +1383,12 @@ class FSDPEngine(BaseEngine):
         """
 
         self.sdc_init(config)
+        self._sdc_prepare_models(include_optimizer=True)
         distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         if not distributed:
-            return self._sdc_sft_update_local(success_records, failure_records, config)
+            result = self._sdc_sft_update_local(success_records, failure_records, config)
+            self._sdc_offload_models()
+            return result
 
         is_rank_zero = torch.distributed.get_rank() == 0
         self._sdc_defer_sync = True
@@ -1283,16 +1409,26 @@ class FSDPEngine(BaseEngine):
         torch.distributed.broadcast_object_list(payload, src=0)
         result = payload[0] or {}
         if result.get("_sdc_failed", False):
+            self._sdc_offload_models()
             raise RuntimeError(f"Rank-zero SDC SFT update failed: {result.get('_sdc_error', 'unknown error')}")
         success_updates = int(result.get("sdc/success_sft_updates", 0.0))
         failure_updates = int(result.get("sdc/failure_sft_updates", 0.0))
         if success_updates or failure_updates:
             if success_updates != failure_updates:
                 raise RuntimeError("SDC success/failure refresh produced different optimizer-step counts.")
-            self._sdc_ensure_optimizer_state(self._sdc_success_optimizer)
-            self._sdc_ensure_optimizer_state(self._sdc_failure_optimizer)
-            self._sdc_sync_model_and_optimizer(self._sdc_success, self._sdc_success_optimizer)
-            self._sdc_sync_model_and_optimizer(self._sdc_failure, self._sdc_failure_optimizer)
+            # Rank zero is the only SDC optimizer owner. Every rank needs the
+            # refreshed model weights for scoring, but duplicating two complete
+            # AdamW states on nonzero ranks wastes tens of gigabytes of host RAM.
+            self._sdc_sync_model_and_optimizer(
+                self._sdc_success,
+                self._sdc_success_optimizer,
+                include_optimizer=False,
+            )
+            self._sdc_sync_model_and_optimizer(
+                self._sdc_failure,
+                self._sdc_failure_optimizer,
+                include_optimizer=False,
+            )
             if self._is_lora:
                 # Ranks that skipped rank-zero SFT can now release their full
                 # CPU base snapshot too; rank zero captured it during mixing.
@@ -1304,6 +1440,7 @@ class FSDPEngine(BaseEngine):
             result.get("sdc/failure_model_update_count", self._sdc_failure_model_update_count)
         )
         self._sdc_models_ready = bool(result.get("sdc/models_ready", self._sdc_models_ready))
+        self._sdc_offload_models()
         return result
 
     def _sdc_peft_state(self, model):
@@ -1339,9 +1476,11 @@ class FSDPEngine(BaseEngine):
 
     def sdc_load(self, local_path: str, config: dict | None = None):
         config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
-        if state.get("sdc_base_state_cpu") is not None:
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        is_sdc_optimizer_owner = not distributed or torch.distributed.get_rank() == 0
+        if is_sdc_optimizer_owner and state.get("sdc_base_state_cpu") is not None:
             self._sdc_base_state_cpu = clone_frozen_state(state["sdc_base_state_cpu"])
-        if state.get("sdc_base_adapter_state_cpu") is not None:
+        if is_sdc_optimizer_owner and state.get("sdc_base_adapter_state_cpu") is not None:
             self._sdc_base_adapter_state_cpu = clone_frozen_state(state["sdc_base_adapter_state_cpu"])
             if state.get("sdc_adapter_only", False):
                 self._sdc_base_state_cpu = None
@@ -1353,7 +1492,7 @@ class FSDPEngine(BaseEngine):
             directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
             if os.path.exists(model_path):
                 self._sdc_load_model_state(model, torch.load(model_path, map_location="cpu"))
-            if os.path.exists(optimizer_path):
+            if is_sdc_optimizer_owner and os.path.exists(optimizer_path):
                 optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
                 self._sdc_move_optimizer_state(optimizer, next(model.parameters()).device)
         return {
@@ -1884,13 +2023,29 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     value.data = value.to(device=device, non_blocking=True)
 
     def _sdc_model_log_probs(self, module, input_ids, attention_mask, response_mask):
+        self._sdc_prepare_models()
         was_training = module.training
         module.eval()
-        with torch.no_grad():
-            outputs = module(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = outputs.logits[:, :-1].contiguous()
+        with torch.no_grad(), _sdc_autocast_context(input_ids.device):
+            outputs = module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
             labels = input_ids[:, 1:].contiguous()
-            token_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False).view(labels.shape)
+            if outputs.logits is not None:
+                logits = outputs.logits[:, :-1].contiguous()
+                token_lp = logprobs_from_logits(
+                    logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
+                ).view(labels.shape)
+            elif getattr(outputs, "log_probs", None) is not None:
+                # The Triton fused actor path returns per-token log-probs rather
+                # than logits. Drop its final rolled-label position to match the
+                # ordinary shifted-label path above.
+                token_lp = outputs.log_probs.reshape(input_ids.shape)[:, :-1].contiguous()
+            else:
+                raise RuntimeError("SDC model output contains neither logits nor fused log_probs.")
             width = response_mask.shape[-1]
             prompt_width = input_ids.shape[-1] - width
             result = torch.zeros(input_ids.shape[0], width, device=input_ids.device, dtype=torch.float32)
@@ -1929,11 +2084,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
         self._sdc_success = self._sdc_clone_from_state(self._sdc_base_state_cpu)
         self._sdc_failure = self._sdc_clone_from_state(self._sdc_base_state_cpu)
         lr = float(sdc_config.get("sft_lr", 1e-6))
+        fused_adamw = bool(sdc_config.get("fused_adamw", False))
         self._sdc_success_optimizer = torch.optim.AdamW(
-            (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad), lr=lr
+            (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad),
+            lr=lr,
+            fused=fused_adamw,
         )
         self._sdc_failure_optimizer = torch.optim.AdamW(
-            (parameter for parameter in self._sdc_failure.parameters() if parameter.requires_grad), lr=lr
+            (parameter for parameter in self._sdc_failure.parameters() if parameter.requires_grad),
+            lr=lr,
+            fused=fused_adamw,
         )
         self._sdc_success_model_update_count = int(sdc_config.get("sdc_success_model_update_count", 0))
         self._sdc_failure_model_update_count = int(sdc_config.get("sdc_failure_model_update_count", 0))
@@ -1946,6 +2106,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
         }
         success_counts = self._sdc_parameter_counts(self._sdc_success, self._sdc_success_optimizer)
         failure_counts = self._sdc_parameter_counts(self._sdc_failure, self._sdc_failure_optimizer)
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if distributed and torch.distributed.get_rank() != 0 and not self._is_lora:
+            # Only rank zero interpolates SDC weights with the frozen actor.
+            # Scoring ranks retain the two synchronized models but not this
+            # extra full-model CPU snapshot.
+            self._sdc_base_state_cpu = None
+        self._sdc_offload_models()
         return {
             "sdc_initialized": True,
             "sdc/base_mix_gamma": self._sdc_base_mix_gamma,
@@ -1990,6 +2157,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             active_ids, active_attention, active_response = ids[active], attention[active], response[active]
             success[active] = self._sdc_model_log_probs(self._sdc_success, active_ids, active_attention, active_response)
             failure[active] = self._sdc_model_log_probs(self._sdc_failure, active_ids, active_attention, active_response)
+            self._sdc_offload_models()
         return TensorDict({"sdc_success_log_probs": success, "sdc_failure_log_probs": failure}, batch_size=[ids.shape[0]])
 
     def _sdc_get_tokenizer(self):
@@ -2070,13 +2238,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
             input_ids = input_ids_cpu.to(device, non_blocking=True)
             attention = attention_cpu.to(device, non_blocking=True)
             response = response_cpu.to(device, non_blocking=True)
-            output = model(input_ids=input_ids, attention_mask=attention, use_cache=False)
-            logits = output.logits[:, :-1]
-            labels = input_ids[:, 1:]
-            token_log_probs = logprobs_from_logits(
-                logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
-            ).view(labels.shape)
-            loss = outcome_sft_loss(token_log_probs, response[:, 1:].bool())
+            with _sdc_autocast_context(input_ids.device):
+                output = model(input_ids=input_ids, attention_mask=attention, use_cache=False, return_dict=True)
+                labels = input_ids[:, 1:]
+                if output.logits is not None:
+                    logits = output.logits[:, :-1]
+                    token_log_probs = logprobs_from_logits(
+                        logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
+                    ).view(labels.shape)
+                elif getattr(output, "log_probs", None) is not None:
+                    token_log_probs = output.log_probs.reshape(input_ids.shape)[:, :-1].contiguous()
+                else:
+                    raise RuntimeError("SDC SFT output contains neither logits nor fused log_probs.")
+                loss = outcome_sft_loss(token_log_probs, response[:, 1:].bool())
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -2199,9 +2373,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def sdc_load(self, local_path: str, config: dict | None = None):
         config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
-        if state.get("sdc_base_state_cpu") is not None:
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        is_sdc_optimizer_owner = not distributed or torch.distributed.get_rank() == 0
+        if is_sdc_optimizer_owner and state.get("sdc_base_state_cpu") is not None:
             self._sdc_base_state_cpu = clone_frozen_state(state["sdc_base_state_cpu"])
-        if state.get("sdc_base_adapter_state_cpu") is not None:
+        if is_sdc_optimizer_owner and state.get("sdc_base_adapter_state_cpu") is not None:
             self._sdc_base_adapter_state_cpu = clone_frozen_state(state["sdc_base_adapter_state_cpu"])
             if state.get("sdc_adapter_only", False):
                 self._sdc_base_state_cpu = None
@@ -2213,7 +2389,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
             if os.path.exists(model_path):
                 self._sdc_load_model_state(model, torch.load(model_path, map_location="cpu"))
-            if os.path.exists(optimizer_path):
+            if is_sdc_optimizer_owner and os.path.exists(optimizer_path):
                 optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
                 self._sdc_move_optimizer_state(optimizer, next(model.parameters()).device)
         return {"sdc_loaded": os.path.exists(state_path), "sdc_success_model_update_count": self._sdc_success_model_update_count, "sdc_failure_model_update_count": self._sdc_failure_model_update_count, "sdc_models_ready": self._sdc_models_ready, "success_buffer_state": state.get("success_buffer_state"), "failure_buffer_state": state.get("failure_buffer_state")}
