@@ -137,7 +137,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         sdc_global_batch_info["reduce_diagnostics"] = bool(
             sdc_config.get("distributed_metrics", False)
         )
-    if sdc_loss_active:
         for field in ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs"):
             if field in data:
                 fields.append(field)

@@ -379,6 +379,9 @@ class RayPPOTrainer:
         self.sdc_failure_model_update_count = 0
         self.sdc_models_ready = False
         self.sdc_parameter_metrics: dict[str, float] = {}
+        # Per-step shared row context (CPU token ids / lengths) for SDC
+        # marshalling; keyed by response-mask tensor identity.
+        self._sdc_row_ctx: dict | None = None
         # init_workers() initializes the SDC models before fit() loads a
         # checkpoint. Fresh workers therefore need a defined policy step; a
         # regular global_step_* checkpoint overwrites it in _load_checkpoint().
@@ -1337,7 +1340,8 @@ class RayPPOTrainer:
         self.actor_rollout_wg.init_model()
         if self.sdc_enabled:
             sdc_init_output = self._sdc_rank0_result(
-                self.actor_rollout_wg.sdc_init(self._sdc_config_dict()), operation="initialization"
+                self.actor_rollout_wg.sdc_init(self._sdc_config_dict(include_buffer_states=True)),
+                operation="initialization"
             )
             self.sdc_parameter_metrics = {
                 key: float(value)
@@ -1574,7 +1578,7 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.sdc_save_checkpoint(
                         os.path.join(self.config.trainer.default_local_dir, dir_name, "sdc"),
                         self.global_steps,
-                        self._sdc_config_dict(),
+                        self._sdc_config_dict(include_buffer_states=True),
                     )
         finally:
             self.checkpoint_manager.update_weights(self.global_steps)
@@ -1671,7 +1675,9 @@ class RayPPOTrainer:
         # optimizers, readiness counters, and pending buffers.
         if self.sdc_enabled:
             sdc_local_path = os.path.join(local_global_step_folder, "sdc")
-            self.actor_rollout_wg.sdc_save_checkpoint(sdc_local_path, self.global_steps, self._sdc_config_dict())
+            self.actor_rollout_wg.sdc_save_checkpoint(
+                sdc_local_path, self.global_steps, self._sdc_config_dict(include_buffer_states=True)
+            )
             self._sdc_sync_vllm_adapters()
         if self.avspo_state is not None:
             os.makedirs(local_global_step_folder, exist_ok=True)
@@ -1769,7 +1775,7 @@ class RayPPOTrainer:
         if self.sdc_enabled and os.path.isdir(sdc_local_path):
             print(f"Loading SDC state from {sdc_local_path}")
             sdc_load_output = self._sdc_rank0_result(
-                self.actor_rollout_wg.sdc_load(sdc_local_path, self._sdc_config_dict()),
+                self.actor_rollout_wg.sdc_load(sdc_local_path, self._sdc_config_dict(include_buffer_states=True)),
                 operation="checkpoint load",
             )
             self.sdc_success_model_update_count = int(
@@ -2137,8 +2143,8 @@ class RayPPOTrainer:
             "clip_ratio": float(self.sharpening_config.clip_ratio),
         }
 
-    def _sdc_config_dict(self) -> dict[str, Any]:
-        return {
+    def _sdc_config_dict(self, include_buffer_states: bool = False) -> dict[str, Any]:
+        config = {
             "enable": bool(self.sdc_config.enable),
             "beta": float(self.sdc_config.beta),
             "scoring_backend": str(self.sdc_config.scoring_backend),
@@ -2165,13 +2171,20 @@ class RayPPOTrainer:
             "sdc_failure_model_update_count": int(self.sdc_failure_model_update_count),
             "sdc_models_ready": bool(self.sdc_models_ready),
             "global_policy_step": int(self.global_steps),
-            "success_buffer_state": (
-                self.sdc_success_collector.state_dict() if self.sdc_success_collector is not None else None
-            ),
-            "failure_buffer_state": (
-                self.sdc_failure_collector.state_dict() if self.sdc_failure_collector is not None else None
-            ),
         }
+        # Outcome buffers are large; ship them only for checkpoint
+        # save/load/init round-trips, not on every per-step dispatch.
+        if include_buffer_states:
+            config["success_buffer_state"] = (
+                self.sdc_success_collector.state_dict() if self.sdc_success_collector is not None else None
+            )
+            config["failure_buffer_state"] = (
+                self.sdc_failure_collector.state_dict() if self.sdc_failure_collector is not None else None
+            )
+        # Optional sidecar execution knobs; absent attrs yield None.
+        config["sidecar_residency"] = getattr(self.sdc_config, "sidecar_residency", None)
+        config["sidecar_gradient_checkpointing"] = getattr(self.sdc_config, "sidecar_gradient_checkpointing", None)
+        return config
 
     def _sdc_select_payload(self, output):
         candidates = output if isinstance(output, list) else [output]
@@ -2223,32 +2236,81 @@ class RayPPOTrainer:
         batch.batch["sdc_outcome"] = outcome.to(device=batch.batch["response_mask"].device)
         batch.batch["sdc_failure_mask"] = ~batch.batch["sdc_outcome"]
 
-    def _sdc_build_vllm_score_inputs(self, batch: DataProto):
+    def _sdc_step_row_context(self, batch: DataProto) -> dict:
+        """Compute CPU token ids/lengths once per step and share them between
+        vLLM scoring input marshalling and outcome collection. The cache is
+        keyed by response-mask tensor identity so a new batch recomputes."""
+        response_mask_ref = batch.batch["response_mask"]
+        active_ref = batch.batch.get("sdc_failure_mask")
+        cached = self._sdc_row_ctx
+        if (
+            cached is not None
+            and cached["_ref_response_mask"] is response_mask_ref
+            and cached["_ref_active"] is active_ref
+        ):
+            return cached
         prompts = batch.batch["prompts"].detach().cpu()
         responses = batch.batch["responses"].detach().cpu()
         attention_mask = batch.batch["attention_mask"].detach().cpu()
-        response_mask = batch.batch["response_mask"].detach().cpu()
-        prompt_width = prompts.shape[-1]
-        sequences, prompt_lens, response_lens = [], [], []
+        response_mask = response_mask_ref.detach().cpu()
         active = batch.batch.get("sdc_failure_mask", torch.ones(prompts.shape[0], dtype=torch.bool)).detach().cpu()
+        prompt_width = prompts.shape[-1]
+        response_lens = response_mask.sum(-1)
+        active_indices = active.nonzero(as_tuple=False).squeeze(-1).tolist()
+        prompt_ids_per_row: list[list[int]] = []
+        sequence_ids_per_row: list[list[int]] = []
         for i in range(prompts.shape[0]):
-            if not bool(active[i]):
-                continue
-            prompt_ids = prompts[i][attention_mask[i, :prompt_width].bool()].tolist()
-            response_len = int(response_mask[i].sum().item())
-            sequences.append([int(x) for x in prompt_ids + responses[i, :response_len].tolist()])
-            prompt_lens.append(len(prompt_ids))
-            response_lens.append(response_len)
-        return sequences, prompt_lens, response_lens, active
+            prompt_ids = [int(x) for x in prompts[i][attention_mask[i, :prompt_width].bool()].tolist()]
+            prompt_ids_per_row.append(prompt_ids)
+            sequence_ids_per_row.append(
+                prompt_ids + [int(x) for x in responses[i, : int(response_lens[i].item())].tolist()]
+            )
+        self._sdc_row_ctx = {
+            "_ref_response_mask": response_mask_ref,
+            "_ref_active": active_ref,
+            "active": active,
+            "active_indices": active_indices,
+            "prompt_ids": prompt_ids_per_row,
+            "sequence_ids": sequence_ids_per_row,
+            "sequences": [sequence_ids_per_row[i] for i in active_indices],
+            "prompt_lens": [len(prompt_ids_per_row[i]) for i in active_indices],
+            "active_response_lens": [int(response_lens[i].item()) for i in active_indices],
+        }
+        return self._sdc_row_ctx
+
+    def _sdc_build_vllm_score_inputs(self, batch: DataProto):
+        ctx = self._sdc_step_row_context(batch)
+        return ctx["sequences"], ctx["prompt_lens"], ctx["active_response_lens"], ctx["active"]
 
     @staticmethod
-    def _sdc_rows_to_tensor(rows: list[list[float]], shape_template: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
-        output = torch.zeros_like(shape_template, dtype=torch.float32)
+    def _sdc_rows_to_tensor(
+        rows: list[list[float]],
+        shape_template: torch.Tensor,
+        active: torch.Tensor,
+        expected_lens: list[int],
+    ) -> torch.Tensor:
+        # Build on CPU (pinned when CUDA is available) and copy once to avoid
+        # one tiny H2D transfer per row.
+        pin_memory = shape_template.is_cuda and torch.cuda.is_available()
+        output = torch.zeros(
+            (shape_template.shape[0], shape_template.shape[-1]),
+            dtype=torch.float32,
+            pin_memory=pin_memory,
+        )
         indices = active.nonzero(as_tuple=False).squeeze(-1).tolist()
+        row_lens = torch.tensor([len(row) for row in rows], dtype=torch.long)
+        expected = torch.tensor(expected_lens, dtype=torch.long)
+        mismatches = (row_lens != expected).nonzero(as_tuple=False).squeeze(-1)
+        if mismatches.numel() > 0:
+            first = int(mismatches[0].item())
+            raise ValueError(
+                f"SDC scoring returned a row of wrong length for index {indices[first]}: "
+                f"expected {int(expected[first].item())} (response token count), "
+                f"got {int(row_lens[first].item())}."
+            )
         for row, index in zip(rows, indices, strict=True):
-            values = torch.tensor(row, dtype=torch.float32, device=output.device)
-            output[index, : values.numel()] = values
-        return output
+            output[index, : len(row)] = torch.as_tensor(row, dtype=torch.float32)
+        return output.to(device=shape_template.device, non_blocking=pin_memory)
 
     def _sdc_compute_vllm_log_probs_multi(self, batch: DataProto) -> dict[str, torch.Tensor]:
         sequences, prompt_lens, response_lens, active = self._sdc_build_vllm_score_inputs(batch)
@@ -2262,7 +2324,10 @@ class RayPPOTrainer:
             adapters=("success", "failure"),
         )
         shape = batch.batch["response_mask"]
-        return {name: self._sdc_rows_to_tensor(rows[name], shape, active) for name in ("success", "failure")}
+        return {
+            name: self._sdc_rows_to_tensor(rows[name], shape, active, response_lens)
+            for name in ("success", "failure")
+        }
 
     def _sdc_compute_model_log_probs(self, batch: DataProto) -> None:
         shape = batch.batch["response_mask"]
@@ -2290,24 +2355,17 @@ class RayPPOTrainer:
         if not self.sdc_enabled or self.sdc_success_collector is None or self.sdc_failure_collector is None:
             return 0, 0
         outcome = validate_sdc_outcome(batch.batch["sdc_outcome"]).cpu().tolist()
-        prompts = batch.batch["prompts"].detach().cpu()
-        responses = batch.batch["responses"].detach().cpu()
-        attention_mask = batch.batch["attention_mask"].detach().cpu()
-        response_mask = batch.batch["response_mask"].detach().cpu()
+        ctx = self._sdc_step_row_context(batch)
         uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [""] * len(outcome))]
         success_count = failure_count = 0
-        prompt_width = prompts.shape[-1]
         for i, reward in enumerate(outcome):
-            response_len = int(response_mask[i].sum().item())
-            prompt_ids = prompts[i][attention_mask[i, :prompt_width].bool()].tolist()
-            response_ids = responses[i, :response_len].tolist()
             row = dict(
                 # Keep empty text placeholders for compatibility with older
                 # checkpoints; SFT consumes the IDs directly when present.
                 prompt="",
                 response="",
-                prompt_ids=[int(token) for token in prompt_ids],
-                response_ids=[int(token) for token in response_ids],
+                prompt_ids=list(ctx["prompt_ids"][i]),
+                response_ids=ctx["sequence_ids"][i][len(ctx["prompt_ids"][i]) :],
                 reward=int(reward),
                 metadata={"uid": uids[i], "global_policy_step": self.global_steps},
             )
@@ -2328,6 +2386,20 @@ class RayPPOTrainer:
         failure_records = self.sdc_failure_collector.to_records()
         if not success_records and not failure_records:
             return {"sdc/did_sft_update_this_step": 0.0, "sdc/sft_skipped_empty": 1.0}
+        # Replicate the worker-side _sdc_match_records selection exactly so only
+        # the consumed prefix is dispatched to every rank. The worker keeps its
+        # own trim as a safety net and must select identical records.
+        max_prompt_length = int(self.config.data.get("max_prompt_length", 1024))
+        max_response_length = int(self.config.data.get("max_response_length", 2048))
+        token_budget = int(getattr(self.sdc_config, "sft_max_token_len_per_gpu", 0) or 0)
+        max_length = max_prompt_length + max_response_length
+        batch_size = int(self.sdc_config.sft_batch_size)
+        if token_budget > 0:
+            batch_size = min(batch_size, max(1, token_budget // max_length))
+        max_examples = batch_size * int(self.sdc_config.sft_max_updates_per_interval)
+        paired_count = min(len(success_records), len(failure_records), max_examples)
+        success_records = success_records[:paired_count]
+        failure_records = failure_records[:paired_count]
         output = self.actor_rollout_wg.sdc_sft_update(success_records, failure_records, self._sdc_config_dict())
         metrics = self._sdc_rank0_result(output, operation="SFT")
         success_updates = int(metrics.get("sdc/success_sft_updates", 0.0))

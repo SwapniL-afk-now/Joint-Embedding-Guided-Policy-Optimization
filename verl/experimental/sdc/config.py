@@ -31,6 +31,21 @@ class SDCConfig:
     sft_max_updates_per_interval: int = 1
     fused_adamw: bool = False
 
+    # Sidecar residency policy. 'auto_offload' (default) moves both SDC sidecar
+    # clones back to host memory after every scoring/SFT pass; this matches the
+    # historical behavior exactly. 'resident' keeps the clones on the actor GPU
+    # across scoring/SFT calls until an explicit release point; trainers using
+    # resident mode MUST call the actor engine's sdc_release_residency()
+    # method before vLLM wake-up / rollout weight sync, otherwise vLLM will
+    # not have enough free GPU memory.
+    sidecar_residency: str = "auto_offload"
+    # Sidecar gradient-checkpointing override. None (default) inherits the
+    # actor model's gradient-checkpointing setting, matching historical
+    # behavior. Explicit True/False enables/disables activation
+    # checkpointing on the two SDC sidecar clones ONLY; the actor module is
+    # never touched. Recompute-or-not is numerically identical for scoring.
+    sidecar_gradient_checkpointing: Optional[bool] = None
+
     data_max_size: Optional[int] = None
     data_sampling: str = "recent"
     save_to_disk_interval_policy_steps: int = 0
@@ -45,6 +60,13 @@ class SDCConfig:
             raise ValueError(
                 f"custom_sdc.base_mix_gamma must be in [0, 1], got {self.base_mix_gamma}."
             )
+        if self.sidecar_residency not in {"auto_offload", "resident"}:
+            raise ValueError(
+                "custom_sdc.sidecar_residency must be 'auto_offload' or 'resident', "
+                f"got {self.sidecar_residency!r}."
+            )
+        if self.sidecar_gradient_checkpointing is not None:
+            self.sidecar_gradient_checkpointing = bool(self.sidecar_gradient_checkpointing)
 
     @classmethod
     def from_config(cls, config: DictConfig | dict[str, Any] | None) -> SDCConfig:

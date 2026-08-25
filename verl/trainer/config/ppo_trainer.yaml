@@ -170,6 +170,18 @@ custom_sdc:
   save_to_disk_interval_policy_steps: 0
   loss_agg_mode: token-mean
   distributed_metrics: false
+  # Sidecar residency policy for the two SDC reference clones.
+  # 'auto_offload' (default) moves both clones to host memory after every
+  # scoring/SFT pass: historical behavior, no vLLM wake-up coordination needed.
+  # 'resident' keeps the clones on the actor GPU across scoring/SFT calls to
+  # avoid per-pass H2D/D2H churn; the trainer MUST call the actor engine's
+  # sdc_release_residency() hook before waking vLLM / syncing rollout weights.
+  sidecar_residency: auto_offload
+  # Gradient checkpointing for the two SDC sidecar clones ONLY.
+  # null inherits the actor model's gradient-checkpointing setting (default,
+  # historical behavior). Set true/false to force it on/off for the sidecars;
+  # the actor module is never touched and numerics are unchanged.
+  sidecar_gradient_checkpointing: null
 
 # config for Sequence Sharpening GRPO
 custom_sharpening_grpo:

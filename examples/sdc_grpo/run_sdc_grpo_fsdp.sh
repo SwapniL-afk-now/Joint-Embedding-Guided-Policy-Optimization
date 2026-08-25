@@ -187,6 +187,14 @@ SDC_SAVE_TO_DISK_INTERVAL=${SDC_SAVE_TO_DISK_INTERVAL:-0}
 SDC_DATA_MAX_SIZE=${SDC_DATA_MAX_SIZE:-8192}
 SDC_DATA_SAMPLING=${SDC_DATA_SAMPLING:-recent}
 SDC_FUSED_ADAMW=${SDC_FUSED_ADAMW:-true}
+# Sidecar residency: '' (unset) -> library default 'auto_offload' (per-pass CPU
+# offload, historical behavior). 'resident' keeps the SDC clones on the actor
+# GPU across scoring/SFT; only use it with a trainer that calls
+# sdc_release_residency() before vLLM wake-up.
+SDC_SIDECAR_RESIDENCY=${SDC_SIDECAR_RESIDENCY:-}
+# Sidecar gradient checkpointing: '' (unset) -> library default null (inherit
+# the actor setting). 'true'/'false' force it on/off for the SDC clones only.
+SDC_SIDECAR_GRADIENT_CHECKPOINTING=${SDC_SIDECAR_GRADIENT_CHECKPOINTING:-}
 
 # Match the GXPO actor optimization stack. These are explicit launcher
 # settings rather than relying on model/config defaults.
@@ -470,6 +478,17 @@ SDC=(
     custom_sdc.fused_adamw="${SDC_FUSED_ADAMW}"
     custom_sdc.distributed_metrics="${SDC_DISTRIBUTED_METRICS}"
 )
+
+if [[ -n "${SDC_SIDECAR_RESIDENCY}" ]]; then
+    SDC+=(
+        custom_sdc.sidecar_residency="${SDC_SIDECAR_RESIDENCY}"
+    )
+fi
+if [[ -n "${SDC_SIDECAR_GRADIENT_CHECKPOINTING}" ]]; then
+    SDC+=(
+        custom_sdc.sidecar_gradient_checkpointing="${SDC_SIDECAR_GRADIENT_CHECKPOINTING}"
+    )
+fi
 
 WASSERSTEIN=(
     actor_rollout_ref.actor.wasserstein_guidance.enable=${WG_ENABLE}
