@@ -17,6 +17,8 @@ def _zero_metrics() -> dict[str, float]:
         "sdc/contrast_p90": 0.0,
         "sdc/contrast_max": 0.0,
         "sdc/contrast_sequence_mean": 0.0,
+        "sdc/contrast_center": 0.0,
+        "sdc/contrast_rms": 0.0,
     }
 
 
@@ -64,6 +66,8 @@ def compute_sdc_loss(
     use_importance_weight: bool = True,
     importance_weight_clip: float = 10.0,
     models_ready: bool = True,
+    use_centering: bool = False,
+    use_scale_normalize: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the locked SDC auxiliary on failed response tokens only.
 
@@ -116,7 +120,26 @@ def compute_sdc_loss(
         ratio_a = clipped_ratio_a
 
     # Locked algebra: + beta E[pi_theta/pi_old * log(pi_F/pi_S)].
-    token_loss_a = ratio_a * (failure_a - success_a)
+    contrast = failure_a - success_a
+    contrast_center_t = torch.zeros((), device=log_prob.device, dtype=torch.float32)
+    contrast_rms_t = torch.zeros((), device=log_prob.device, dtype=torch.float32)
+    if use_centering or use_scale_normalize:
+        # Opt-in normalization over the SAME active mask used by the loss sum.
+        # Statistics are detached: they rescale the gradient, never feed it.
+        norm_mask = resp.to(log_prob.dtype)
+        norm_count = norm_mask.sum().clamp_min(1.0)
+        if use_centering:
+            # Strip the common-mode offset of log(pi_F/pi_S); sign structure
+            # is preserved and the uniform failed-token-mass gradient that
+            # overlaps the KL-to-old term is removed.
+            contrast_center_t = (contrast.detach() * norm_mask).sum() / norm_count
+            contrast = contrast - contrast_center_t
+        if use_scale_normalize:
+            # Applied after centering so beta stays scale-stable as the
+            # teacher gap sharpens.
+            contrast_rms_t = ((contrast.detach() ** 2) * norm_mask).sum().div(norm_count).sqrt().clamp_min(1e-8)
+            contrast = contrast / contrast_rms_t
+    token_loss_a = ratio_a * contrast
     local_count = resp.to(log_prob.dtype).sum()
     if precomputed_count is not None:
         count = torch.as_tensor(precomputed_count, device=log_prob.device, dtype=log_prob.dtype)
@@ -185,9 +208,25 @@ def compute_sdc_loss(
     sequence_mean_t = metric_sums[6] / metric_sums[7].clamp_min(1.0)
     # One further host sync batches the quantiles, the max, and the sequence mean.
     tail = torch.stack(
-        [q[0], q[1], q[2], global_contrast_max.reshape(()), sequence_mean_t.to(torch.float32).reshape(())]
+        [
+            q[0],
+            q[1],
+            q[2],
+            global_contrast_max.reshape(()),
+            sequence_mean_t.to(torch.float32).reshape(()),
+            contrast_center_t.to(torch.float32).reshape(()),
+            contrast_rms_t.to(torch.float32).reshape(()),
+        ]
     ).detach()
-    contrast_p10, contrast_p50, contrast_p90, contrast_max, contrast_sequence_mean = tail.cpu().tolist()
+    (
+        contrast_p10,
+        contrast_p50,
+        contrast_p90,
+        contrast_max,
+        contrast_sequence_mean,
+        contrast_center,
+        contrast_rms,
+    ) = tail.cpu().tolist()
     metrics = {
         "sdc/loss": float(beta) * global_token_loss_sum / global_active_count,
         "sdc/active_token_fraction": global_active_count / global_response_count,
@@ -199,6 +238,8 @@ def compute_sdc_loss(
         "sdc/contrast_p90": contrast_p90,
         "sdc/contrast_max": contrast_max,
         "sdc/contrast_sequence_mean": contrast_sequence_mean,
+        "sdc/contrast_center": contrast_center,
+        "sdc/contrast_rms": contrast_rms,
     }
     return loss, metrics
 

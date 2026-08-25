@@ -195,6 +195,10 @@ SDC_SIDECAR_RESIDENCY=${SDC_SIDECAR_RESIDENCY:-}
 # Sidecar gradient checkpointing: '' (unset) -> library default null (inherit
 # the actor setting). 'true'/'false' force it on/off for the SDC clones only.
 SDC_SIDECAR_GRADIENT_CHECKPOINTING=${SDC_SIDECAR_GRADIENT_CHECKPOINTING:-}
+# Algorithm-strength variants (default unset -> locked legacy behavior).
+SDC_MATCH_PROMPTS=${SDC_MATCH_PROMPTS:-}
+SDC_CONTRAST_CENTERING=${SDC_CONTRAST_CENTERING:-}
+SDC_CONTRAST_SCALE_NORMALIZE=${SDC_CONTRAST_SCALE_NORMALIZE:-}
 
 # Match the GXPO actor optimization stack. These are explicit launcher
 # settings rather than relying on model/config defaults.
@@ -487,6 +491,24 @@ fi
 if [[ -n "${SDC_SIDECAR_GRADIENT_CHECKPOINTING}" ]]; then
     SDC+=(
         custom_sdc.sidecar_gradient_checkpointing="${SDC_SIDECAR_GRADIENT_CHECKPOINTING}"
+    )
+fi
+
+# Algorithm-strength variants. These change training dynamics (not the actor
+# loss algebra); A/B them against the default before adopting.
+if [[ -n "${SDC_MATCH_PROMPTS}" ]]; then
+    SDC+=(
+        custom_sdc.match_prompts="${SDC_MATCH_PROMPTS}"
+    )
+fi
+if [[ -n "${SDC_CONTRAST_CENTERING}" ]]; then
+    SDC+=(
+        custom_sdc.contrast_centering="${SDC_CONTRAST_CENTERING}"
+    )
+fi
+if [[ -n "${SDC_CONTRAST_SCALE_NORMALIZE}" ]]; then
+    SDC+=(
+        custom_sdc.contrast_scale_normalize="${SDC_CONTRAST_SCALE_NORMALIZE}"
     )
 fi
 

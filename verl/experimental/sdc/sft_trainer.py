@@ -70,6 +70,72 @@ def pair_outcome_records(success_records: list[dict], failure_records: list[dict
     return success_records[:count], failure_records[:count]
 
 
+def pair_outcome_records_prompt_matched(
+    success_records: list[dict],
+    failure_records: list[dict],
+    *,
+    max_examples: int,
+):
+    """Pair success/failure records so both buffers share the same prompts.
+
+    Records are insertion-ordered (append = newer). Each failure record is
+    scanned from NEWEST to OLDEST and paired with the newest unused success
+    record carrying the same ``metadata.uid``. Records without a uid never
+    match. Leftover budget is filled from the unmatched remainder of each
+    buffer in legacy prefix order while keeping counts equal. Returned lists
+    are sorted by original buffer position and always have equal length.
+    """
+    if not success_records or not failure_records or max_examples <= 0:
+        return [], []
+
+    def _uid(record: dict):
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        return metadata.get("uid")
+
+    used_success = [False] * len(success_records)
+    used_failure = [False] * len(failure_records)
+    matched_pairs: list[tuple[int, int]] = []
+
+    # Newest-to-oldest failure scan; inner scan also newest-first.
+    for failure_index in range(len(failure_records) - 1, -1, -1):
+        if len(matched_pairs) >= max_examples:
+            break
+        uid = _uid(failure_records[failure_index])
+        if uid is None:
+            continue
+        for success_index in range(len(success_records) - 1, -1, -1):
+            if used_success[success_index]:
+                continue
+            if _uid(success_records[success_index]) != uid:
+                continue
+            used_success[success_index] = True
+            used_failure[failure_index] = True
+            matched_pairs.append((success_index, failure_index))
+            break
+
+    if not matched_pairs:
+        # No uid overlap anywhere: fall back to exact legacy behavior.
+        return pair_outcome_records(success_records, failure_records, max_examples=max_examples)
+
+    # Fill leftover budget from the unmatched remainders in prefix order,
+    # keeping success/failure counts equal.
+    remaining_budget = max_examples - len(matched_pairs)
+    unmatched_success = [index for index, used in enumerate(used_success) if not used]
+    unmatched_failure = [index for index, used in enumerate(used_failure) if not used]
+    fill_count = min(remaining_budget, len(unmatched_success), len(unmatched_failure))
+    for offset in range(fill_count):
+        matched_pairs.append((unmatched_success[offset], unmatched_failure[offset]))
+
+    # Restore buffer order for downstream determinism.
+    matched_pairs.sort()
+    return (
+        [success_records[index] for index, _ in matched_pairs],
+        [failure_records[index] for _, index in matched_pairs],
+    )
+
+
 class OutcomeSFTTrainer:
     def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer):
         self.model, self.optimizer = model, optimizer
