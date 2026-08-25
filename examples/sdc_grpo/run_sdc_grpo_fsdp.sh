@@ -46,6 +46,46 @@ fi
 # pair.
 export CUDA_VISIBLE_DEVICES=0,1
 
+# ══════════════════════════════════════════════════════════════════════════
+# RUN CONFIGURATION — edit this block to change the campaign.
+# Everything the run needs is set here (env/.env still win if you export
+# a variable before launching). Values below = the frozen 1.5B reference
+# campaign: batch 256 x 8 rollouts, minibatch 64, 2x Blackwell 6000,
+# full-parameter SDC with HF scoring. Do not add new knobs; edit values.
+# ══════════════════════════════════════════════════════════════════════════
+: "${MODEL_PATH:=/models/Qwen2.5-Math-1.5B-Instruct}"          # ← EDIT: local model dir
+: "${GXPO_DATA_ROOT:=/data/sdc}"                                # ← EDIT: parquet root
+: "${TRAIN_DAPO_FILE:=${GXPO_DATA_ROOT}/dapo_math/train.parquet}"
+: "${TRAIN_LIGHTEVAL_FILE:=${GXPO_DATA_ROOT}/lighteval-math/train.parquet}"
+: "${NNODES:=1}"
+: "${NDEVICES_PER_NODE:=2}"
+
+: "${TRAIN_PROMPT_BATCH_SIZE:=256}"      # prompts per step
+: "${NUM_GENERATIONS:=8}"                # rollouts per prompt -> 2048 rows/step
+: "${PPO_MINI_BATCH_SIZE:=64}"           # 4 optimizer slices; see note below
+: "${MAX_PROMPT_LENGTH:=1024}"
+: "${MAX_RESPONSE_LENGTH:=3072}"
+: "${MODEL_DTYPE:=fp32}"                 # fp32 master weights, BF16 compute
+: "${ACTOR_ATTENTION_IMPL:=flash_attention_2}"
+: "${ROLLOUT_MAX_NUM_SEQS:=1024}"
+: "${SAVE_FREQ:=20}"
+: "${TEST_FREQ:=5}"
+
+# SDC (single recipe, no variant flags). beta is the only algorithm knob.
+: "${SDC_BETA:=0.5}"
+: "${SDC_BASE_MIX_GAMMA:=0.9}"
+: "${SDC_MIN_SFT_UPDATES_BEFORE_USE:=2}"
+: "${SDC_SFT_UPDATE_INTERVAL:=5}"
+: "${SDC_CHECKPOINT_INTERVAL:=20}"
+: "${SDC_SFT_LR:=1.0e-5}"
+: "${SDC_DATA_MAX_SIZE:=8192}"
+: "${SDC_SCORING_BACKEND:=hf}"           # hf = full-parameter teachers
+: "${SDC_DISTRIBUTED_METRICS:=false}"
+# Performance-only toggles; flip after confirming VRAM headroom:
+: "${SDC_SIDECAR_RESIDENCY:=auto_offload}"
+: "${SDC_SIDECAR_GRADIENT_CHECKPOINTING:=}"
+# ══════════════════════════════════════════════════════════════════════════
+
 # Use the same local model and prepared parquet assets as the GXPO reference
 # launcher. These paths remain overridable for another machine.
 GXPO_REFERENCE_ROOT=${GXPO_REFERENCE_ROOT:-${WORKSPACE_ROOT}/gradient-extrapolation-based-policy-optimization-gxpo-speed-audit}
@@ -124,11 +164,9 @@ PROJECT_NAME=${PROJECT_NAME:-verl_sdc_deepscaler}
 export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
 export WANDB_SILENT=${WANDB_SILENT:-true}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
-# Default model/data/benchmark settings mirror the GXPO reference launcher.
+# Defaults for anything the RUN CONFIGURATION block above left unset.
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-sdc_${BASE_ALGO:-drgrpo}_qwen25math_1_5b-${RUN_TIMESTAMP}}
 MODEL_PATH=${MODEL_PATH:-${GXPO_REFERENCE_ROOT}/models/Qwen2.5-Math-1.5B-Instruct}
-NNODES=${NNODES:-1}
-NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-2}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-2}
 ROLLOUT_AGENT_NUM_WORKERS=${ROLLOUT_AGENT_NUM_WORKERS:-1}
 
