@@ -17,6 +17,31 @@ def clone_frozen_state(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Ten
     }
 
 
+def pin_base_state_once(base_state: dict) -> bool:
+    """Lazily pin CPU base tensors so mixing can issue async H2D copies.
+
+    Pinning happens at first mix rather than snapshot creation: snapshots are
+    also embedded into checkpoint payloads where pageable host memory is fine,
+    and this keeps one-time pinning costs off cold paths. Dropping the
+    snapshot later releases the pinned pages through ordinary garbage
+    collection (PyTorch has no separate unpin operation).
+
+    Returns True when the caller may use ``non_blocking=True`` copies.
+    """
+
+    if not torch.cuda.is_available():
+        return False
+    for name, value in list(base_state.items()):
+        if torch.is_tensor(value) and value.device.type == "cpu" and not value.is_pinned():
+            try:
+                base_state[name] = value.pin_memory()
+            except RuntimeError:
+                # Pinned-allocator exhaustion or no accessible CUDA context:
+                # fall back to synchronous transfers for everything after.
+                return False
+    return True
+
+
 @torch.no_grad()
 def mix_state_with_base(
     destination_state: Mapping[str, torch.Tensor],
@@ -27,18 +52,22 @@ def mix_state_with_base(
 
     Floating tensors use ``gamma * destination + (1 - gamma) * base``.  Other
     tensors are copied from the common base, avoiding arithmetic on integer
-    buffers while keeping both branches deterministic.
+    buffers while keeping both branches deterministic. Base tensors are pinned
+    once (lazily) and copied to the destination device with non-blocking H2D
+    transfers; the fp32 accumulation below runs on the same stream, so dtype,
+    order of operations, and numerics are identical to synchronous copies.
     """
 
     gamma = float(gamma)
     if not 0.0 <= gamma <= 1.0:
         raise ValueError(f"SDC base_mix_gamma must be in [0, 1], got {gamma}.")
 
+    non_blocking = isinstance(base_state, dict) and pin_base_state_once(base_state)
     for name, destination in destination_state.items():
         base = base_state.get(name)
         if base is None or not torch.is_tensor(destination):
             continue
-        base_on_destination = base.to(device=destination.device)
+        base_on_destination = base.to(device=destination.device, non_blocking=non_blocking)
         if torch.is_floating_point(destination):
             # Use a temporary higher-precision accumulator without changing
             # the destination parameter/buffer dtype.
@@ -70,8 +99,16 @@ def build_sdc_checkpoint_state(
     base_mix_gamma: float,
     success_buffer_state=None,
     failure_buffer_state=None,
+    base_saved: bool = False,
+    base_global_step: int | None = None,
 ) -> dict:
-    """Build the replicated SDC sidecar payload used by FSDP/FSDP2."""
+    """Build the replicated SDC sidecar payload used by FSDP/FSDP2.
+
+    Slim full-parameter checkpoints pass ``base_state=None`` together with
+    ``base_saved=True`` and ``base_global_step`` referencing the earlier save
+    that embedded ``sdc_base_state_cpu``. Old payloads without those keys load
+    exactly as before.
+    """
 
     return {
         "global_step": int(global_step),
@@ -86,4 +123,6 @@ def build_sdc_checkpoint_state(
         "sdc_adapter_only": bool(adapter_only),
         "success_buffer_state": success_buffer_state,
         "failure_buffer_state": failure_buffer_state,
+        "base_saved": bool(base_saved),
+        "base_global_step": None if base_global_step is None else int(base_global_step),
     }

@@ -16,8 +16,10 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
 import gc
+import hashlib
 import logging
 import os
+import time
 import warnings
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional
@@ -108,6 +110,22 @@ def sdc_cast_state_to_dest(state: dict, dest_state: dict, param_dtype, device):
         else v.to(device)
         for k, v in state.items()
     }
+def sdc_layout_digest(entries: list[tuple[str, torch.Tensor]], include_optimizer: bool) -> int:
+    """Order-sensitive sha256 digest over entry name/dtype/shape strings.
+
+    Used to validate SDC synchronization layouts without shipping the whole
+    layout list every refresh. The first 8 bytes are interpreted as a signed
+    int64 so two ranks can compare digests with one tiny MIN/MAX all-reduce.
+    """
+
+    hasher = hashlib.sha256()
+    hasher.update(f"sdc-layout-v1|{int(bool(include_optimizer))}|".encode())
+    for name, tensor in entries:
+        hasher.update(name.encode())
+        hasher.update(f"|{tensor.dtype}|{tuple(tensor.shape)}|{tensor.device.type}".encode())
+    return int.from_bytes(hasher.digest()[:8], "big", signed=True)
+
+
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
@@ -745,6 +763,33 @@ class FSDPEngine(BaseEngine):
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
+    def _sdc_is_rank_zero(self) -> bool:
+        return not (torch.distributed.is_available() and torch.distributed.is_initialized()) or (
+            torch.distributed.get_rank() == 0
+        )
+
+    def _sdc_record_timing(self, key: str, start: float | None, accumulate: bool = False) -> None:
+        """Record one wall-clock phase duration in ms on rank zero only.
+
+        Nonzero ranks do nothing beyond their existing collectives.
+        """
+
+        if start is None or not self._sdc_is_rank_zero():
+            return
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        timings = getattr(self, "_sdc_phase_timings", None)
+        if timings is None:
+            timings = self._sdc_phase_timings = {}
+        timings[key] = timings.get(key, 0.0) + elapsed_ms if accumulate else elapsed_ms
+
+    def _sdc_timing_metrics(self, *keys: str) -> dict[str, float]:
+        """Expose recorded phase timings as trainer-metric float keys."""
+
+        if not self._sdc_is_rank_zero():
+            return {}
+        timings = getattr(self, "_sdc_phase_timings", None) or {}
+        return {f"sdc/timing/{key}": float(timings.get(key, 0.0)) for key in keys}
+
     def _sdc_actor_state_cpu(self) -> dict[str, torch.Tensor]:
         def to_cpu(value):
             full = value.full_tensor() if hasattr(value, "full_tensor") else value
@@ -981,6 +1026,9 @@ class FSDPEngine(BaseEngine):
         state = self._sdc_actor_state_cpu()
         self._sdc_base_state_cpu = clone_frozen_state(state)
         self._sdc_base_adapter_state_cpu = None
+        # Fresh base snapshot: the next checkpoint save embeds it again and
+        # re-anchors the slim-checkpoint marker chain.
+        self._sdc_saved_base_global_step = None
         self._sdc_base_mix_gamma = float(sdc_config.get("base_mix_gamma", 0.9))
         if not 0.0 <= self._sdc_base_mix_gamma <= 1.0:
             raise ValueError(
@@ -1062,6 +1110,7 @@ class FSDPEngine(BaseEngine):
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
         config = tu.get_non_tensor_data(data=data, key="custom_sdc", default={}) or {}
         self.sdc_init(config)
+        scoring_start = time.perf_counter() if self._sdc_is_rank_zero() else None
         padded = data.to_padded_tensor()
         device = next(self.module.parameters()).device
         ids = padded["input_ids"].to(device)
@@ -1075,10 +1124,33 @@ class FSDPEngine(BaseEngine):
             # move is idempotent, so results are bitwise identical.
             self._sdc_prepare_models()
             active_ids, active_attention, active_response = ids[active], attention[active], response[active]
-            success[active] = self._sdc_model_log_probs(self._sdc_success, active_ids, active_attention, active_response)
-            failure[active] = self._sdc_model_log_probs(self._sdc_failure, active_ids, active_attention, active_response)
+            active_index = active.nonzero(as_tuple=True)[0]
+            # Score active rows in bounded batch chunks instead of one dense
+            # forward over every row padded to the global max length. Rows are
+            # independent under no_grad and the padded width is unchanged, so
+            # per-row log-probs are bitwise identical to the single-pass result.
+            micro_batch_size = int(config.get("vllm_score_micro_batch_size", 0) or 0)
+            if micro_batch_size <= 0:
+                micro_batch_size = 8
+            total_active = active_ids.shape[0]
+            for start in range(0, total_active, micro_batch_size):
+                end = min(start + micro_batch_size, total_active)
+                rows = slice(start, end)
+                success[active_index[rows]] = self._sdc_model_log_probs(
+                    self._sdc_success, active_ids[rows], active_attention[rows], active_response[rows]
+                )
+                failure[active_index[rows]] = self._sdc_model_log_probs(
+                    self._sdc_failure, active_ids[rows], active_attention[rows], active_response[rows]
+                )
             self._sdc_release_models()
-        return TensorDict({"sdc_success_log_probs": success, "sdc_failure_log_probs": failure}, batch_size=[ids.shape[0]])
+        self._sdc_record_timing("scoring_ms", scoring_start)
+        output = TensorDict(
+            {"sdc_success_log_probs": success, "sdc_failure_log_probs": failure}, batch_size=[ids.shape[0]]
+        )
+        # Scoring returns tensors rather than a metrics dict; carry the rank-0
+        # timing as non-tensor data so callers can surface it if desired.
+        tu.assign_non_tensor_data(output, "sdc/timing/scoring_ms", float((getattr(self, "_sdc_phase_timings", {}) or {}).get("scoring_ms", 0.0)))
+        return output
 
     def _sdc_get_tokenizer(self):
         if self._sdc_tokenizer is None:
@@ -1153,20 +1225,48 @@ class FSDPEngine(BaseEngine):
 
         # Fail before launching tensor broadcasts if ranks disagree on model
         # or optimizer state. Otherwise a first-refresh mismatch can hang NCCL.
-        layout = [
-            (name, tensor.device.type, str(tensor.dtype), tensor.numel())
-            for name, tensor in entries
-        ]
-        layouts: list[list[tuple[str, str, str, int]] | None] = [
-            None
-        ] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(layouts, layout)
-        if any(candidate != layout for candidate in layouts):
-            mismatch_rank = next(index for index, candidate in enumerate(layouts) if candidate != layout)
-            raise RuntimeError(
-                "SDC synchronization layout differs across ranks; "
-                f"local rank {torch.distributed.get_rank()} does not match rank {mismatch_rank}."
-            )
+        # The full all_gather_object comparison runs ONLY on the first refresh;
+        # afterwards an order-sensitive sha256 digest compared through one tiny
+        # int64 MIN/MAX all-reduce validates the layout at negligible cost.
+        cache = getattr(self, "_sdc_layout_digest_cache", None)
+        if cache is None:
+            cache = self._sdc_layout_digest_cache = {}
+        cached_digest = cache.get(bool(include_optimizer))
+        local_digest = sdc_layout_digest(entries, include_optimizer)
+        backend = str(torch.distributed.get_backend()).lower()
+        token_device = get_device_id() if "nccl" in backend else "cpu"
+        # Pack [digest, -digest]; one MIN all-reduce yields both the global min
+        # and (negated) the global max. Agreement means every rank matched.
+        token = torch.tensor([local_digest, -local_digest], dtype=torch.int64, device=token_device)
+        torch.distributed.all_reduce(token, op=torch.distributed.ReduceOp.MIN)
+        digests_agree = int(token[0].item()) == -int(token[1].item())
+        if not digests_agree or cached_digest is None:
+            layout = [(name, tensor.device.type, str(tensor.dtype), tensor.numel()) for name, tensor in entries]
+            if cached_digest is None:
+                # First refresh with this configuration: validate fully so any
+                # mismatch is reported against the exact offending rank.
+                layouts: list[list[tuple[str, str, str, int]] | None] = [
+                    None
+                ] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(layouts, layout)
+                if any(candidate != layout for candidate in layouts):
+                    mismatch_rank = next(index for index, candidate in enumerate(layouts) if candidate != layout)
+                    raise RuntimeError(
+                        "SDC synchronization layout differs across ranks; "
+                        f"local rank {torch.distributed.get_rank()} does not match rank {mismatch_rank}."
+                    )
+                if not digests_agree:
+                    raise RuntimeError(
+                        "SDC synchronization layout digests disagree across ranks even though "
+                        f"rank {torch.distributed.get_rank()} gathered identical layouts."
+                    )
+                cache[bool(include_optimizer)] = local_digest
+            else:
+                raise RuntimeError(
+                    "SDC synchronization layout hash differs across ranks; "
+                    f"local rank {torch.distributed.get_rank()} digest {local_digest:#018x} "
+                    f"disagrees with the group (min {int(token[0].item()):#018x})."
+                )
 
         grouped: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
         for _, tensor in entries:
@@ -1175,35 +1275,58 @@ class FSDPEngine(BaseEngine):
             grouped.setdefault((tensor.device, tensor.dtype), []).append(tensor)
 
         rank = torch.distributed.get_rank()
-        backend = str(torch.distributed.get_backend()).lower()
         max_chunk_bytes = int(getattr(self, "_sdc_sync_chunk_bytes", 64 * 1024 * 1024))
         if max_chunk_bytes <= 0:
             raise ValueError("SDC synchronization chunk size must be positive.")
+        staging_buffers: dict[tuple, torch.Tensor] = getattr(self, "_sdc_staging_buffers", None) or {}
+        self._sdc_staging_buffers = staging_buffers
 
         with torch.no_grad():
             for (device, dtype), grouped_tensors in sorted(
                 grouped.items(), key=lambda item: (item[0][0].type, item[0][0].index or -1, str(item[0][1]))
             ):
                 max_chunk_elements = max(1, max_chunk_bytes // torch.empty((), dtype=dtype).element_size())
+                # One persistent pinned staging buffer per (device, dtype)
+                # group, reused across flushes instead of fresh torch.cat
+                # allocations. Chunk ordering and broadcast semantics are
+                # unchanged; only the temporary allocation is removed.
+                group_key = ("staging", str(device), str(dtype))
+                staged = staging_buffers.get(group_key)
+                if staged is None or staged.numel() != max_chunk_elements:
+                    staged = torch.empty(max_chunk_elements, dtype=dtype, device=device)
+                    if device.type == "cpu" and torch.cuda.is_available():
+                        staged = staged.pin_memory()
+                    staging_buffers[group_key] = staged
+                relayed = None
+                if device.type == "cpu" and "nccl" in backend:
+                    relay_key = ("relay", str(device), str(dtype))
+                    relayed = staging_buffers.get(relay_key)
+                    if relayed is None or relayed.numel() != max_chunk_elements:
+                        relayed = torch.empty(max_chunk_elements, dtype=dtype, device=get_device_id())
+                        staging_buffers[relay_key] = relayed
+
                 pending: list[torch.Tensor] = []
                 pending_elements = 0
 
-                def flush_pending() -> None:
+                def flush_pending(_staged=staged, _relayed=relayed) -> None:
                     nonlocal pending, pending_elements
                     if not pending:
                         return
-                    flat = torch.cat(pending)
-                    communication = flat
-                    if device.type == "cpu" and "nccl" in backend:
-                        communication = flat.to(device=get_device_id())
-                    torch.distributed.broadcast(communication, src=0)
+                    offset = 0
+                    for piece in pending:
+                        size = piece.numel()
+                        _staged[offset : offset + size].copy_(piece)
+                        offset += size
+                    communication = _staged
+                    if _relayed is not None:
+                        _relayed[:pending_elements].copy_(_staged[:pending_elements], non_blocking=True)
+                        communication = _relayed
+                    torch.distributed.broadcast(communication[:pending_elements], src=0)
                     if rank != 0:
-                        if communication is not flat:
-                            flat.copy_(communication.to(device="cpu"))
                         offset = 0
                         for piece in pending:
                             size = piece.numel()
-                            piece.copy_(flat[offset : offset + size].view_as(piece))
+                            piece.copy_(communication[offset : offset + size].view_as(piece))
                             offset += size
                     pending = []
                     pending_elements = 0
@@ -1227,6 +1350,7 @@ class FSDPEngine(BaseEngine):
         distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         is_rank_zero = not distributed or torch.distributed.get_rank() == 0
         status = {"ok": True, "error": None}
+        save_start = time.perf_counter() if is_rank_zero else None
         if is_rank_zero:
             try:
                 os.makedirs(local_path, exist_ok=True)
@@ -1237,26 +1361,49 @@ class FSDPEngine(BaseEngine):
                     directory = os.path.join(local_path, f"{name}_sft")
                     os.makedirs(directory, exist_ok=True)
                     model_state = self._sdc_peft_state(model) if self._is_lora else model.state_dict()
-                    torch.save(model_state, os.path.join(directory, "pytorch_model.bin"))
-                    torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt"))
+                    # Atomic per-file writes: a crash mid-save cannot leave a
+                    # truncated payload that later loads would silently accept.
+                    torch.save(model_state, os.path.join(directory, "pytorch_model.bin.tmp"))
+                    os.replace(os.path.join(directory, "pytorch_model.bin.tmp"), os.path.join(directory, "pytorch_model.bin"))
+                    torch.save(optimizer.state_dict(), os.path.join(directory, "optimizer.pt.tmp"))
+                    os.replace(os.path.join(directory, "optimizer.pt.tmp"), os.path.join(directory, "optimizer.pt"))
                 base_adapter_state = (
                     self._sdc_adapter_base_state(self._sdc_success) if self._is_lora else None
                 )
+                # Full-parameter slimming: embed the frozen-base CPU snapshot
+                # only on the FIRST save of this engine process. Later saves
+                # write a light 'base_saved' marker referencing the earlier
+                # step; sdc_load then relies on the init-time clone produced by
+                # sdc_reinitialize_from_actor. LoRA checkpoints keep embedding
+                # the (small) adapter snapshot every interval.
+                embed_base = False
+                base_saved_marker = False
+                saved_base_step = getattr(self, "_sdc_saved_base_global_step", None)
+                if not self._is_lora and self._sdc_base_state_cpu is not None:
+                    if saved_base_step is None:
+                        embed_base = True
+                        self._sdc_saved_base_global_step = int(global_step)
+                        saved_base_step = self._sdc_saved_base_global_step
+                    else:
+                        base_saved_marker = True
                 torch.save(
                     build_sdc_checkpoint_state(
                         global_step=global_step,
                         success_model_update_count=self._sdc_success_model_update_count,
                         failure_model_update_count=self._sdc_failure_model_update_count,
                         models_ready=self._sdc_models_ready,
-                        base_state=None if self._is_lora else self._sdc_base_state_cpu,
+                        base_state=self._sdc_base_state_cpu if embed_base else None,
                         base_adapter_state=base_adapter_state,
                         adapter_only=bool(self._is_lora),
                         base_mix_gamma=self._sdc_base_mix_gamma,
                         success_buffer_state=config.get("success_buffer_state"),
                         failure_buffer_state=config.get("failure_buffer_state"),
+                        base_saved=base_saved_marker,
+                        base_global_step=saved_base_step,
                     ),
-                    os.path.join(local_path, "sdc_state.pt"),
+                    os.path.join(local_path, "sdc_state.pt.tmp"),
                 )
+                os.replace(os.path.join(local_path, "sdc_state.pt.tmp"), os.path.join(local_path, "sdc_state.pt"))
             except Exception as exc:
                 status = {"ok": False, "error": repr(exc)}
         if distributed:
@@ -1269,12 +1416,15 @@ class FSDPEngine(BaseEngine):
             torch.distributed.barrier()
         if not status["ok"]:
             raise RuntimeError(f"SDC checkpoint save failed on rank 0: {status['error']}")
-        return {
+        result = {
             "sdc_saved": True,
             "sdc_success_model_update_count": self._sdc_success_model_update_count,
             "sdc_failure_model_update_count": self._sdc_failure_model_update_count,
             "sdc_models_ready": self._sdc_models_ready,
         }
+        if save_start is not None:
+            result["sdc/timing/checkpoint_save_ms"] = (time.perf_counter() - save_start) * 1000.0
+        return result
 
     def _sdc_sft_model(
         self,
@@ -1374,8 +1524,16 @@ class FSDPEngine(BaseEngine):
 
     def _sdc_sft_update_local(self, success_records: list[dict], failure_records: list[dict], config: dict):
         self.sdc_init(config)
+        # Phase timers cover exactly one refresh; zero them so accumulate-mode
+        # recordings below never carry values from previous intervals.
+        timings = getattr(self, "_sdc_phase_timings", None)
+        if timings is None:
+            timings = self._sdc_phase_timings = {}
+        for phase_key in ("success_sft_ms", "failure_sft_ms", "base_mixing_ms", "model_sync_ms"):
+            timings[phase_key] = 0.0
         if not success_records or not failure_records:
             return {
+                **self._sdc_timing_metrics("success_sft_ms", "failure_sft_ms", "base_mixing_ms", "model_sync_ms"),
                 "sdc/success_sft_updates": 0.0,
                 "sdc/failure_sft_updates": 0.0,
                 "sdc/success_sft_response_tokens": 0.0,
@@ -1390,6 +1548,7 @@ class FSDPEngine(BaseEngine):
         success_records, failure_records = self._sdc_match_records(success_records, failure_records, config)
         if not success_records or not failure_records:
             return {
+                **self._sdc_timing_metrics("success_sft_ms", "failure_sft_ms", "base_mixing_ms", "model_sync_ms"),
                 "sdc/success_sft_updates": 0.0,
                 "sdc/failure_sft_updates": 0.0,
                 "sdc/sft_pair_skipped_unmatched": 1.0,
@@ -1403,6 +1562,7 @@ class FSDPEngine(BaseEngine):
         )
         if common_response_tokens <= 0:
             return {
+                **self._sdc_timing_metrics("success_sft_ms", "failure_sft_ms", "base_mixing_ms", "model_sync_ms"),
                 "sdc/success_sft_updates": 0.0,
                 "sdc/failure_sft_updates": 0.0,
                 "sdc/sft_pair_skipped_unmatched": 1.0,
@@ -1410,6 +1570,7 @@ class FSDPEngine(BaseEngine):
                 "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
                 "sdc/models_ready": float(self._sdc_models_ready),
             }
+        success_sft_start = time.perf_counter() if self._sdc_is_rank_zero() else None
         success = self._sdc_sft_model(
             self._sdc_success,
             self._sdc_success_optimizer,
@@ -1418,6 +1579,8 @@ class FSDPEngine(BaseEngine):
             config,
             response_token_budget=common_response_tokens,
         )
+        self._sdc_record_timing("success_sft_ms", success_sft_start)
+        failure_sft_start = time.perf_counter() if self._sdc_is_rank_zero() else None
         failure = self._sdc_sft_model(
             self._sdc_failure,
             self._sdc_failure_optimizer,
@@ -1426,6 +1589,7 @@ class FSDPEngine(BaseEngine):
             config,
             response_token_budget=common_response_tokens,
         )
+        self._sdc_record_timing("failure_sft_ms", failure_sft_start)
         success_updates = int(success["sdc/success_sft_updates"])
         failure_updates = int(failure["sdc/failure_sft_updates"])
         if success_updates != failure_updates:
@@ -1437,11 +1601,15 @@ class FSDPEngine(BaseEngine):
         if success_updates:
             # Base mixing changes model parameters only.  The two AdamW
             # optimizers retain their independent moments and step counters.
+            base_mix_start = time.perf_counter() if self._sdc_is_rank_zero() else None
             self._sdc_mix_with_base(self._sdc_success)
             self._sdc_mix_with_base(self._sdc_failure)
+            self._sdc_record_timing("base_mixing_ms", base_mix_start)
+            sync_start = time.perf_counter() if self._sdc_is_rank_zero() else None
             if not getattr(self, "_sdc_defer_sync", False):
                 self._sdc_sync_model_and_optimizer(self._sdc_success, self._sdc_success_optimizer)
                 self._sdc_sync_model_and_optimizer(self._sdc_failure, self._sdc_failure_optimizer)
+            self._sdc_record_timing("model_sync_ms", sync_start)
         self._sdc_success_model_update_count += success_updates
         self._sdc_failure_model_update_count += failure_updates
         minimum = int(config.get("min_sft_updates_before_use", 1))
@@ -1452,6 +1620,7 @@ class FSDPEngine(BaseEngine):
         return {
             **success,
             **failure,
+            **self._sdc_timing_metrics("success_sft_ms", "failure_sft_ms", "base_mixing_ms", "model_sync_ms"),
             "sdc/sft_pair_skipped_unmatched": 0.0,
             "sdc/sft_pair_response_tokens": min(
                 success["sdc/success_sft_response_tokens"], failure["sdc/failure_sft_response_tokens"]
@@ -1506,6 +1675,7 @@ class FSDPEngine(BaseEngine):
             # Rank zero is the only SDC optimizer owner. Every rank needs the
             # refreshed model weights for scoring, but duplicating two complete
             # AdamW states on nonzero ranks wastes tens of gigabytes of host RAM.
+            sync_start = time.perf_counter() if is_rank_zero else None
             self._sdc_sync_model_and_optimizer(
                 self._sdc_success,
                 self._sdc_success_optimizer,
@@ -1516,6 +1686,10 @@ class FSDPEngine(BaseEngine):
                 self._sdc_failure_optimizer,
                 include_optimizer=False,
             )
+            if sync_start is not None:
+                self._sdc_record_timing("model_sync_ms", sync_start)
+                timings = getattr(self, "_sdc_phase_timings", None) or {}
+                result["sdc/timing/model_sync_ms"] = float(timings.get("model_sync_ms", 0.0))
             if self._is_lora:
                 # Ranks that skipped rank-zero SFT can now release their full
                 # CPU base snapshot too; rank zero captured it during mixing.
@@ -1562,11 +1736,64 @@ class FSDPEngine(BaseEngine):
         return self._sdc_write_checkpoint(local_path, global_step, config)
 
     def sdc_load(self, local_path: str, config: dict | None = None):
-        config = config or {}; self.sdc_reinitialize_from_actor(config); state_path = os.path.join(local_path, "sdc_state.pt"); state = torch.load(state_path, map_location="cpu") if os.path.exists(state_path) else {}
+        config = config or {}
+        # Rebuild both clones from the CURRENT actor first. This fully
+        # reconstructs ``self._sdc_base_state_cpu`` (rank zero keeps it) BEFORE
+        # any checkpoint payload below can overwrite or preserve it, which is
+        # what the slim-checkpoint fallback relies on.
+        self.sdc_reinitialize_from_actor(config)
+        state_path = os.path.join(local_path, "sdc_state.pt")
         distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         is_sdc_optimizer_owner = not distributed or torch.distributed.get_rank() == 0
+        heavy_keys = ("sdc_base_state_cpu", "sdc_base_adapter_state_cpu")
+        state: dict = {}
+        light: dict | None = None
+        load_error: str | None = None
+        if os.path.exists(state_path):
+            if is_sdc_optimizer_owner:
+                try:
+                    state = torch.load(state_path, map_location="cpu")
+                    # Rank zero alone touches the heavy payload; every other
+                    # rank previously torch.loaded the whole file (including a
+                    # third full model) only to discard the base tensors.
+                    light = {key: value for key, value in state.items() if key not in heavy_keys}
+                except Exception as exc:  # pragma: no cover - surfaced below
+                    load_error = repr(exc)
+            if distributed:
+                # Broadcast the failure flag together with the light scalars so
+                # a corrupt sidecar fails everywhere instead of hanging NCCL.
+                holder = [{"error": load_error, "light": light}]
+                torch.distributed.broadcast_object_list(holder, src=0)
+                payload = holder[0] or {}
+                if payload.get("error"):
+                    raise RuntimeError(f"SDC sidecar load failed on rank 0: {payload['error']}")
+                light = payload.get("light")
+                if not is_sdc_optimizer_owner:
+                    state = light or {}
+        elif distributed:
+            # Keep collective participation symmetric even without a sidecar.
+            holder = [None]
+            torch.distributed.broadcast_object_list(holder, src=0)
+        if load_error:
+            # Single-process path: no broadcast surfaced it yet.
+            raise RuntimeError(f"SDC sidecar load failed: {load_error}")
         if is_sdc_optimizer_owner and state.get("sdc_base_state_cpu") is not None:
+            # Old checkpoints embed the full frozen base; overwrite exactly as
+            # before so legacy payloads load bit-for-bit identically.
             self._sdc_base_state_cpu = clone_frozen_state(state["sdc_base_state_cpu"])
+        elif is_sdc_optimizer_owner and state.get("base_saved", False):
+            # Slim checkpoint ('base_saved' marker, no embedded base): rely on
+            # the init-time clone reconstructed above; nothing overwrites it.
+            recorded_step = state.get("base_global_step")
+            restored_step = int(config.get("global_policy_step", -1))
+            if recorded_step is not None and restored_step >= 0 and int(recorded_step) != restored_step:
+                logger.warning(
+                    "SDC slim checkpoint references a base captured around policy step %s while "
+                    "the restored actor is at step %s; keeping the base reconstructed from the "
+                    "restored actor by sdc_reinitialize_from_actor.",
+                    recorded_step,
+                    restored_step,
+                )
         if is_sdc_optimizer_owner and state.get("sdc_base_adapter_state_cpu") is not None:
             self._sdc_base_adapter_state_cpu = clone_frozen_state(state["sdc_base_adapter_state_cpu"])
             if state.get("sdc_adapter_only", False):
@@ -1574,9 +1801,16 @@ class FSDPEngine(BaseEngine):
         self._sdc_base_mix_gamma = float(state.get("base_mix_gamma", self._sdc_base_mix_gamma))
         if not 0.0 <= self._sdc_base_mix_gamma <= 1.0:
             raise ValueError(f"Invalid checkpoint base_mix_gamma={self._sdc_base_mix_gamma}.")
-        self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0)); self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0)); self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
-        for name, model, optimizer in (("success", self._sdc_success, self._sdc_success_optimizer), ("failure", self._sdc_failure, self._sdc_failure_optimizer)):
-            directory = os.path.join(local_path, f"{name}_sft"); model_path = os.path.join(directory, "pytorch_model.bin"); optimizer_path = os.path.join(directory, "optimizer.pt")
+        self._sdc_success_model_update_count = int(state.get("sdc_success_model_update_count", 0))
+        self._sdc_failure_model_update_count = int(state.get("sdc_failure_model_update_count", 0))
+        self._sdc_models_ready = bool(state.get("sdc_models_ready", False))
+        for name, model, optimizer in (
+            ("success", self._sdc_success, self._sdc_success_optimizer),
+            ("failure", self._sdc_failure, self._sdc_failure_optimizer),
+        ):
+            directory = os.path.join(local_path, f"{name}_sft")
+            model_path = os.path.join(directory, "pytorch_model.bin")
+            optimizer_path = os.path.join(directory, "optimizer.pt")
             if os.path.exists(model_path):
                 self._sdc_load_model_state(model, torch.load(model_path, map_location="cpu"))
             if is_sdc_optimizer_owner and os.path.exists(optimizer_path):
@@ -2115,6 +2349,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
             raise NotImplementedError("SDC currently supports only FSDP/FSDP2 HF actors.")
         state = self._sdc_actor_state_cpu()
         self._sdc_base_state_cpu = clone_frozen_state(state)
+        # Fresh base snapshot: the next checkpoint save embeds it again and
+        # re-anchors the slim-checkpoint marker chain.
+        self._sdc_saved_base_global_step = None
         # Divergence from FSDPEngine.sdc_init: this subclass does not track
         # LoRA adapter snapshots, so it intentionally skips setting
         # ``self._sdc_base_adapter_state_cpu`` here.
