@@ -323,6 +323,60 @@ def plot_tsne_grid(
     plt.close()
 
 
+def plot_correct_wrong_progression(npz_paths: list[str], output_path: str, max_cols: int = 4) -> None:
+    """Small-multiples t-SNE grid across TRAINING STEPS, colored by correct/wrong.
+
+    Unlike `plot_tsne_grid` (which re-encodes probes per merged checkpoint),
+    this reads the `.npz` files the live trainer already saves every
+    `trainer.rep_tsne_freq` steps under `<default_local_dir>/representation_tsne/
+    train_step_<N>.npz` (see `JEPARayPPOTrainer._maybe_log_train_rep_tsne`) — one
+    fit per step, laid out left-to-right so a reader sees correct/wrong clusters
+    visibly separate (or not) as training progresses. This is the actual paper
+    figure for "representations sharpen/suppress over training"; it's built once
+    post-hoc from existing artifacts rather than redone live every step.
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+
+    def _step_of(path: str) -> int:
+        return int(os.path.basename(path).split("train_step_")[-1].split(".")[0])
+
+    paths = sorted(npz_paths, key=_step_of)
+    n = len(paths)
+    if n == 0:
+        raise ValueError("plot_correct_wrong_progression: no .npz paths given")
+    ncols = min(max_cols, n)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False)
+
+    for i, path in enumerate(paths):
+        ax = axes[i // ncols][i % ncols]
+        step = _step_of(path)
+        data = np.load(path)
+        student, correct = data["student"], data["correct"].astype(bool)
+        if len(student) < 3:
+            ax.axis("off")
+            continue
+        perp = min(30, max(2, (len(student) - 1) // 3))
+        proj = TSNE(n_components=2, init="pca", learning_rate="auto",
+                    perplexity=perp, random_state=14142).fit_transform(student)
+        ax.scatter(proj[correct, 0], proj[correct, 1], c="tab:blue", marker="o",
+                   s=14, alpha=.75, label="correct")
+        if (~correct).any():
+            ax.scatter(proj[~correct, 0], proj[~correct, 1], c="tab:red", marker="x",
+                       s=18, alpha=.75, label="incorrect")
+        ax.set_title(f"step {step}", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        if i == 0:
+            ax.legend(fontsize=8)
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].axis("off")
+    fig.suptitle("Student CoT representations, correct vs incorrect — training progression")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -331,12 +385,21 @@ def plot_tsne_grid(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--run", action="append", required=True, metavar="LABEL=DIR",
+        "--progression-npz", default=None, metavar="GLOB",
+        help="Shortcut mode: build the correct/wrong t-SNE progression figure "
+             "(plot_correct_wrong_progression) straight from already-saved "
+             "'<default_local_dir>/representation_tsne/train_step_*.npz' files "
+             "-- pass a glob, e.g. 'checkpoints/.../representation_tsne/train_step_*.npz'. "
+             "Skips the checkpoint-merge/probe pipeline below; only --output-dir is "
+             "also required in this mode.",
+    )
+    parser.add_argument(
+        "--run", action="append", metavar="LABEL=DIR",
         help="Repeatable. e.g. --run jepa=checkpoints/.../jepa_exp --run baseline=checkpoints/.../drgrpo_exp",
     )
-    parser.add_argument("--steps", required=True, help="Comma-separated checkpoint steps, e.g. 0,200,400")
-    parser.add_argument("--base-model", required=True, help="HF path/id used for step 0 in every run")
-    parser.add_argument("--probe-file", required=True, help="verl-format parquet with extra_info.problem")
+    parser.add_argument("--steps", help="Comma-separated checkpoint steps, e.g. 0,200,400")
+    parser.add_argument("--base-model", help="HF path/id used for step 0 in every run")
+    parser.add_argument("--probe-file", help="verl-format parquet with extra_info.problem")
     parser.add_argument("--num-probes", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-prompt-length", type=int, default=1024)
@@ -348,12 +411,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--tsne", action="store_true", help="Also produce the t-SNE grid (needs scikit-learn)")
     parser.add_argument("--tsne-steps", default=None, help="Comma-separated subset of --steps to t-SNE (default: all)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.progression_npz is None and (not args.run or not args.steps or not args.base_model or not args.probe_file):
+        parser.error("--run/--steps/--base-model/--probe-file are required unless --progression-npz is given")
+    return args
 
 
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.progression_npz is not None:
+        import glob
+        paths = sorted(glob.glob(args.progression_npz))
+        if not paths:
+            raise FileNotFoundError(f"no files matched --progression-npz {args.progression_npz!r}")
+        out = os.path.join(args.output_dir, "correct_wrong_progression.png")
+        plot_correct_wrong_progression(paths, out)
+        print(f"[representation_quality] wrote {out} from {len(paths)} step(s)")
+        return
 
     runs = dict(r.split("=", 1) for r in args.run)
     steps = [int(s) for s in args.steps.split(",")]

@@ -3,6 +3,7 @@
 # Do not modify this file directly.
 # The file is usually only for reference and never used.
 
+model_engine: dp
 actor_rollout_ref:
   actor:
     optim:
@@ -78,10 +79,27 @@ actor_rollout_ref:
       clip_cov_ub: 5.0
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
+    wasserstein_guidance:
+      _target_: verl.workers.config.WassersteinGuidanceConfig
+      enable: false
+      lambda_wg: 0.01
+      alpha_transport: 0.2
+      embed_model: BAAI/bge-small-en-v1.5
+      decode_model: ''
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null
+    ppo_loss_coef: 1.0
     entropy_coeff: 0
+    exploration:
+      _target_: verl.trainer.ppo.exploration.ExplorationConfig
+      enabled: false
+      alpha_max: 0.3
+      delta: 3.0
+      ema_gamma: 0.995
+      ema_update_every: 5
+      entropy_threshold_ratio: 0.5
+      warmup_steps: 100
     calculate_entropy: false
     calculate_sum_pi_squared: false
     use_kl_loss: false
@@ -91,6 +109,7 @@ actor_rollout_ref:
     kl_loss_type: low_var_kl
     ppo_epochs: 1
     shuffle: false
+    accumulate_minibatch_grads: false
     data_loader_seed: 42
     checkpoint:
       _target_: verl.trainer.config.CheckpointConfig
@@ -765,7 +784,16 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  base_rl_name: null
   norm_adv_by_std_in_grpo: true
+  ngrpo_r_max: 1.0
+  ngrpo_epsilon_pos: 0.24
+  ngrpo_epsilon_neg: 0.16
+  avspo_collapse_tau: 1.0e-6
+  avspo_alpha: 0.5
+  avspo_anchor_reward: 0.1
+  avspo_adapt_tau_init: 0.5
+  avspo_adapt_eta: 0.01
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:
@@ -827,6 +855,80 @@ distillation:
         response_length: ${oc.select:actor_rollout_ref.rollout.response_length}
         temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
   teacher_key: data_source
+custom_gpi_ce:
+  enable: false
+  online_per_prompt: 4
+  offline_per_prompt: 4
+  temperature: 0.5
+  score_normalization: token_mean
+  verify_offline: true
+  allow_short_offline: false
+  fuse_old_log_prob: true
+custom_sdc:
+  enable: false
+  beta: 0.5
+  scoring_backend: hf
+  vllm_score_micro_batch_size: 16
+  reuse_rollout_log_probs: false
+  verify_rollout_log_probs: false
+  use_importance_weight: true
+  importance_weight_clip: 10.0
+  base_mix_gamma: 0.9
+  sft_update_interval_policy_steps: 5
+  checkpoint_interval_policy_steps: 10
+  min_sft_updates_before_use: 1
+  sft_lr: 1.0e-6
+  sft_batch_size: 8
+  sft_max_token_len_per_gpu: 0
+  sft_max_updates_per_interval: 1
+  data_max_size: null
+  data_sampling: recent
+  save_to_disk_interval_policy_steps: 0
+  loss_agg_mode: token-mean
+custom_sharpening_grpo:
+  enable: false
+  use_grpo_reward: true
+  gamma: 0.1
+  alpha: 1.0
+  beta: 0.1
+  group_size: 8
+  clip_ratio: 0.2
+custom_abstract_rl:
+  enable: false
+  use_utility: true
+  kl_coef: 0.05
+  kl_type: low_var_kl
+  kl_clip: 2.0
+  delta_clip: 1.0
+  invalid_delta: zero
+  valid_bonus: 0.2
+  delta_baseline: matched
+  utility_affine: true
+  open_tag: <abstract>
+  close_tag: </abstract>
+  max_scan_tokens: 512
+  max_abstract_tokens: 120
+  length_penalty_coef: 0.0
+  inject_instruction: true
+  instruction_variant: spec
+  instruction_override: ''
+  instruction_placement: user_turn
+  score_only_correct: false
+  scoring_max_token_len_per_gpu: 24576
+  max_score_response_tokens: 0
+  bootstrap_mode: trailing
+  bootstrap_steps: 0
+  bootstrap_graft_fraction: 0.5
+  bootstrap_native_threshold: 0.3
+  bootstrap_patience: 3
+  bootstrap_max_abstract_tokens: 256
+  bootstrap_sft_steps: 0
+  bootstrap_sft_lr: 0.0
+  bootstrap_sft_clip_grad: 0.0
+  bootstrap_sft_accuracy_drop: 0.1
+  bootstrap_sft_min_length_fraction: 0.6
+  bootstrap_abstract_cache: ''
+  debug_print_n: 0
 trainer:
   balance_batch: true
   total_epochs: 30
@@ -900,3 +1002,4 @@ ray_kwargs:
   ray_init:
     num_cpus: null
   timeline_json_file: null
+  loss_agg_mode: token-mean

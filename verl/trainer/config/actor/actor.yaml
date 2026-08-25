@@ -168,6 +168,12 @@ ppo_epochs: 1
 # Shuffle training data across PPO epochs
 shuffle: false
 
+# Treat the PPO mini-batches of one actor update as gradient-accumulation units of a
+# single logical batch: zero the gradient once before the first, take exactly one
+# optimizer step after the last. false (default) keeps the historical behavior of one
+# independent zero_grad/backward/step per mini-batch, so existing runs are unchanged.
+accumulate_minibatch_grads: false
+
 # The seed used to construct mini-batch
 data_loader_seed: 42
 

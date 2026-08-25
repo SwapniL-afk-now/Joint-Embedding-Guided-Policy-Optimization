@@ -131,6 +131,7 @@ LOGGER=${LOGGER:-'["console","wandb"]'}
 # Training size
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 ROLLOUT_N=${ROLLOUT_N:-8}
+TRAIN_SEED=${TRAIN_SEED:-31415}
 # Split of ROLLOUT_N completions/prompt between CoT-framed and Code-framed
 # system prompts (see jepa.n_cot/jepa.n_code below). Both views now
 # contribute to the GRPO policy-gradient update, not just CoT — the
@@ -172,6 +173,8 @@ ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.7}   # leaves headroom for the Co
 # False is faster on update_actor/jepa_update but uses more activation memory (OOM risk).
 GRAD_CKPT=${GRAD_CKPT:-True}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}   # more parallel sequences during vLLM rollout
+ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}
+LOGPROB_MAX_TOKEN_LEN_PER_GPU=${LOGPROB_MAX_TOKEN_LEN_PER_GPU:-${PPO_MAX_TOKEN_LEN}}
 # DAPO training-rollout sampling: high-exploration generation (paper §4.1). Temperature 1.0
 # with unrestricted top_p/top_k produces the diverse groups clip-higher relies on.
 # (verl's rollout defaults already match these; set explicitly for reproducibility.)
@@ -272,6 +275,7 @@ VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-128}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
+VALIDATION_SEEDS=${VALIDATION_SEEDS:-'[31415,271828,14142,16180,299792]'}
 # data_source names (see verl/experimental/fepo/data.py) used to compute the average
 # accuracy that decides whether to overwrite the `best/` checkpoint. Must be a subset
 # of whatever's actually in VAL_FILES, or best-checkpoint tracking silently no-ops.
@@ -293,7 +297,15 @@ KL_COEF=${KL_COEF:-0.0}
 # Fail fast if either required teacher-target cache is missing, instead of crashing deep
 # in JEPARayConfig.validate() at trainer construction. jepa-tcr-dual needs BOTH the CoT and
 # the Code-view caches.
+# 'llm-jepa-cluster' uses a prompt's own correct rollouts as each other's views, so it
+# reads NO teacher targets. Blank both paths for it: an unused-but-set path still gets
+# eagerly torch.load()ed in JEPARayPPOTrainer.__init__.
+if [[ "${JEPA_LOSS_TYPE}" == "llm-jepa-cluster" ]]; then
+    TEACHER_CACHE=""
+    CODE_TEACHER_CACHE=""
+fi
 for c in "${TEACHER_CACHE}" "${CODE_TEACHER_CACHE}"; do
+    [[ -z "${c}" ]] && continue
     if [[ ! -f "${c}" ]]; then
         echo "ERROR: teacher-target cache not found: ${c}" >&2
         echo "Build it with examples/jepa_grpo_trainer/precompute_teacher_targets.py --view {cot,code}" >&2
@@ -345,6 +357,7 @@ ACTOR=(
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}
+    actor_rollout_ref.actor.data_loader_seed=${TRAIN_SEED}
     actor_rollout_ref.actor.use_dynamic_bsz=True
 )
 
@@ -353,7 +366,8 @@ ROLLOUT=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}
     actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}
+    actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${LOGPROB_MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.rollout.temperature=${TRAIN_TEMPERATURE}
     actor_rollout_ref.rollout.top_p=${TRAIN_TOP_P}
     actor_rollout_ref.rollout.top_k=${TRAIN_TOP_K}
@@ -389,6 +403,15 @@ JEPA=(
     jepa.auto_off_min_delta=${AUTO_OFF_MIN_DELTA}
     jepa.auto_off_warmup_steps=${AUTO_OFF_WARMUP}
     jepa.auto_off_min_cos=${AUTO_OFF_MIN_COS}
+    # Optimizer-step coupling. Defaults reproduce the existing behaviour exactly:
+    #   fuse=False, update_before_policy=False -> GRPO step, then a second JEPA step.
+    # fuse=True             -> ONE Adam step over g_policy + alpha*g_JEPA (needs
+    #                          ppo_epochs==1 and ppo_mini_batch_size >= train_batch_size).
+    # update_before_policy  -> decoupled, but JEPA steps FIRST (EEPO-style ordering).
+    jepa.fuse_optimizer_step=${JEPA_FUSE_OPTIMIZER_STEP:-False}
+    jepa.update_before_policy=${JEPA_UPDATE_BEFORE_POLICY:-False}
+    jepa.min_correct_for_cluster=${JEPA_MIN_CORRECT_FOR_CLUSTER:-2} \
+    jepa.cluster_repel=${JEPA_CLUSTER_REPEL:-0.0}
 )
 
 TRAINER=(
@@ -406,11 +429,12 @@ TRAINER=(
     trainer.logger=${LOGGER}
     +trainer.best_ckpt_sources=${BEST_CKPT_SOURCES}
     +trainer.best_ckpt_metrics=${BEST_CKPT_METRICS}
+    +trainer.validation_seeds=${VALIDATION_SEEDS}
 )
 
 ALGORITHM=(
     algorithm.adv_estimator=grpo
-    algorithm.norm_adv_by_std_in_grpo=True
+    algorithm.norm_adv_by_std_in_grpo=${NORM_ADV_BY_STD_IN_GRPO:-True}
     algorithm.use_kl_in_reward=False
     actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS}
     actor_rollout_ref.actor.kl_loss_type=low_var_kl

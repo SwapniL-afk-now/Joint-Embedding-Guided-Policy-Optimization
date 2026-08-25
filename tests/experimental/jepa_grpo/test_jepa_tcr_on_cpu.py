@@ -406,3 +406,256 @@ def test_autooff_ignores_zero_metric_steps():
     for _ in range(10):
         _step(f, 0.0)             # no anchors -> ignored, stall must not advance
     assert f._align_stall["global"] == 0 and not f._jepa_signal_off
+
+
+# --------------------------------------------------------------------- infoNCE builder
+
+
+def _fake_self_infonce(teacher_texts, min_valid_pairs=1):
+    return types.SimpleNamespace(
+        teacher_targets=teacher_texts,   # TEXT cache {ds_idx: [t+, ...]}
+        tokenizer=types.SimpleNamespace(pad_token_id=0, eos_token_id=None),
+        # loss_type gates the Code-teacher requirement inside the shared builder
+        # (geometry needs one, infoNCE does not) -- the stub must carry it.
+        jepa_cfg=types.SimpleNamespace(
+            min_valid_pairs=min_valid_pairs, loss_type="llm-jepa-infoNCE"),
+        _tokenize_target=lambda problem, text, view: torch.tensor([7, 8, 9]),
+        _template_prefix_ids=lambda: [],
+    )
+
+
+def _fake_batch_cot(n_rollouts=4, n_prompts=3, prompt_len=3):
+    rows = n_rollouts * n_prompts
+    ids = torch.arange(1, rows * prompt_len + 1).reshape(rows, prompt_len)
+    mask = torch.ones(rows, prompt_len, dtype=torch.long)
+    uids, extra = [], []
+    for p in range(n_prompts):
+        for _ in range(n_rollouts):
+            uids.append(f"p{p}"); extra.append({"index": p, "problem": f"q{p}"})
+    batch = types.SimpleNamespace(
+        # The builders take RESPONSE-ONLY student reads (encoding [prompt+response]
+        # glues every rollout of a prompt onto one point). Here the whole row is the
+        # response, so the reads come out equal to input_ids and the assertions below
+        # can compare against it directly.
+        batch={"input_ids": ids, "attention_mask": mask, "responses": ids},
+        non_tensor_batch={"uid": np.array(uids, dtype=object),
+                          "extra_info": np.array(extra, dtype=object)},
+    )
+    return batch, np.array(["cot"] * rows, dtype=object)
+
+
+def test_infonce_builder_mixed_prompts_only_one_pair_each():
+    # prompt0 mixed (2 correct / 2 wrong), prompt1 all-correct, prompt2 all-wrong
+    # -> min(c, w) = 2 disjoint (y+, y-, t+) triples, all from prompt0.
+    batch, view = _fake_batch_cot(n_rollouts=4, n_prompts=3)
+    fake = _fake_self_infonce({0: ["t0"], 1: ["t1"], 2: ["t2"]})
+    reward = torch.tensor([1, 1, 0, 0,  1, 1, 1, 1,  0, 0, 0, 0],
+                          dtype=torch.float32).reshape(-1, 1)
+    out = JEPARayPPOTrainer._build_jepa_batch_llm_jepa_infonce(fake, batch, reward, view)
+    assert out is not None and out.meta_info["n_anchors"] == 2
+    assert out.meta_info["n_mixed_prompts"] == 1
+    assert out.meta_info["pairs_per_prompt"] == 2.0
+    lens = out.batch["anchor_lengths"]
+    assert int((lens > 0).sum()) == 4            # 2 pos rows + 2 neg rows
+    correct_rows = {tuple(batch.batch["input_ids"][i].tolist()) for i in (0, 1)}
+    wrong_rows = {tuple(batch.batch["input_ids"][i].tolist()) for i in (2, 3)}
+    pos = [tuple(out.batch["anchor_input_ids"][r][: lens[r]].tolist()) for r in (0, 1)]
+    neg = [tuple(out.batch["anchor_input_ids"][r][: lens[r]].tolist()) for r in (2, 3)]
+    # disjoint pairs: both correct rollouts used as pos, both wrong as neg
+    assert set(pos) == correct_rows and set(neg) == wrong_rows
+    # one unique teacher row shared by both pairs
+    assert out.meta_info["n_unique_targets"] == 1
+    assert out.batch["tgt_cot_idx"][:2].tolist() == [0, 0]
+    assert out.batch["pair_group_id"][:2].tolist() == [0, 0]
+
+
+def test_infonce_builder_returns_none_without_enough_mixed_prompts():
+    batch, view = _fake_batch_cot(n_rollouts=4, n_prompts=2)
+    fake = _fake_self_infonce({0: ["t0"], 1: ["t1"]}, min_valid_pairs=1)
+    reward = torch.tensor([1, 1, 1, 1,  0, 0, 0, 0], dtype=torch.float32).reshape(-1, 1)
+    assert JEPARayPPOTrainer._build_jepa_batch_llm_jepa_infonce(fake, batch, reward, view) is None
+
+
+def test_infonce_loss_prefers_separated_reads():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_infonce_loss
+    z = _unit(4, 1)
+    l_sep, m = llm_jepa_infonce_loss(z, _unit(4, 2), z, tau=0.1)      # p+ == z+
+    l_col, _ = llm_jepa_infonce_loss(z, z, z, tau=0.1)                # p- == p+
+    assert float(l_sep) < float(l_col)                                # cos(p+,p-) up -> loss up
+    assert m["jepa/infonce_acc"] == 1.0 and m["jepa/n_anchors_cot"] == 4
+
+
+# --------------------------------------------------------------------- explicit geometry
+
+
+def test_geometry_loss_prefers_requested_layout():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_geometry_loss
+
+    teacher = _unit(4, 1)
+    correct = teacher.clone()
+    wrong_far = -teacher
+    wrong_close = teacher.clone()
+    groups = torch.arange(4)
+    good, metrics = llm_jepa_geometry_loss(
+        correct, wrong_far, teacher, groups, sigreg_lambda=0.0
+    )
+    bad, _ = llm_jepa_geometry_loss(
+        correct, wrong_close, teacher, groups, sigreg_lambda=0.0
+    )
+    assert float(good) < float(bad)
+    assert metrics["jepa/cos_correct_teacher"] > 0.99
+    assert metrics["jepa/margin_teacher"] > 1.9
+    assert metrics["jepa/margin_correct"] > 1.9
+
+
+def test_geometry_attraction_moves_correct_only_with_both_teachers_stopgrad():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_geometry_loss
+
+    correct = _unit(3, 1).clone().requires_grad_(True)
+    teacher = _unit(3, 2).clone().requires_grad_(True)
+    teacher_code = _unit(3, 4).clone().requires_grad_(True)
+    wrong = _unit(3, 3).clone().requires_grad_(True)
+    loss, metrics = llm_jepa_geometry_loss(
+        correct, wrong, teacher, torch.arange(3),
+        teacher_code=teacher_code, has_code=torch.ones(3, dtype=torch.bool),
+        align_weight=1.0, wrong_teacher_weight=0.0,
+        wrong_correct_weight=0.0, sigreg_lambda=0.0,
+    )
+    loss.backward()
+    assert correct.grad is not None and correct.grad.abs().sum() > 0
+    assert teacher.grad is None or teacher.grad.abs().sum() == 0
+    assert teacher_code.grad is None or teacher_code.grad.abs().sum() == 0
+    assert wrong.grad is None or wrong.grad.abs().sum() == 0
+    assert metrics["jepa/n_anchors_code"] == 3
+
+
+def test_geometry_repulsion_moves_only_wrong():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_geometry_loss
+
+    correct = _unit(3, 1).clone().requires_grad_(True)
+    teacher = _unit(3, 2).clone().requires_grad_(True)
+    wrong = _unit(3, 3).clone().requires_grad_(True)
+    loss, _ = llm_jepa_geometry_loss(
+        correct, wrong, teacher, torch.arange(3),
+        align_weight=0.0, wrong_teacher_weight=1.0,
+        wrong_correct_weight=1.0, sigreg_lambda=0.0,
+    )
+    loss.backward()
+    assert wrong.grad is not None and wrong.grad.abs().sum() > 0
+    assert correct.grad is None or correct.grad.abs().sum() == 0
+    assert teacher.grad is None or teacher.grad.abs().sum() == 0
+
+
+def test_geometry_prompt_averaging_ignores_duplicate_pair_count():
+    from verl.experimental.jepa_grpo.core_algos import llm_jepa_geometry_loss
+
+    correct = _unit(2, 1)
+    wrong = _unit(2, 2)
+    teacher = _unit(2, 3)
+    groups = torch.tensor([0, 1])
+    base, _ = llm_jepa_geometry_loss(
+        correct, wrong, teacher, groups, sigreg_lambda=0.0
+    )
+    # Duplicate prompt zero's complete pair: its per-prompt mean is unchanged.
+    dup, _ = llm_jepa_geometry_loss(
+        torch.cat([correct, correct[:1]]),
+        torch.cat([wrong, wrong[:1]]),
+        torch.cat([teacher, teacher[:1]]),
+        torch.tensor([0, 1, 0]),
+        sigreg_lambda=0.0,
+    )
+    assert torch.allclose(base, dup, atol=1e-6)
+
+
+def test_effective_rank_detects_collapsed_pool():
+    from verl.experimental.jepa_grpo.core_algos import representation_effective_rank
+
+    spread = _unit(32, 1)
+    collapsed = F.normalize(spread[:1].repeat(32, 1) + 1e-4 * _unit(32, 2), dim=-1)
+    _, spread_norm = representation_effective_rank(spread)
+    _, collapsed_norm = representation_effective_rank(collapsed)
+    assert spread_norm > collapsed_norm
+    assert collapsed_norm < 0.15
+
+
+def test_geometry_config_requires_k0_and_valid_collapse_guard():
+    cfg = JEPARayConfig.from_config({
+        "enable": True, "loss_type": "llm-jepa-geometry",
+        "teacher_cache_path": "/x", "code_teacher_cache_path": "/y",
+        "n_cot": 8, "n_code": 0,
+        "predictor_k": 0,
+    })
+    cfg.validate(rollout_n=8)
+    cfg.predictor_k = 1
+    with pytest.raises(ValueError, match="predictor_k=0"):
+        cfg.validate(rollout_n=8)
+
+
+def test_collapse_patience_latches_geometry_auxiliary_only():
+    fake = types.SimpleNamespace(
+        jepa_cfg=types.SimpleNamespace(
+            enable=True, loss_type="llm-jepa-geometry",
+            collapse_guard_enable=True, collapse_warmup_steps=0,
+            collapse_effective_rank_min=0.003,
+            collapse_rank_fraction_of_best=0.5, collapse_patience=3,
+        ),
+        global_steps=10,
+        _collapse_stall=0,
+        _collapse_latched=False,
+        _collapse_best_rank=0.2,
+        _jepa_signal_off=False,
+    )
+    for expected in (1, 2, 3):
+        metrics = {"jepa/effective_rank_norm": 0.05}
+        JEPARayPPOTrainer._maybe_guard_representation_collapse(fake, metrics)
+        assert fake._collapse_stall == expected
+    assert fake._collapse_latched and fake._jepa_signal_off
+
+
+def test_collapse_patience_resets_on_healthy_representation():
+    fake = types.SimpleNamespace(
+        jepa_cfg=types.SimpleNamespace(
+            enable=True, loss_type="llm-jepa-geometry",
+            collapse_guard_enable=True, collapse_warmup_steps=0,
+            collapse_effective_rank_min=0.003,
+            collapse_rank_fraction_of_best=0.5, collapse_patience=3,
+        ),
+        global_steps=10,
+        _collapse_stall=2,
+        _collapse_latched=False,
+        _collapse_best_rank=0.2,
+        _jepa_signal_off=False,
+    )
+    JEPARayPPOTrainer._maybe_guard_representation_collapse(
+        fake, {"jepa/effective_rank_norm": 0.5}
+    )
+    assert fake._collapse_stall == 0 and not fake._jepa_signal_off
+
+
+def test_collapse_guard_reenables_after_healthy_representation_probes():
+    fake = types.SimpleNamespace(
+        jepa_cfg=types.SimpleNamespace(
+            enable=True, loss_type="llm-jepa-geometry",
+            collapse_guard_enable=True, collapse_warmup_steps=0,
+            collapse_effective_rank_min=0.003,
+            collapse_rank_fraction_of_best=0.5, collapse_patience=3,
+            collapse_reenable_patience=2,
+        ),
+        global_steps=30,
+        _collapse_stall=3,
+        _collapse_recovery_stall=0,
+        _collapse_latched=True,
+        _collapse_best_rank=0.2,
+        _latest_rep_probe_rank=0.11,
+        _jepa_signal_off=True,
+    )
+    JEPARayPPOTrainer._maybe_guard_representation_collapse(fake, {})
+    assert fake._collapse_latched and fake._jepa_signal_off
+    assert fake._collapse_recovery_stall == 1
+
+    fake._latest_rep_probe_rank = 0.12
+    metrics = {}
+    JEPARayPPOTrainer._maybe_guard_representation_collapse(fake, metrics)
+    assert not fake._collapse_latched and not fake._jepa_signal_off
+    assert fake._collapse_recovery_stall == 0
+    assert metrics["jepa/collapse_latched"] == 0.0

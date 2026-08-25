@@ -1,0 +1,17 @@
+branch: agent/drgrpo-jepa-training-diagnostics
+head: 0ad7d144376de12a9b3c5613268874e71d0fdea8
+status-at-freeze:
+  ?? IMPLEMENT_SDC_MODULAR.md
+  ?? MUSTDO.md
+  ?? MUSTDO_FOR_H200.md
+recent-commits:
+  0ad7d14 replace TAFR with SDC-GRPO
+  c2693ea replace TAFR with SDC-GRPO
+  0a755e1 Make hybrid Qwen 7B optimization defaults explicit
+  a3194c9 Optimize Qwen GRPO fused kernels and batching
+  852619b Reuse rollout logprobs and scale Qwen rollout scheduling
+  54b4d8d Update Qwen 7B GRPO and FEPO diagnostics
+  e7122f4 Add FEPO beta reruns, evaluation, and upload workflows
+  1907a55 Add FEPO paper source and GPU queue/eval fixes
+  8af5ca4 FEPO paper program and launch configuration
+  bb54f43 Add TAFR repro-b10 results, DTC dose probe, HF push script, and upload workflows

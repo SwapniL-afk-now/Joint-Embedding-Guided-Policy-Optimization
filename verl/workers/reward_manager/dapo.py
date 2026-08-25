@@ -65,6 +65,7 @@ class DAPORewardManager(AbstractRewardManager):
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        semantic_outcomes = []
 
         already_print_data_sources = {}
 
@@ -109,11 +110,13 @@ class DAPORewardManager(AbstractRewardManager):
             score: float
             if isinstance(result, dict):
                 score = result["score"]
+                semantic_outcomes.append(result.get("acc", result.get("correct", score)))
                 # Store the information including original reward
                 for key, value in result.items():
                     reward_extra_info[key].append(value)
             else:
                 score = result
+                semantic_outcomes.append(score)
                 reward_extra_info["acc"].append(score)
 
             reward = score
@@ -145,6 +148,7 @@ class DAPORewardManager(AbstractRewardManager):
                 else:
                     print("[score]", score)
 
+        data.batch["sdc_outcome"] = torch.tensor(semantic_outcomes, dtype=torch.float32, device=data.batch["responses"].device)
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,

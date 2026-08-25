@@ -287,7 +287,7 @@ if (( N_COT + N_CODE != ROLLOUT_N )); then
     exit 1
 fi
 
-if [[ "${JEPA_ENABLE}" == "True" ]]; then
+if [[ "${JEPA_ENABLE}" == "True" && "${JEPA_LOSS_TYPE}" != "llm-jepa" ]]; then
 for c in "${TEACHER_CACHE}" "${CODE_TEACHER_CACHE}"; do
     if [[ ! -f "${c}" ]]; then
         echo "Missing JEPA teacher cache: ${c}" >&2

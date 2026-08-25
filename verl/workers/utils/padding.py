@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
@@ -126,21 +125,43 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
         response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
         max_response_len = response_ids.shape[1]
 
+    # Keep all indexing metadata beside the model output. The previous
+    # implementation iterated over every response and called F.pad followed by
+    # torch.stack. On the actor hot path that creates a Python/device sync
+    # point for every sample in every microbatch. Build the response gather
+    # indices once and scatter the selected tokens into the padded result using
+    # device-side tensor operations instead.
+    prompt_lens = prompt_lens.to(device=values.device, dtype=torch.long)
+    response_lens = response_lens.to(device=values.device, dtype=torch.long)
     sequence_lens = prompt_lens + response_lens
     sequence_offsets = sequence_lens.cumsum(dim=0)
     assert sequence_offsets[-1].item() == values.shape[0]
     assert not prompt_lens.eq(0).any(), f"seq_offset - resp_len - 1 assumes prompt_len > 0. Got {prompt_lens}"
 
-    response_list = []
-    # Skip padding dimensions after sequence dimensions, if any.
-    skip_padding = (0, 0) * (values.ndim - 1)
-    for resp_len, seq_offset in zip(response_lens, sequence_offsets, strict=True):
-        pad_size = max_response_len - resp_len
-        # left-shift model output by one token for log_probs/values
-        response_list.append(F.pad(values[seq_offset - resp_len - 1 : seq_offset - 1], (*skip_padding, 0, pad_size)))
+    batch_size = response_lens.numel()
+    output_shape = (batch_size, max_response_len, *values.shape[1:])
+    total_response_tokens = int(response_lens.sum().item())
+    if total_response_tokens == 0:
+        return values.new_zeros(output_shape)
 
-    output = torch.stack(response_list, dim=0)
-    return output
+    response_row = torch.repeat_interleave(
+        torch.arange(batch_size, device=values.device, dtype=torch.long), response_lens
+    )
+    response_start = sequence_offsets - response_lens - 1
+    response_segment_start = torch.cumsum(response_lens, dim=0) - response_lens
+    response_offset = torch.repeat_interleave(response_segment_start, response_lens)
+    response_column = torch.arange(total_response_tokens, device=values.device, dtype=torch.long) - response_offset
+
+    # Left-shift model output by one token for log-probability/value alignment.
+    source_index = torch.repeat_interleave(response_start, response_lens) + response_column
+    selected = values.index_select(0, source_index)
+
+    # index_copy preserves autograd from the selected model outputs while
+    # avoiding per-sample padding kernels and Python-side tensor construction.
+    flat_index = response_row * max_response_len + response_column
+    output = values.new_zeros((batch_size * max_response_len, *values.shape[1:]))
+    output = output.index_copy(0, flat_index, selected)
+    return output.reshape(output_shape)
 
 
 def build_attention_mask_from_nested(input_ids: torch.Tensor, max_seq_len: int | None = None) -> torch.Tensor:

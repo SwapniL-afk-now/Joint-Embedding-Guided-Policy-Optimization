@@ -40,7 +40,11 @@ if (_major or 0) >= 10:
 # ahead of it on PYTHONPATH (breaks numba/scipy in the vLLM workers).
 _venv_site_packages = sysconfig.get_paths().get("purelib", "")
 _verl_repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_extra_pythonpath = f"{_venv_site_packages}:{_verl_repo}"
+_extra_pythonpath_entries = [_venv_site_packages, _verl_repo]
+_extra_pythonpath_entries.extend(
+    value for value in os.environ.get("VERL_EXTRA_PYTHONPATH", "").split(":") if value
+)
+_extra_pythonpath = ":".join(_extra_pythonpath_entries)
 
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
@@ -97,8 +101,65 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
-    # Ray workers don't inherit the driver's os.environ; pass these explicitly
-    for key in ("WANDB_API_KEY", "HF_TOKEN", "LD_PRELOAD"):
+    # Ray workers don't inherit the driver's os.environ; pass these explicitly.
+    # WANDB_RUN_ID is read by Tracking inside the TaskRunner actor; without it here a
+    # resumed training run starts a *new* wandb run instead of continuing the old one.
+    for key in (
+        "WANDB_API_KEY",
+        "HF_TOKEN",
+        "LD_PRELOAD",
+        "WANDB_RUN_ID",
+        "PYTHONPATH",
+        "VERL_EXTRA_PYTHONPATH",
+        "LD_LIBRARY_PATH",
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "CUDACXX",
+        "CPATH",
+        "TRITON_CACHE_DIR",
+    ):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env
+
+
+# env_vars carries real credentials into the Ray runtime env, so anything that prints
+# the runtime env prints the secrets. Every training log used to contain the plaintext
+# WANDB_API_KEY and HF_TOKEN because of this.
+SECRET_ENV_KEYS = ("WANDB_API_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "OPENAI_API_KEY")
+
+
+def redact_secrets(obj):
+    """Deep-copy `obj` with the values of SECRET_ENV_KEYS replaced by '***'.
+
+    Accepts plain dicts/lists or OmegaConf containers; returns a plain container.
+    Use before printing or logging anything that may carry the Ray runtime env.
+    """
+    try:
+        from omegaconf import DictConfig, ListConfig, OmegaConf
+
+        if isinstance(obj, DictConfig | ListConfig):
+            obj = OmegaConf.to_container(obj, resolve=False)
+    except ImportError:
+        pass
+    if isinstance(obj, dict):
+        return {k: ("***" if k in SECRET_ENV_KEYS else redact_secrets(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_secrets(v) for v in obj]
+    return obj
+
+
+def _demo():
+    env = {"runtime_env": {"env_vars": {"WANDB_API_KEY": "real", "HF_TOKEN": "real", "OMP_NUM_THREADS": "2"}}}
+    out = redact_secrets(env)
+    vars_ = out["runtime_env"]["env_vars"]
+    assert vars_["WANDB_API_KEY"] == "***", vars_
+    assert vars_["HF_TOKEN"] == "***", vars_
+    assert vars_["OMP_NUM_THREADS"] == "2", vars_
+    assert env["runtime_env"]["env_vars"]["WANDB_API_KEY"] == "real", "must not mutate the input"
+    assert redact_secrets([{"HF_TOKEN": "x"}]) == [{"HF_TOKEN": "***"}]
+    print("redact_secrets ok")
+
+
+if __name__ == "__main__":
+    _demo()

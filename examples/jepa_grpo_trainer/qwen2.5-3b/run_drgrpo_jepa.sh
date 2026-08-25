@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Dr.GRPO + JEPA (jepa-tcr-dual) | Qwen2.5-3B-Instruct | Ray + FSDP + hybrid-engine vLLM
+# Dr.GRPO + LLM-JEPA (paper-exact, arXiv:2509.14252) | Qwen2.5-3B-Instruct | Ray + FSDP + hybrid-engine vLLM
 # Dr.GRPO core (unnormalized advantage, symmetric clip 0.2, no overlong
-# penalty, no dynamic sampling) with the JEPA dual-view objective: 4 CoT +
-# 4 Code rollouts/prompt, Code view EXECUTED and scored on printed answer
-# (verl/experimental/jepa_grpo/code_exec.py). JEPA auto-off patience 10.
+# penalty, no dynamic sampling) with the LLM-JEPA auxiliary objective:
+# 8 CoT rollouts/prompt (no code rollouts); each student CoT's [PRED]-token
+# read predicts BOTH pregenerated big-teacher views (CoT + Code) with the
+# paper's cosine-distance loss — no stop-grad, no SIGReg, no reward shaping.
+# JEPA auto-off patience 10.
 # DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization, arXiv:2503.14476) keeps the
 # GRPO group-relative advantage (WITH std normalization, unlike Dr.GRPO) and adds:
 #   - Clip-Higher: decoupled clip epsilons (clip_ratio_low=0.2, clip_ratio_high=0.28) + clip_ratio_c
@@ -132,8 +134,10 @@ fi
 # On the local 96GB Blackwell GPU, 64 prompts x 8 rollouts gave the best tested utilization.
 TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}
 NUM_GENERATIONS=${NUM_GENERATIONS:-8}
-N_COT=${N_COT:-4}
-N_CODE=${N_CODE:-4}
+# llm-jepa (default): the student generates CoT rollouts only — the Code view
+# comes from the pregenerated teacher cache, not from student rollouts.
+N_COT=${N_COT:-8}
+N_CODE=${N_CODE:-0}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
@@ -160,29 +164,51 @@ KL_LOSS_COEF=${KL_LOSS_COEF:-0.0}
 # vLLM async-engine drain before back-to-back CoT/Code rollout RPCs.
 JEPA_VLLM_DRAIN_S=${JEPA_VLLM_DRAIN_S:-2}
 export JEPA_VLLM_DRAIN_S
+# JEPA_UPDATE_NO_GC=1 runs the GRPO actor update WITHOUT gradient checkpointing
+# (~25-35% faster) but OOMs with the 3B model at ppo_max_token_len 16384 on 96GB
+# (verified: Triton CUDA OOM in update_actor). Keep GC ON for 3B.
+export JEPA_UPDATE_NO_GC=${JEPA_UPDATE_NO_GC:-0}
 
-# JEPA/TCR-dual auxiliary objective.
+# LLM-JEPA auxiliary objective (paper-exact, arXiv:2509.14252; default mode).
+# Student CoT anchors predict BOTH pregenerated teacher views via [PRED]-token
+# reads; cosine-distance loss, flat mean, NO stop-grad, no SIGReg, no shaping.
 JEPA_ENABLE=${JEPA_ENABLE:-True}
-ALPHA=${ALPHA:-0.005}
+# ALPHA = the paper's λ. The paper's SFT-scale values (λ∈{0.5..4}) are calibrated
+# against a CE loss whose gradient is O(1-10); measured here (3B smoke run), the
+# RL policy gradient is ~0.006-0.014 pre-clip while grad(L_JEPA) is ~10-18, so
+# λ=0.5 made the fused update >99% JEPA (combined norm ~9 vs clip 0.5 — GRPO
+# erased). α=1e-3 puts α·grad(L_JEPA) at ~1-2x the policy gradient: a real
+# auxiliary signal that cannot drown the RL objective.
+ALPHA=${ALPHA:-0.001}
 EMA_DECAY=${EMA_DECAY:-0.99}
 EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-32}
 MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
-JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-tcr-dual}
-JEPA_REWARD_BETA=${JEPA_REWARD_BETA:-0.5}
+JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-llm-jepa}
+# Paper has NO reward shaping; β=0 also skips the whole per-step forward-only
+# shaping embedding pass (score_cot_embeddings + embed_targets) — the dominant
+# per-step embedding bottleneck in the previous recipe.
+JEPA_REWARD_BETA=${JEPA_REWARD_BETA:-0}
 JEPA_SIGMA_FLOOR=${JEPA_SIGMA_FLOOR:-0.1}
 TEACHER_CACHE=${TEACHER_CACHE:-/workspace/jepa-grpo-cache/teacher_targets.pt.responses.pt}
 CODE_TEACHER_CACHE=${CODE_TEACHER_CACHE:-/workspace/jepa-grpo-cache/code_teacher_targets.pt.responses.pt}
+# Cap teacher target views at the prompt+response budget (4096) — no YaRN or any
+# context extension; also bounds the per-step target-encode cost.
+TARGET_MAX_LENGTH=${TARGET_MAX_LENGTH:-4096}
 TCR_MATCH=${TCR_MATCH:-cycle}
-SELF_CONSIST_W=${SELF_CONSIST_W:-1.0}
+# Anchors per prompt entering the JEPA backward (paper trains ONE pair/example;
+# this is also the main JEPA-update speed lever). 0 = use all selected anchors.
+MAX_ANCHORS_PER_PROMPT=${MAX_ANCHORS_PER_PROMPT:-2}
 AUTO_OFF_ENABLE=${AUTO_OFF_ENABLE:-True}
 AUTO_OFF_PATIENCE=${AUTO_OFF_PATIENCE:-10}
 AUTO_OFF_MIN_DELTA=${AUTO_OFF_MIN_DELTA:-0.002}
 AUTO_OFF_WARMUP=${AUTO_OFF_WARMUP:-20}
 AUTO_OFF_MIN_COS=${AUTO_OFF_MIN_COS:-0.0}
 JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
-LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
-TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.3}
-N_PROJECTIONS=${N_PROJECTIONS:-4096}
+# k literal predictor tokens <|predictor_k|>..<|predictor_1|> on each student CoT
+# anchor, exactly as the official finetune.py (new special tokens in the tokenizer,
+# ids in Qwen's spare padded embedding rows — no resize). Paper sweeps k∈{0..4};
+# GSM8K best k=4 (paired with λ=0.5) — used as default.
+LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-4}
 JEPA_MAX_GRAD_NORM=${JEPA_MAX_GRAD_NORM:-0.5}
 ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-0}
 
@@ -233,7 +259,7 @@ TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}   # skip the step-0 pre-train validation; go straight into training
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}   # only the most recent checkpoint is kept on disk
 
-PROJECT_NAME=${PROJECT_NAME:-dapo_deepseek_1.5B}
+PROJECT_NAME=${PROJECT_NAME:-grpo-qwen-3b}
 export WANDB_ENTITY=${WANDB_ENTITY:-ismamnurswapnil-bangladesh-university-of-engineering-and}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
 MODEL_NAME=${MODEL_NAME:-$(basename "${MODEL_PATH}")}
@@ -348,15 +374,14 @@ JEPA=(
     jepa.min_valid_pairs=${MIN_VALID_PAIRS}
     jepa.loss_type=${JEPA_LOSS_TYPE}
     jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
-    jepa.triplet_sigreg_lambda=${TRIPLET_SIGREG_LAMBDA}
-    jepa.n_projections=${N_PROJECTIONS}
     jepa.alpha_warmup_steps=${ALPHA_WARMUP_STEPS}
     jepa.max_grad_norm=${JEPA_MAX_GRAD_NORM}
     jepa.teacher_cache_path=${TEACHER_CACHE}
     jepa.code_teacher_cache_path=${CODE_TEACHER_CACHE}
+    jepa.target_max_length=${TARGET_MAX_LENGTH}
     jepa.tcr_match=${TCR_MATCH}
+    jepa.max_anchors_per_prompt=${MAX_ANCHORS_PER_PROMPT}
     jepa.jepa_anchor_set=${JEPA_ANCHOR_SET}
-    jepa.self_consist_w=${SELF_CONSIST_W}
     jepa.tcr_reward_beta=${JEPA_REWARD_BETA}
     jepa.tcr_reward_sigma_floor=${JEPA_SIGMA_FLOOR}
     jepa.auto_off_enable=${AUTO_OFF_ENABLE}

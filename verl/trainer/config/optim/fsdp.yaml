@@ -8,6 +8,9 @@ optimizer: AdamW
 # Examples: "torch.optim", "torchao.optim", "bitsandbytes.optim"
 optimizer_impl: torch.optim
 
+# Use PyTorch's fused CUDA AdamW implementation when explicitly enabled.
+fused: null
+
 # Learning rate
 lr: 1e-3
 

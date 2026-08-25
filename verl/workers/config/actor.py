@@ -145,6 +145,8 @@ class ActorConfig(BaseConfig):
         kl_loss_coef (float): KL divergence loss coefficient.
         kl_loss_type (str): Type of KL loss to use.
         ppo_epochs (int): Number of PPO epochs per training step.
+        accumulate_minibatch_grads (bool): Treat mini-batches as gradient-accumulation
+            units of one logical batch, giving exactly one optimizer step per update.
         shuffle (bool): Whether to shuffle data during training.
         checkpoint (CheckpointConfig): Configuration for checkpointing.
         optim (OptimizerConfig): Configuration for optimizer.
@@ -197,6 +199,11 @@ class ActorConfig(BaseConfig):
     # and ppo_mini_batch_size >= train_batch_size), skip the separate old_log_prob
     # forward and let the loss default old_log_prob = log_prob.detach() (ratio == 1).
     fuse_old_log_prob: bool = False
+    # Treat this update's PPO mini-batches as gradient-accumulation units of ONE
+    # logical batch: zero the gradient once before the first, take exactly one
+    # optimizer step after the last. False keeps the historical behavior of an
+    # independent zero_grad/backward/step per mini-batch.
+    accumulate_minibatch_grads: bool = False
     shuffle: bool = False
     data_loader_seed: int = 1
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)

@@ -24,7 +24,7 @@ from typing import Any, Literal, Optional, get_args
 import torch
 from vllm.outputs import RequestOutput
 
-from verl.experimental.tafr_grpo.vllm_scoring import tafr_vllm_adapter_spec
+from verl.experimental.sdc.vllm_scoring import sdc_vllm_adapter_spec
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
@@ -262,15 +262,15 @@ class vLLMColocateWorkerExtension:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
 
-    def load_tafr_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict = None, lora_tensors_pkl: bytes = None):
+    def load_sdc_lora_adapter(self, adapter: str, peft_config: dict, lora_tensors: dict = None, lora_tensors_pkl: bytes = None):
         import pickle
         if lora_tensors_pkl is not None:
             lora_tensors = pickle.loads(lora_tensors_pkl)
-        # Register each TAFR adapter under its own dedicated int_id (anchor=124,
-        # replay=125) so multiple adapters can stay resident and be co-batched in a
+        # Register each SDC adapter under its own dedicated int_id so both models
+        # can stay resident and be co-batched in a
         # single prefill sweep. Only evict this adapter's own slot on reload — leave
-        # the actor LoRA (VLLM_LORA_INT_ID) and the sibling TAFR adapter untouched.
-        spec = tafr_vllm_adapter_spec(adapter)
+        # the actor LoRA (VLLM_LORA_INT_ID) and the sibling SDC adapter untouched.
+        spec = sdc_vllm_adapter_spec(adapter)
         if spec.int_id in list(self.list_loras()):
             self.remove_lora(spec.int_id)
         self.add_lora(
@@ -283,7 +283,7 @@ class vLLMColocateWorkerExtension:
             )
         )
         logger.info(
-            f"vLLM loaded TAFR {adapter} adapter into slot int_id={spec.int_id}, tensors={len(lora_tensors)}"
+            f"vLLM loaded SDC {adapter} adapter into slot int_id={spec.int_id}, tensors={len(lora_tensors)}"
         )
 
     def _get_zmq_handle(self) -> str:

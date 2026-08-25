@@ -53,6 +53,7 @@ class NaiveRewardManager(AbstractRewardManager):
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        semantic_outcomes = []
 
         already_print_data_sources = {}
 
@@ -91,11 +92,13 @@ class NaiveRewardManager(AbstractRewardManager):
 
             if isinstance(score, dict):
                 reward = score["score"]
+                semantic_outcomes.append(score.get("acc", score.get("correct", reward)))
                 # Store the information including original reward
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
             else:
                 reward = score
+                semantic_outcomes.append(reward)
 
             reward_tensor[i, valid_response_length - 1] = reward
 
@@ -113,6 +116,7 @@ class NaiveRewardManager(AbstractRewardManager):
                 else:
                     print("[score]", score)
 
+        data.batch["sdc_outcome"] = torch.tensor(semantic_outcomes, dtype=torch.float32, device=data.batch["responses"].device)
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
