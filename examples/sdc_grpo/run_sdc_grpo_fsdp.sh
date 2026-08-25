@@ -76,13 +76,29 @@ for LOCAL_CUDA_LIB_DIR in \
     fi
 done
 GXPO_SITE_PACKAGES=${GXPO_SITE_PACKAGES:-${GXPO_REFERENCE_ROOT}/.venv/lib/python3.12/site-packages}
+SDC_SITE_PACKAGES=${SDC_SITE_PACKAGES:-${REPO_ROOT}/.venv/lib/python3.12/site-packages}
+
+# Resolve FlashAttention2 + Liger: prefer the verified GXPO bundle, fall back
+# to the SDC venv's own packages (e.g. a self-contained Blackwell install),
+# and only fail when NEITHER location provides both packages.
+_EXTRA_PYTHONPATH=""
 if [[ -d "${GXPO_SITE_PACKAGES}/flash_attn" && -d "${GXPO_SITE_PACKAGES}/liger_kernel" ]]; then
-    SDC_SITE_PACKAGES=${SDC_SITE_PACKAGES:-${REPO_ROOT}/.venv/lib/python3.12/site-packages}
-    export VERL_EXTRA_PYTHONPATH="${GXPO_SITE_PACKAGES}"
-    export PYTHONPATH="${SDC_SITE_PACKAGES}:${GXPO_SITE_PACKAGES}${PYTHONPATH:+:${PYTHONPATH}}"
+    _EXTRA_PYTHONPATH="${GXPO_SITE_PACKAGES}"
+elif [[ -d "${SDC_SITE_PACKAGES}/flash_attn" && -d "${SDC_SITE_PACKAGES}/liger_kernel" ]]; then
+    echo "Using FlashAttention2/Liger from the SDC venv (${SDC_SITE_PACKAGES}); GXPO bundle not found."
+elif [[ -d "${GXPO_SITE_PACKAGES}/flash_attn" || -d "${SDC_SITE_PACKAGES}/flash_attn" ]] && [[ ! -d "${GXPO_SITE_PACKAGES}/liger_kernel" && ! -d "${SDC_SITE_PACKAGES}/liger_kernel" ]]; then
+    echo "WARNING: flash_attn found but liger_kernel missing; disabling Liger kernels." >&2
+    USE_LIGER=false
 else
-    echo "Missing verified GXPO FlashAttention2/Liger packages under ${GXPO_SITE_PACKAGES}" >&2
+    echo "ERROR: no FlashAttention2 package found in either of:" >&2
+    echo "  - ${GXPO_SITE_PACKAGES}" >&2
+    echo "  - ${SDC_SITE_PACKAGES}" >&2
+    echo "Build FA2 for sm_120 (see BLACKWELL_SETUP.md) or point GXPO_SITE_PACKAGES at a bundle that has it." >&2
     exit 2
+fi
+export VERL_EXTRA_PYTHONPATH="${_EXTRA_PYTHONPATH}"
+if [[ -n "${_EXTRA_PYTHONPATH}" ]]; then
+    export PYTHONPATH="${SDC_SITE_PACKAGES}:${_EXTRA_PYTHONPATH}${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-${REPO_ROOT}/.cache/triton}
 export TRITON_CACHE_DIR
@@ -157,10 +173,21 @@ for required_file in \
     "${MATH500_FILE}" "${AIME24_FILE}" "${AIME25_FILE}" \
     "${AMC23_FILE}" "${MINERVA_FILE}" "${OLYMPIADBENCH_FILE}"; do
     if [[ ! -f "${required_file}" ]]; then
-        echo "Missing GXPO reference dataset: ${required_file}" >&2
+        echo "ERROR: missing dataset file: ${required_file}" >&2
+        echo "Override the defaults instead of editing the launcher, e.g.:" >&2
+        echo "  TRAIN_DAPO_FILE=/path/train.parquet TRAIN_LIGHTEVAL_FILE=/path/train.parquet \\" >&2
+        echo "  SDC_VAL_CACHE_ROOT=/dir/with-math500-aime24-aime25-amc23-minervamath-olympiadbench-parquets \\" >&2
+        echo "  bash examples/sdc_grpo/run_sdc_grpo_fsdp.sh" >&2
         exit 2
     fi
 done
+
+# Model preflight: fail with the fix in the message, not deep inside HF hub code.
+if [[ ! -d "${MODEL_PATH}" ]]; then
+    echo "ERROR: MODEL_PATH does not exist: ${MODEL_PATH}" >&2
+    echo "Override it, e.g.: MODEL_PATH=/models/Qwen2.5-Math-1.5B-Instruct bash examples/sdc_grpo/run_sdc_grpo_fsdp.sh" >&2
+    exit 2
+fi
 
 # ── SDC-GRPO hyperparameters ────────────────────────────────────────────────
 SDC_ENABLE=${SDC_ENABLE:-true}
@@ -214,9 +241,11 @@ SDC_DISTRIBUTED_METRICS=${SDC_DISTRIBUTED_METRICS:-false}
 TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-256}
 NUM_GENERATIONS=${NUM_GENERATIONS:-8}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
-# One full logical PPO batch avoids repeated optimizer/FSDP synchronization boundaries.
-# Dynamic token batching still splits this batch for memory safety.
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-256}
+# Minibatch 64 = 4 optimizer slices over the 2048-row logical batch.
+# NOTE: this disables the fused old-log-prob fast path (it requires
+# ppo_mini_batch_size * rollout.n >= batch rows; 64*8=512 < 2048), so each
+# step pays one separate old-policy forward. Set 256 to restore the fusion.
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
 FUSE_OLD_LOG_PROB=${FUSE_OLD_LOG_PROB:-true}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
