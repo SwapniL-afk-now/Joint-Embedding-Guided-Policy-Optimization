@@ -6,7 +6,20 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
 
+import numpy as np
 import torch
+
+
+def _as_id_array(ids: Any) -> Optional[np.ndarray]:
+    """Normalize token ids into one compact int64 numpy array.
+
+    Python int lists cost roughly an order of magnitude more memory per token
+    than int64 arrays and pickle far less compactly.  Lists are converted
+    exactly once, here.
+    """
+    if ids is None:
+        return None
+    return np.asarray(ids, dtype=np.int64)
 
 
 def validate_sdc_outcome(outcome: torch.Tensor | Any) -> torch.BoolTensor:
@@ -55,8 +68,10 @@ class OutcomeExample:
     metadata: dict[str, Any] = field(default_factory=dict)
     # When available, keep the already-tokenized prompt/response. This avoids
     # decode -> chat-template -> tokenize churn before every SFT refresh.
-    prompt_ids: Optional[list[int]] = None
-    response_ids: Optional[list[int]] = None
+    # Ids are stored as compact int64 numpy arrays (converted once on add);
+    # plain int lists are accepted transparently at the constructor boundary.
+    prompt_ids: Optional[np.ndarray] = None
+    response_ids: Optional[np.ndarray] = None
 
 
 class OutcomeDataCollector:
@@ -81,9 +96,53 @@ class OutcomeDataCollector:
         self._rng = random.Random(seed)
         self._examples = deque(maxlen=max_size) if sampling == "recent" else []
         self.total_seen = 0
+        # Incremental minimum explicit policy step among retained examples,
+        # maintained on add/consume so buffer_age() is O(1) instead of a scan.
+        # _min_policy_step_count tracks how many retained examples carry that
+        # exact step so removals know when the cached minimum went stale and a
+        # rescan is needed.
+        self._min_policy_step: Optional[int] = None
+        self._min_policy_step_count: int = 0
 
     def __len__(self) -> int:
         return len(self._examples)
+
+    @staticmethod
+    def _example_policy_step(metadata: dict[str, Any]) -> Optional[int]:
+        value = metadata.get("global_policy_step", metadata.get("global_grpo_step"))
+        return int(value) if value is not None else None
+
+    def _track_step_on_add(self, example: OutcomeExample) -> None:
+        step = self._example_policy_step(example.metadata)
+        if step is None:
+            return
+        if self._min_policy_step is None or step < self._min_policy_step:
+            self._min_policy_step = step
+            self._min_policy_step_count = 1
+        elif step == self._min_policy_step:
+            self._min_policy_step_count += 1
+
+    def _track_steps_on_remove(self, removed: list[OutcomeExample]) -> None:
+        # Call only AFTER the examples are already out of self._examples: a
+        # rescan triggered here observes the final retained set.
+        for example in removed:
+            if self._min_policy_step is None:
+                return
+            step = self._example_policy_step(example.metadata)
+            if step is not None and step == self._min_policy_step:
+                self._min_policy_step_count -= 1
+                if self._min_policy_step_count <= 0:
+                    self._recompute_min_policy_step()
+                    return
+
+    def _recompute_min_policy_step(self) -> None:
+        steps = [s for s in map(self._example_policy_step, (e.metadata for e in self._examples)) if s is not None]
+        if steps:
+            self._min_policy_step = min(steps)
+            self._min_policy_step_count = steps.count(self._min_policy_step)
+        else:
+            self._min_policy_step = None
+            self._min_policy_step_count = 0
 
     def add(
         self,
@@ -106,18 +165,25 @@ class OutcomeDataCollector:
             response,
             self.target_reward,
             metadata or {},
-            prompt_ids=prompt_ids,
-            response_ids=response_ids,
+            prompt_ids=_as_id_array(prompt_ids),
+            response_ids=_as_id_array(response_ids),
         )
         self.total_seen += 1
         if self.sampling == "recent":
+            self._track_step_on_add(example)
             self._examples.append(example)
         elif self.max_size is None or len(self._examples) < self.max_size:
+            self._track_step_on_add(example)
             self._examples.append(example)
         else:
             index = self._rng.randrange(self.total_seen)
             if index < self.max_size:
+                # Overwrite BEFORE removal tracking: _track_steps_on_remove()
+                # must observe the post-eviction retained set when it rescans.
+                evicted = self._examples[index]
                 self._examples[index] = example
+                self._track_steps_on_remove([evicted])
+                self._track_step_on_add(example)
         return True
 
     def add_many(self, rows: Iterable[dict[str, Any]]) -> int:
@@ -133,17 +199,29 @@ class OutcomeDataCollector:
 
     def clear(self) -> None:
         self._examples.clear()
+        self._min_policy_step = None
+        self._min_policy_step_count = 0
 
     def consume(self, count: int) -> None:
         if count < 0:
             raise ValueError("count must be non-negative")
         if self.sampling == "recent":
+            removed = []
             for _ in range(min(count, len(self._examples))):
-                self._examples.popleft()
+                removed.append(self._examples.popleft())
+            self._track_steps_on_remove(removed)
         else:
-            del self._examples[: min(count, len(self._examples))]
+            bound = min(count, len(self._examples))
+            removed = [self._examples[i] for i in range(bound)]
+            del self._examples[:bound]
+            self._track_steps_on_remove(removed)
 
     def to_records(self) -> list[dict[str, Any]]:
+        # Boundary format choice: keep prompt_ids/response_ids as int64 numpy
+        # arrays.  Every consumer (Ray pickling to SFT workers, torch.save of
+        # state_dict, encode_outcome_example's list()/slicing/torch.as_tensor)
+        # handles numpy arrays directly and they pickle far more compactly
+        # than Python int lists, so lists are no longer materialized here.
         return [asdict(example) for example in self._examples]
 
     def state_dict(self) -> dict[str, Any]:
@@ -176,18 +254,14 @@ class OutcomeDataCollector:
             self._rng.setstate(state["rng_state"])
 
     def buffer_age(self, current_policy_step: int) -> float:
-        if not self._examples:
+        # O(1) via the incrementally maintained minimum explicit policy step.
+        # Equivalent to the old per-call scan: examples without an explicit
+        # step key used the query-time step as a default, which never lowered
+        # min() below any explicitly recorded step; when NO retained example
+        # carries an explicit step, both versions return 0.0.
+        if not self._examples or self._min_policy_step is None:
             return 0.0
-        steps = [
-            int(
-                example.metadata.get(
-                    "global_policy_step",
-                    example.metadata.get("global_grpo_step", current_policy_step),
-                )
-            )
-            for example in self._examples
-        ]
-        return float(max(0, current_policy_step - min(steps)))
+        return float(max(0, int(current_policy_step) - self._min_policy_step))
 
 
 class SuccessDataCollector(OutcomeDataCollector):

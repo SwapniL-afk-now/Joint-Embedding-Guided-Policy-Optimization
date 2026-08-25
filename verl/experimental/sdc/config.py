@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -151,6 +152,14 @@ def validate_sdc_config(config: DictConfig | dict) -> SDCConfig:
         raise ValueError("SDC SFT learning rate and batch size must be positive.")
     if settings.sft_max_token_len_per_gpu < 0 or settings.sft_max_updates_per_interval <= 0:
         raise ValueError("SDC token budget must be non-negative and update budget positive.")
+    if settings.data_max_size is None:
+        # Advisory only: behavior is unchanged (unbounded buffers remain legal).
+        warnings.warn(
+            "custom_sdc.data_max_size is null: SDC success/failure outcome "
+            "buffers will grow without bound over training. Set a positive "
+            "integer cap to bound memory use.",
+            stacklevel=2,
+        )
     if settings.data_max_size is not None and settings.data_max_size <= 0:
         raise ValueError("custom_sdc.data_max_size must be positive or null.")
     if settings.data_sampling not in {"recent", "uniform"}:

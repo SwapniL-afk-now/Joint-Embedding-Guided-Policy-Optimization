@@ -2355,8 +2355,16 @@ class RayPPOTrainer:
         if not self.sdc_enabled or self.sdc_success_collector is None or self.sdc_failure_collector is None:
             return 0, 0
         outcome = validate_sdc_outcome(batch.batch["sdc_outcome"]).cpu().tolist()
-        ctx = self._sdc_step_row_context(batch)
         uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [""] * len(outcome))]
+        # Build compact int64 numpy id arrays straight from the CPU tensors.
+        # Exact same token ids as the old list construction: prompt ids are the
+        # attention-masked prompt slice; response ids are responses[i,
+        # :response_len] (the old sequence-ids slice minus its prompt prefix).
+        prompts_t = batch.batch["prompts"].detach().cpu()
+        responses_t = batch.batch["responses"].detach().cpu()
+        attention_mask_t = batch.batch["attention_mask"].detach().cpu()
+        response_lens_t = batch.batch["response_mask"].detach().cpu().sum(-1)
+        prompt_width = prompts_t.shape[-1]
         success_count = failure_count = 0
         for i, reward in enumerate(outcome):
             row = dict(
@@ -2364,8 +2372,8 @@ class RayPPOTrainer:
                 # checkpoints; SFT consumes the IDs directly when present.
                 prompt="",
                 response="",
-                prompt_ids=list(ctx["prompt_ids"][i]),
-                response_ids=ctx["sequence_ids"][i][len(ctx["prompt_ids"][i]) :],
+                prompt_ids=prompts_t[i][attention_mask_t[i, :prompt_width].bool()].numpy(),
+                response_ids=responses_t[i, : int(response_lens_t[i])].numpy(),
                 reward=int(reward),
                 metadata={"uid": uids[i], "global_policy_step": self.global_steps},
             )
