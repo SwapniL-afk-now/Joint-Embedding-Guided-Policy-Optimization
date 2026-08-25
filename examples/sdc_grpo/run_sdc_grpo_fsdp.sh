@@ -191,7 +191,10 @@ SDC_FUSED_ADAMW=${SDC_FUSED_ADAMW:-true}
 # Match the GXPO actor optimization stack. These are explicit launcher
 # settings rather than relying on model/config defaults.
 USE_LIGER=${USE_LIGER:-true}
-USE_FUSED_KERNELS=${USE_FUSED_KERNELS:-true}
+# The measured SDC run was slower with the custom Triton linear-CE path than
+# the standard BF16 logits path. Keep it available as an explicit A/B option,
+# but use the verified standard path by default for throughput and stability.
+USE_FUSED_KERNELS=${USE_FUSED_KERNELS:-false}
 FUSED_KERNEL_BACKEND=${FUSED_KERNEL_BACKEND:-triton}
 USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-true}
 OPTIM_FUSED=${OPTIM_FUSED:-true}

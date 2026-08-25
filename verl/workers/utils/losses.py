@@ -17,7 +17,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.experimental.sharpening_grpo.loss import compute_sharpening_grpo_loss
-from verl.experimental.sdc.sdc_loss import compute_sdc_loss
+from verl.experimental.sdc.sdc_loss import _zero_metrics, compute_sdc_loss
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -89,6 +89,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
     metrics = {}
 
     sdc_config = tu.get_non_tensor_data(data=data, key="custom_sdc", default=None)
+    sdc_enabled = bool(sdc_config and sdc_config.get("enable", False))
+    sdc_models_ready = bool(sdc_config and sdc_config.get("sdc_models_ready", False))
+    sdc_loss_active = sdc_enabled and sdc_models_ready and float(sdc_config.get("beta", 0.0)) != 0.0
 
     gpi_config = tu.get_non_tensor_data(data=data, key="custom_gpi_ce", default=None)
     gpi_enabled = bool(gpi_config and gpi_config.get("enable", False))
@@ -119,13 +122,12 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         for field in ("rm_scores", "token_level_rewards"):
             if field in data:
                 fields.append(field)
-    sdc_enabled = bool(sdc_config and sdc_config.get("enable", False))
     # Keep SDC-only normalization and diagnostics out of the generic actor
     # aggregation payload. The same generic payload is expanded into agg_loss()
     # for PPO, entropy, and KL, whose API intentionally only accepts the common
     # distributed-batch fields.
     sdc_global_batch_info = config.global_batch_info
-    if sdc_enabled:
+    if sdc_loss_active:
         sdc_global_batch_info = dict(config.global_batch_info)
         active_token_count = tu.get_non_tensor_data(
             data=data, key="sdc_active_token_count", default=None
@@ -135,7 +137,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         sdc_global_batch_info["reduce_diagnostics"] = bool(
             sdc_config.get("distributed_metrics", False)
         )
-    if sdc_enabled:
+    if sdc_loss_active:
         for field in ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs"):
             if field in data:
                 fields.append(field)
@@ -258,24 +260,32 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         metrics["sharpen/beta"] = Metric(value=sharpening_beta, aggregation=AggregationType.MAX)
 
     if sdc_enabled:
-        required = ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs")
-        missing = [field for field in required if field not in data]
-        if missing:
-            raise ValueError(f"SDC batch is missing required fields: {missing}")
-        sdc_loss, sdc_stats = compute_sdc_loss(
-            log_prob=log_prob,
-            old_log_prob=old_log_prob,
-            success_log_prob=data["sdc_success_log_probs"],
-            failure_log_prob=data["sdc_failure_log_probs"],
-            response_mask=response_mask,
-            failure_mask=data["sdc_failure_mask"],
-            beta=float(sdc_config.get("beta", 0.0)),
-            loss_agg_mode="token-mean",
-            global_batch_info=sdc_global_batch_info,
-            use_importance_weight=bool(sdc_config.get("use_importance_weight", True)),
-            importance_weight_clip=float(sdc_config.get("importance_weight_clip", 10.0)),
-            models_ready=bool(sdc_config.get("sdc_models_ready", False)),
-        )
+        if not sdc_loss_active:
+            # Before both SFT models are ready, the auxiliary loss is exactly
+            # zero. Do not require or materialize its three large padded
+            # tensors in this phase; retaining the zero metrics keeps logging
+            # and aggregation unchanged.
+            sdc_loss = log_prob.sum() * 0.0
+            sdc_stats = _zero_metrics()
+        else:
+            required = ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs")
+            missing = [field for field in required if field not in data]
+            if missing:
+                raise ValueError(f"SDC batch is missing required fields: {missing}")
+            sdc_loss, sdc_stats = compute_sdc_loss(
+                log_prob=log_prob,
+                old_log_prob=old_log_prob,
+                success_log_prob=data["sdc_success_log_probs"],
+                failure_log_prob=data["sdc_failure_log_probs"],
+                response_mask=response_mask,
+                failure_mask=data["sdc_failure_mask"],
+                beta=float(sdc_config.get("beta", 0.0)),
+                loss_agg_mode="token-mean",
+                global_batch_info=sdc_global_batch_info,
+                use_importance_weight=bool(sdc_config.get("use_importance_weight", True)),
+                importance_weight_clip=float(sdc_config.get("importance_weight_clip", 10.0)),
+                models_ready=True,
+            )
         policy_loss = policy_loss + sdc_loss
         metrics.update(Metric.from_dict(sdc_stats, aggregation=AggregationType.MEAN))
     # add entropy loss
