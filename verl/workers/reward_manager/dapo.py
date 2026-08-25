@@ -110,13 +110,15 @@ class DAPORewardManager(AbstractRewardManager):
             score: float
             if isinstance(result, dict):
                 score = result["score"]
-                semantic_outcomes.append(result.get("acc", result.get("correct", score)))
+                # Only an explicit verifier correctness field counts as the SDC
+                # outcome; fall back to None instead of the shaped reward.
+                semantic_outcomes.append(result.get("acc", result.get("correct")))
                 # Store the information including original reward
                 for key, value in result.items():
                     reward_extra_info[key].append(value)
             else:
                 score = result
-                semantic_outcomes.append(score)
+                semantic_outcomes.append(None)
                 reward_extra_info["acc"].append(score)
 
             reward = score
@@ -148,7 +150,14 @@ class DAPORewardManager(AbstractRewardManager):
                 else:
                     print("[score]", score)
 
-        data.batch["sdc_outcome"] = torch.tensor(semantic_outcomes, dtype=torch.float32, device=data.batch["responses"].device)
+        # Expose sdc_outcome only when every row had an explicit verifier
+        # correctness field (acc/correct). Otherwise leave it unset so
+        # extract_sdc_outcome fails fast with its clear message instead of
+        # validating shaped rewards mid-training.
+        if all(outcome is not None for outcome in semantic_outcomes):
+            data.batch["sdc_outcome"] = torch.tensor(
+                semantic_outcomes, dtype=torch.float32, device=data.batch["responses"].device
+            )
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,

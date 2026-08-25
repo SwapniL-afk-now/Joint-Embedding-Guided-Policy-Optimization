@@ -102,12 +102,14 @@ class BatchRewardManager(AbstractRewardManager):
 
             if isinstance(score, dict):
                 reward = score["score"]
-                semantic_outcomes.append(score.get("acc", score.get("correct", reward)))
+                # Only an explicit verifier correctness field counts as the SDC
+                # outcome; fall back to None instead of the shaped reward.
+                semantic_outcomes.append(score.get("acc", score.get("correct")))
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
             else:
                 reward = score
-                semantic_outcomes.append(reward)
+                semantic_outcomes.append(None)
 
             rewards.append(reward)
             reward_tensor[i, length - 1] = reward
@@ -124,7 +126,14 @@ class BatchRewardManager(AbstractRewardManager):
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
         data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
-        data.batch["sdc_outcome"] = torch.tensor(semantic_outcomes, dtype=torch.float32, device=prompt_ids.device)
+        # Expose sdc_outcome only when every row had an explicit verifier
+        # correctness field (acc/correct). Otherwise leave it unset so
+        # extract_sdc_outcome fails fast with its clear message instead of
+        # validating shaped rewards mid-training.
+        if all(outcome is not None for outcome in semantic_outcomes):
+            data.batch["sdc_outcome"] = torch.tensor(
+                semantic_outcomes, dtype=torch.float32, device=prompt_ids.device
+            )
 
         if return_dict:
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}

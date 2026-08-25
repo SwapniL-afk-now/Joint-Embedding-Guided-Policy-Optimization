@@ -620,7 +620,11 @@ class vLLMHttpServer:
         """Score existing prompt+response tokens under a SDC LoRA adapter."""
 
         if self.node_rank != 0:
-            return []
+            raise RuntimeError(
+                f"SDC vLLM scoring is only supported on node_rank 0, but this server has node_rank={self.node_rank} "
+                f"(server={self.__class__.__name__}, replica_rank: {self.replica_rank}, "
+                f"node_rank: {self.node_rank}, address: {self._server_address})."
+            )
         sequence_ids = normalize_token_ids(sequence_ids)
         spec = sdc_vllm_adapter_spec(adapter)
         if spec.int_id not in await self.engine.list_loras():
