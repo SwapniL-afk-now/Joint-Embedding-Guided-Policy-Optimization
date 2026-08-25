@@ -183,17 +183,6 @@ custom_sdc:
   # the actor module is never touched and numerics are unchanged.
   sidecar_gradient_checkpointing: null
 
-  # ---- Algorithm-strength variants (all default to locked legacy behavior) ----
-  # Train success/failure teachers on prompt-matched subsets (same uids in both
-  # buffers) so both teachers see the same prompt distribution; removes
-  # coverage-asymmetry bias from the contrast signal.
-  match_prompts: false
-  # Subtract the detached mean contrast over active tokens before importance
-  # weighting (removes the common-mode uniform-mass component).
-  contrast_centering: false
-  # Divide by the detached RMS of active contrasts for scale-stable beta.
-  contrast_scale_normalize: false
-
 # config for Sequence Sharpening GRPO
 custom_sharpening_grpo:
 

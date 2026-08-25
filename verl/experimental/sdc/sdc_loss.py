@@ -66,8 +66,6 @@ def compute_sdc_loss(
     use_importance_weight: bool = True,
     importance_weight_clip: float = 10.0,
     models_ready: bool = True,
-    use_centering: bool = False,
-    use_scale_normalize: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the locked SDC auxiliary on failed response tokens only.
 
@@ -123,22 +121,18 @@ def compute_sdc_loss(
     contrast = failure_a - success_a
     contrast_center_t = torch.zeros((), device=log_prob.device, dtype=torch.float32)
     contrast_rms_t = torch.zeros((), device=log_prob.device, dtype=torch.float32)
-    if use_centering or use_scale_normalize:
-        # Opt-in normalization over the SAME active mask used by the loss sum.
-        # Statistics are detached: they rescale the gradient, never feed it.
-        norm_mask = resp.to(log_prob.dtype)
-        norm_count = norm_mask.sum().clamp_min(1.0)
-        if use_centering:
-            # Strip the common-mode offset of log(pi_F/pi_S); sign structure
-            # is preserved and the uniform failed-token-mass gradient that
-            # overlaps the KL-to-old term is removed.
-            contrast_center_t = (contrast.detach() * norm_mask).sum() / norm_count
-            contrast = contrast - contrast_center_t
-        if use_scale_normalize:
-            # Applied after centering so beta stays scale-stable as the
-            # teacher gap sharpens.
-            contrast_rms_t = ((contrast.detach() ** 2) * norm_mask).sum().div(norm_count).sqrt().clamp_min(1e-8)
-            contrast = contrast / contrast_rms_t
+    # Canonical normalization, always on. Statistics are detached over the
+    # SAME active mask used by the loss sum: they rescale the gradient, never
+    # feed it. Centering strips the common-mode offset of log(pi_F/pi_S)
+    # (sign structure preserved; removes the uniform failed-token-mass push
+    # that overlaps KL-to-old). RMS division keeps beta scale-stable as the
+    # teacher gap sharpens.
+    norm_mask = resp.to(log_prob.dtype)
+    norm_count = norm_mask.sum().clamp_min(1.0)
+    contrast_center_t = (contrast.detach() * norm_mask).sum() / norm_count
+    contrast = contrast - contrast_center_t
+    contrast_rms_t = ((contrast.detach() ** 2) * norm_mask).sum().div(norm_count).sqrt().clamp_min(1e-8)
+    contrast = contrast / contrast_rms_t
     token_loss_a = ratio_a * contrast
     local_count = resp.to(log_prob.dtype).sum()
     if precomputed_count is not None:

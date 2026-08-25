@@ -21,19 +21,6 @@ class SDCConfig:
     importance_weight_clip: float = 10.0
     base_mix_gamma: float = 0.9
 
-    # Algorithm-strength variants. All default to the locked legacy behavior;
-    # enabling any of them changes training dynamics (never the actor-loss
-    # algebra's identity) and must be validated via A/B before adoption.
-    # Train success/failure teachers on prompt-matched subsets so both see the
-    # same prompt distribution (removes coverage-asymmetry bias in c_t).
-    match_prompts: bool = False
-    # Subtract the detached mean contrast over active tokens before weighting:
-    # removes the common-mode component that uniformly scales failed-row mass.
-    contrast_centering: bool = False
-    # Divide the centered contrast by its detached RMS over active tokens so
-    # beta keeps a stable effective scale as teachers sharpen.
-    contrast_scale_normalize: bool = False
-
     # S/F reference training. Both references use the same paired response-token
     # budget, optimizer-step count, and learning rate.
     sft_update_interval_policy_steps: int = 5

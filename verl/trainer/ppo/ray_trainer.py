@@ -2184,9 +2184,6 @@ class RayPPOTrainer:
         # Optional sidecar execution knobs; absent attrs yield None.
         config["sidecar_residency"] = getattr(self.sdc_config, "sidecar_residency", None)
         config["sidecar_gradient_checkpointing"] = getattr(self.sdc_config, "sidecar_gradient_checkpointing", None)
-        # Algorithm-strength variants (default False -> locked legacy behavior).
-        for _variant_key in ("match_prompts", "contrast_centering", "contrast_scale_normalize"):
-            config[_variant_key] = bool(getattr(self.sdc_config, _variant_key, False))
         return config
 
     def _sdc_select_payload(self, output):
@@ -2408,20 +2405,15 @@ class RayPPOTrainer:
         if token_budget > 0:
             batch_size = min(batch_size, max(1, token_budget // max_length))
         max_examples = batch_size * int(self.sdc_config.sft_max_updates_per_interval)
-        if bool(getattr(self.sdc_config, "match_prompts", False)):
-            # Prompt-matched selection must see the FULL buffers, so apply the
-            # same shared function here instead of the legacy count-prefix
-            # slice. The worker re-runs its matcher on this already-matched,
-            # equal-count payload and selects the identical records.
-            from verl.experimental.sdc.sft_trainer import pair_outcome_records_prompt_matched
+        # Prompt-matched selection must see the FULL buffers, so apply the
+        # same shared function here instead of a count-prefix slice. The
+        # worker re-runs its matcher on this already-matched, equal-count
+        # payload and selects the identical records (idempotent).
+        from verl.experimental.sdc.sft_trainer import pair_outcome_records_prompt_matched
 
-            success_records, failure_records = pair_outcome_records_prompt_matched(
-                success_records, failure_records, max_examples=max_examples
-            )
-        else:
-            paired_count = min(len(success_records), len(failure_records), max_examples)
-            success_records = success_records[:paired_count]
-            failure_records = failure_records[:paired_count]
+        success_records, failure_records = pair_outcome_records_prompt_matched(
+            success_records, failure_records, max_examples=max_examples
+        )
         output = self.actor_rollout_wg.sdc_sft_update(success_records, failure_records, self._sdc_config_dict())
         metrics = self._sdc_rank0_result(output, operation="SFT")
         success_updates = int(metrics.get("sdc/success_sft_updates", 0.0))

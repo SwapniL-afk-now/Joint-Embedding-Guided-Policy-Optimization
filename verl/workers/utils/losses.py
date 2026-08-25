@@ -283,8 +283,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
                 global_batch_info=sdc_global_batch_info,
                 use_importance_weight=bool(sdc_config.get("use_importance_weight", True)),
                 importance_weight_clip=float(sdc_config.get("importance_weight_clip", 10.0)),
-                use_centering=bool(sdc_config.get("contrast_centering", False)),
-                use_scale_normalize=bool(sdc_config.get("contrast_scale_normalize", False)),
                 models_ready=True,
             )
         policy_loss = policy_loss + sdc_loss

@@ -75,7 +75,6 @@ from verl.experimental.sdc.sft_trainer import (
     configure_sft_trainable_parameters,
     encode_outcome_example,
     outcome_sft_loss,
-    pair_outcome_records,
     pair_outcome_records_prompt_matched,
 )
 from verl.experimental.sdc.data_collector import OutcomeExample
@@ -1170,14 +1169,10 @@ class FSDPEngine(BaseEngine):
         if token_budget > 0:
             batch_size = min(batch_size, max(1, token_budget // max_length))
         max_examples = batch_size * int(config.get("sft_max_updates_per_interval", 1))
-        if bool(config.get("match_prompts", False)):
-            return pair_outcome_records_prompt_matched(
-                success_records, failure_records, max_examples=max_examples
-            )
-        return pair_outcome_records(
-            success_records,
-            failure_records,
-            max_examples=max_examples,
+        # Canonical behavior: prompt-matched teacher pairing. Falls back to the
+        # legacy count-prefix pairing internally when no uids overlap.
+        return pair_outcome_records_prompt_matched(
+            success_records, failure_records, max_examples=max_examples
         )
 
     def _sdc_response_token_count(self, records: list[dict], config: dict) -> int:

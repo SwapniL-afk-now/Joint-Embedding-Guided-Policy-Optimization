@@ -144,7 +144,16 @@ cache incremental min-step for `buffer_age` instead of scanning metadata dicts e
   ~2^-8 relative error. Keep fp32. (Would be a TOL-level experiment behind a flag at most.)
 - Any change to denominator semantics, clamp values, or aggregation mode: locked.
 
-## 5. Suggested execution order
+## 5. Status update (post-revision)
+
+The algorithm-strength variants are no longer opt-in flags. The canonical,
+frozen recipe is: prompt-matched teacher pairing + centered contrast +
+RMS scale normalization, always on. Experiment design is a single
+comparison: this SDC vs plain GRPO, judged on steps-to-target accuracy.
+Legacy behavior survives only as the matcher's internal no-overlap fallback
+and in git history.
+
+## 6. Suggested execution order (historical)
 1. C1-C3 correctness guards (small diffs, protect the run)
 2. T14 dedup mixin (so subsequent fixes land once)
 3. T1, T3 (stop moving buffers through Ray) + T5 (hot-path syncs)
