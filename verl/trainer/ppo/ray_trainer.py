@@ -544,6 +544,13 @@ class RayPPOTrainer:
             "train/pass_at_8",
             "train/unique_answer_ratio_at_k",
             "train/exploration_collapse_rate",
+            "eval_greedy/math500_pass1",
+            "eval_greedy/aime24_pass1",
+            "eval_greedy/aime25_pass1",
+            "eval_greedy/amc23_pass1",
+            "eval_greedy/minerva_pass1",
+            "eval_greedy/olympiadbench_pass1",
+            "eval_greedy/avg_pass1",
             "val/amc23/pass_at_1",
             "val/amc23/pass_at_8",
             "val/amc23/avg_at_k",
@@ -1192,6 +1199,36 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        # Keep detailed SDC validation metrics and also emit the compact
+        # names used by the GXPO reference run for direct W&B comparison.
+        eval_aliases = {
+            "math500": "math500_pass1",
+            "aime2024": "aime24_pass1",
+            "aime2025": "aime25_pass1",
+            "amc23": "amc23_pass1",
+            "minervamath": "minerva_pass1",
+            "olympiadbench": "olympiadbench_pass1",
+        }
+        reference_val_names = {
+            "math500": "HuggingFaceH4/MATH-500",
+            "aime2024": "HuggingFaceH4/aime_2024",
+            "aime2025": "MathArena/aime_2025",
+            "amc23": "AI-MO/aimo-validation-amc",
+            "minervamath": "math-ai/minervamath",
+            "olympiadbench": "math-ai/olympiadbench",
+        }
+        eval_values = []
+        for source, alias in eval_aliases.items():
+            value = metric_dict.get(f"val/{source}/pass_at_1")
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                metric_dict[f"eval_greedy/{alias}"] = float(value)
+                metric_dict[f"val/pass_at_1/{reference_val_names[source]}"] = float(value)
+                eval_values.append(float(value))
+        metric_dict["eval_greedy/benchmark_count"] = len(eval_values)
+        if eval_values:
+            metric_dict["eval_greedy/avg_pass1"] = float(np.mean(eval_values))
+        metric_dict["eval_greedy/global_step"] = int(self.global_steps)
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
@@ -2156,6 +2193,7 @@ class RayPPOTrainer:
             "enable": bool(self.sdc_config.enable),
             "beta": float(self.sdc_config.beta),
             "scoring_backend": str(self.sdc_config.scoring_backend),
+            "teacher_mode": str(getattr(self.sdc_config, "teacher_mode", "full_fsdp")),
             "vllm_score_micro_batch_size": int(self.sdc_config.vllm_score_micro_batch_size),
             "reuse_rollout_log_probs": bool(self.sdc_config.reuse_rollout_log_probs),
             "verify_rollout_log_probs": bool(self.sdc_config.verify_rollout_log_probs),

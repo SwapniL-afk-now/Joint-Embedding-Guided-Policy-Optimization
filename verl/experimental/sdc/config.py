@@ -14,6 +14,9 @@ class SDCConfig:
     enable: bool = False
     beta: float = 0.5
     scoring_backend: str = "hf"
+    # Native sharded full-parameter teachers are the default. legacy_lora is
+    # retained only as an internal compatibility value for old LoRA runs.
+    teacher_mode: str = "full_fsdp"
     vllm_score_micro_batch_size: int = 16
     reuse_rollout_log_probs: bool = False
     verify_rollout_log_probs: bool = False
@@ -124,12 +127,30 @@ def validate_sdc_config(config: DictConfig | dict) -> SDCConfig:
     actor_rollout_ref = config.get("actor_rollout_ref", {})
     actor = actor_rollout_ref.get("actor", {})
     model = actor_rollout_ref.get("model", {})
+    lora_rank = int(model.get("lora_rank", 0) or 0)
+    if "teacher_mode" not in custom and lora_rank > 0:
+        settings.teacher_mode = "legacy_lora"
     if settings.beta < 0:
         raise ValueError("custom_sdc.beta must be non-negative.")
     if settings.scoring_backend not in {"hf", "vllm"}:
         raise ValueError("custom_sdc.scoring_backend must be 'hf' or 'vllm'.")
-    if settings.scoring_backend == "vllm" and int(model.get("lora_rank", 0) or 0) <= 0:
+    if settings.teacher_mode not in {"full_fsdp", "shared_lora", "legacy_lora"}:
+        raise ValueError("custom_sdc.teacher_mode must be 'full_fsdp' or 'shared_lora'.")
+    if settings.scoring_backend == "vllm" and lora_rank <= 0:
         raise ValueError("custom_sdc.scoring_backend='vllm' requires a positive model.lora_rank.")
+    if settings.teacher_mode == "full_fsdp" and lora_rank > 0:
+        raise ValueError(
+            "custom_sdc.teacher_mode='full_fsdp' requires model.lora_rank=0; "
+            "use teacher_mode='shared_lora' for a LoRA actor."
+        )
+    if settings.teacher_mode in {"shared_lora", "legacy_lora"}:
+        if lora_rank <= 0:
+            raise ValueError("custom_sdc.teacher_mode='shared_lora' requires a positive model.lora_rank.")
+        if settings.scoring_backend != "vllm" or not settings.reuse_rollout_log_probs:
+            raise ValueError(
+                "custom_sdc.teacher_mode='shared_lora' requires scoring_backend='vllm' "
+                "and reuse_rollout_log_probs=true."
+            )
     if settings.scoring_backend == "hf" and settings.reuse_rollout_log_probs:
         raise ValueError("HF SDC scoring requires reuse_rollout_log_probs=false.")
     if settings.scoring_backend == "vllm" and not settings.reuse_rollout_log_probs:

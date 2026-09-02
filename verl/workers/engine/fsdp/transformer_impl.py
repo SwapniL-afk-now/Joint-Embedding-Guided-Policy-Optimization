@@ -79,6 +79,7 @@ from verl.experimental.sdc.sft_trainer import (
 )
 from verl.experimental.sdc.data_collector import OutcomeExample
 from verl.experimental.sdc.sdc_state import build_sdc_checkpoint_state, clone_frozen_state, mix_module_with_base
+from verl.experimental.sdc.sdc_loss import compute_sdc_global_contrast_stats
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
@@ -720,10 +721,27 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
-        # SDC's actor denominator is global over failed response tokens. Do
-        # this once for the full forward/backward batch, before splitting into
-        # micro-batches, instead of launching an all-reduce per micro-batch.
-        if "sdc_failure_mask" in data and "response_mask" in data:
+        # Compute all SDC normalization statistics once for the complete
+        # logical batch. Reusing them in each micro-batch makes the actor
+        # gradient invariant to dynamic-batch partitioning.
+        sdc_fields = (
+            "sdc_failure_mask",
+            "sdc_success_log_probs",
+            "sdc_failure_log_probs",
+            "response_mask",
+        )
+        if all(field in data for field in sdc_fields):
+            sdc_stats = compute_sdc_global_contrast_stats(
+                success_log_prob=data["sdc_success_log_probs"],
+                failure_log_prob=data["sdc_failure_log_probs"],
+                response_mask=data["response_mask"],
+                failure_mask=data["sdc_failure_mask"],
+                group=self.get_data_parallel_group(),
+            )
+            tu.assign_non_tensor(data, **sdc_stats)
+        elif "sdc_failure_mask" in data and "response_mask" in data:
+            # Keep the denominator path available for callers that provide the
+            # mask before teacher scores have been materialized.
             response_mask = data["response_mask"].to(dtype=torch.bool)
             failure_mask = data["sdc_failure_mask"].to(dtype=torch.bool)
             if failure_mask.ndim < response_mask.ndim:
@@ -951,6 +969,10 @@ class FSDPEngine(BaseEngine):
         weights. The default 'auto_offload' mode does not need it because
         every scoring/SFT pass already releases on its own.
         """
+        pair = getattr(self, "_sdc_sharded_pair", None)
+        if pair is not None:
+            pair.release_residency()
+            return
         self._sdc_offload_models()
 
 
@@ -987,8 +1009,8 @@ class FSDPEngine(BaseEngine):
                 if outputs.logits is not None:
                     logits = outputs.logits[:, :-1].contiguous()
                     token_lp = logprobs_from_logits(
-                        logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
-                    ).view(labels.shape)
+                        logits.reshape(-1, logits.size(-1)), labels.reshape(-1), inplace_backward=False
+                    ).reshape(labels.shape)
                 elif getattr(outputs, "log_probs", None) is not None:
                     # The Triton fused actor path returns per-token log-probs rather
                     # than logits. Drop its final rolled-label position to match the
@@ -1021,6 +1043,19 @@ class FSDPEngine(BaseEngine):
         }
 
     def sdc_init(self, sdc_config: dict):
+        teacher_mode = (sdc_config or {}).get("teacher_mode")
+        if teacher_mode is None:
+            teacher_mode = "legacy_lora" if self._is_lora else "full_fsdp"
+        if teacher_mode == "legacy_lora":
+            teacher_mode = "shared_lora"
+        if teacher_mode in {"full_fsdp", "shared_lora"}:
+            from verl.experimental.sdc.fsdp_teacher import SDCShardedTeacherPair
+
+            if getattr(self, "_sdc_sharded_pair", None) is None:
+                self._sdc_sharded_pair = SDCShardedTeacherPair(self, sdc_config or {})
+            result = self._sdc_sharded_pair.initialize()
+            self._sdc_initialized = True
+            return result
         if getattr(self, "_sdc_initialized", False):
             return {"sdc_initialized": True}
         if self.engine_config.strategy not in ("fsdp", "fsdp2"):
@@ -1094,6 +1129,11 @@ class FSDPEngine(BaseEngine):
         }
 
     def sdc_reinitialize_from_actor(self, sdc_config: dict):
+        pair = getattr(self, "_sdc_sharded_pair", None)
+        if pair is not None:
+            result = pair.reinitialize_from_actor(sdc_config or {})
+            self._sdc_initialized = True
+            return result
         self._sdc_initialized = False
         reset_config = dict(sdc_config or {})
         reset_config.pop("sdc_success_model_update_count", None)
@@ -1112,6 +1152,9 @@ class FSDPEngine(BaseEngine):
     def sdc_compute_success_failure_log_probs(self, data: TensorDict) -> TensorDict:
         config = tu.get_non_tensor_data(data=data, key="custom_sdc", default={}) or {}
         self.sdc_init(config)
+        pair = getattr(self, "_sdc_sharded_pair", None)
+        if pair is not None:
+            return pair.compute_log_probs(data)
         scoring_start = time.perf_counter() if self._sdc_is_rank_zero() else None
         padded = data.to_padded_tensor()
         device = next(self.module.parameters()).device
@@ -1503,8 +1546,8 @@ class FSDPEngine(BaseEngine):
                 if output.logits is not None:
                     logits = output.logits[:, :-1]
                     token_log_probs = logprobs_from_logits(
-                        logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False
-                    ).view(labels.shape)
+                        logits.reshape(-1, logits.size(-1)), labels.reshape(-1), inplace_backward=False
+                    ).reshape(labels.shape)
                 elif getattr(output, "log_probs", None) is not None:
                     token_log_probs = output.log_probs.reshape(input_ids.shape)[:, :-1].contiguous()
                 else:
@@ -1571,25 +1614,37 @@ class FSDPEngine(BaseEngine):
                 "sdc/failure_model_update_count": float(self._sdc_failure_model_update_count),
                 "sdc/models_ready": float(self._sdc_models_ready),
             }
+        device = next(self.module.parameters()).device
         success_sft_start = time.perf_counter() if self._sdc_is_rank_zero() else None
-        success = self._sdc_sft_model(
-            self._sdc_success,
-            self._sdc_success_optimizer,
-            success_records,
-            "success",
-            config,
-            response_token_budget=common_response_tokens,
-        )
+        # Keep only the optimizer state for the sidecar currently being
+        # updated on GPU. Two full AdamW states are unnecessary at the same
+        # time and can collide with the co-located vLLM allocation.
+        self._sdc_move_optimizer_state(self._sdc_success_optimizer, device)
+        try:
+            success = self._sdc_sft_model(
+                self._sdc_success,
+                self._sdc_success_optimizer,
+                success_records,
+                "success",
+                config,
+                response_token_budget=common_response_tokens,
+            )
+        finally:
+            self._sdc_move_optimizer_state(self._sdc_success_optimizer, torch.device("cpu"))
         self._sdc_record_timing("success_sft_ms", success_sft_start)
         failure_sft_start = time.perf_counter() if self._sdc_is_rank_zero() else None
-        failure = self._sdc_sft_model(
-            self._sdc_failure,
-            self._sdc_failure_optimizer,
-            failure_records,
-            "failure",
-            config,
-            response_token_budget=common_response_tokens,
-        )
+        self._sdc_move_optimizer_state(self._sdc_failure_optimizer, device)
+        try:
+            failure = self._sdc_sft_model(
+                self._sdc_failure,
+                self._sdc_failure_optimizer,
+                failure_records,
+                "failure",
+                config,
+                response_token_budget=common_response_tokens,
+            )
+        finally:
+            self._sdc_move_optimizer_state(self._sdc_failure_optimizer, torch.device("cpu"))
         self._sdc_record_timing("failure_sft_ms", failure_sft_start)
         success_updates = int(success["sdc/success_sft_updates"])
         failure_updates = int(failure["sdc/failure_sft_updates"])
@@ -1640,7 +1695,12 @@ class FSDPEngine(BaseEngine):
         """
 
         self.sdc_init(config)
-        self._sdc_prepare_models(include_optimizer=True)
+        pair = getattr(self, "_sdc_sharded_pair", None)
+        if pair is not None:
+            return pair.sft_update(success_records, failure_records, config)
+        # SFT loads each optimizer state just before its sidecar update. This
+        # avoids holding both full AdamW states on every actor GPU.
+        self._sdc_prepare_models(include_optimizer=False)
         distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         if not distributed:
             try:
@@ -1730,6 +1790,9 @@ class FSDPEngine(BaseEngine):
 
     def sdc_export_vllm_adapters(self, config: dict):
         self.sdc_init(config)
+        pair = getattr(self, "_sdc_sharded_pair", None)
+        if pair is not None:
+            return pair.export_vllm_adapters(config)
         if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return {"enabled": False}
         if config.get("scoring_backend") != "vllm" or not self._is_lora:
@@ -1740,10 +1803,16 @@ class FSDPEngine(BaseEngine):
 
     def sdc_save_checkpoint(self, local_path: str, global_step: int, config: dict):
         self.sdc_init(config)
+        pair = getattr(self, "_sdc_sharded_pair", None)
+        if pair is not None:
+            return pair.save_checkpoint(local_path, global_step, config)
         return self._sdc_write_checkpoint(local_path, global_step, config)
 
     def sdc_load(self, local_path: str, config: dict | None = None):
         config = config or {}
+        pair = getattr(self, "_sdc_sharded_pair", None)
+        if pair is not None:
+            return pair.load_checkpoint(local_path, config)
         # Rebuild both clones from the CURRENT actor first. This fully
         # reconstructs ``self._sdc_base_state_cpu`` (rank zero keeps it) BEFORE
         # any checkpoint payload below can overwrite or preserve it, which is
@@ -2334,88 +2403,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
 
     def sdc_init(self, sdc_config: dict):
-        if getattr(self, "_sdc_initialized", False):
-            return {"sdc_initialized": True}
-        if self.engine_config.strategy not in ("fsdp", "fsdp2"):
-            raise NotImplementedError("SDC currently supports only FSDP/FSDP2 HF actors.")
-        state = self._sdc_actor_state_cpu()
-        self._sdc_base_state_cpu = clone_frozen_state(state)
-        # Fresh base snapshot: the next checkpoint save embeds it again and
-        # re-anchors the slim-checkpoint marker chain.
-        self._sdc_saved_base_global_step = None
-        # Invalidate any cached adapter snapshot so a reinit (e.g. from
-        # sdc_reinitialize_from_actor after a resume) cannot mix checkpoints
-        # or base-interpolate against a PREVIOUS actor's adapter values.
-        self._sdc_base_adapter_state_cpu = None
-        self._sdc_base_mix_gamma = float(sdc_config.get("base_mix_gamma", 0.9))
-        if not 0.0 <= self._sdc_base_mix_gamma <= 1.0:
-            raise ValueError(
-                f"custom_sdc.base_mix_gamma must be between 0.0 and 1.0, got {self._sdc_base_mix_gamma}."
-            )
-        sidecar_residency = str(sdc_config.get("sidecar_residency") or "auto_offload")
-        if sidecar_residency not in ("auto_offload", "resident"):
-            raise ValueError(
-                f"custom_sdc.sidecar_residency must be 'auto_offload' or 'resident', got {sidecar_residency!r}."
-            )
-        self._sdc_sidecar_residency = sidecar_residency
-        sidecar_gradient_checkpointing = sdc_config.get("sidecar_gradient_checkpointing", None)
-        self._sdc_sidecar_gradient_checkpointing = (
-            None if sidecar_gradient_checkpointing is None else bool(sidecar_gradient_checkpointing)
-        )
-        self._sdc_success = self._sdc_clone_from_state(self._sdc_base_state_cpu)
-        self._sdc_failure = self._sdc_clone_from_state(self._sdc_base_state_cpu)
-        lr = float(sdc_config.get("sft_lr", 1e-6))
-        fused_adamw = bool(sdc_config.get("fused_adamw", False))
-        self._sdc_success_optimizer = torch.optim.AdamW(
-            (parameter for parameter in self._sdc_success.parameters() if parameter.requires_grad),
-            lr=lr,
-            fused=fused_adamw,
-        )
-        self._sdc_failure_optimizer = torch.optim.AdamW(
-            (parameter for parameter in self._sdc_failure.parameters() if parameter.requires_grad),
-            lr=lr,
-            fused=fused_adamw,
-        )
-        self._sdc_success_model_update_count = int(sdc_config.get("sdc_success_model_update_count", 0))
-        self._sdc_failure_model_update_count = int(sdc_config.get("sdc_failure_model_update_count", 0))
-        self._sdc_models_ready = bool(sdc_config.get("sdc_models_ready", False))
-        self._sdc_tokenizer = None
-        self._sdc_initialized = True
-        actor_counts = {
-            "total": sum(parameter.numel() for parameter in self.module.parameters()),
-            "trainable": sum(parameter.numel() for parameter in self.module.parameters() if parameter.requires_grad),
-        }
-        success_counts = self._sdc_parameter_counts(self._sdc_success, self._sdc_success_optimizer)
-        failure_counts = self._sdc_parameter_counts(self._sdc_failure, self._sdc_failure_optimizer)
-        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
-        if distributed and torch.distributed.get_rank() != 0 and not self._is_lora:
-            # Only rank zero interpolates SDC weights with the frozen actor.
-            # Scoring ranks retain the two synchronized models but not this
-            # extra full-model CPU snapshot.
-            self._sdc_base_state_cpu = None
-        # In resident mode keep the freshly built clones on the actor GPU; the
-        # explicit sdc_release_residency() hook does the release later.
-        self._sdc_release_models()
-        return {
-            "sdc_initialized": True,
-            "sdc/base_mix_gamma": self._sdc_base_mix_gamma,
-            "sdc/actor_total_parameters": actor_counts["total"],
-            "sdc/actor_trainable_parameters": actor_counts["trainable"],
-            "sdc/success_total_parameters": success_counts["total"],
-            "sdc/success_trainable_parameters": success_counts["trainable"],
-            "sdc/success_optimizer_parameters": success_counts["optimizer"],
-            "sdc/failure_total_parameters": failure_counts["total"],
-            "sdc/failure_trainable_parameters": failure_counts["trainable"],
-            "sdc/failure_optimizer_parameters": failure_counts["optimizer"],
-        }
-
-
-
-
-
-
-
-
+        return super().sdc_init(sdc_config)
 
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):

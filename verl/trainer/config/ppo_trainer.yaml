@@ -151,6 +151,7 @@ custom_sdc:
   enable: false
   beta: 0.5
   scoring_backend: hf
+  teacher_mode: full_fsdp
   vllm_score_micro_batch_size: 16
   reuse_rollout_log_probs: false
   verify_rollout_log_probs: false

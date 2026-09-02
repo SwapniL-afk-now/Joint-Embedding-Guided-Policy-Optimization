@@ -530,3 +530,26 @@ def test_single_active_token_skips_centering_and_keeps_sign_direction(direction)
     assert metrics["sdc/contrast_center"] == 0.0
     loss.backward()
     torch.testing.assert_close(current.grad, torch.full_like(current, expected))
+
+
+def test_teacher_mode_validation_requires_matching_actor_and_scoring_backend():
+    full_lora = OmegaConf.create(
+        {
+            "actor_rollout_ref": {"model": {"lora_rank": 8}},
+            "custom_sdc": {"enable": True, "teacher_mode": "full_fsdp", "scoring_backend": "hf"},
+        }
+    )
+    with pytest.raises(ValueError, match="full_fsdp"):
+        validate_sdc_config(full_lora)
+    shared = OmegaConf.create(
+        {
+            "actor_rollout_ref": {"model": {"lora_rank": 8}},
+            "custom_sdc": {
+                "enable": True,
+                "teacher_mode": "shared_lora",
+                "scoring_backend": "vllm",
+                "reuse_rollout_log_probs": True,
+            },
+        }
+    )
+    assert validate_sdc_config(shared).teacher_mode == "shared_lora"
