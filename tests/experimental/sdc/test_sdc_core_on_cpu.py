@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from verl.experimental.sdc.data_collector import FailureDataCollector, SuccessDataCollector, validate_sdc_outcome
-from verl.experimental.sdc.sdc_loss import compute_sdc_loss
+from verl.experimental.sdc.sdc_loss import compute_sdc_global_contrast_stats, compute_sdc_loss
 from verl.experimental.sdc.sft_trainer import outcome_sft_loss
 
 
@@ -161,3 +161,89 @@ def test_single_active_token_skips_centering_and_keeps_sign_direction(direction)
     assert metrics["sdc/contrast_center"] == 0.0
     loss.backward()
     torch.testing.assert_close(current.grad, torch.full_like(current, expected))
+
+
+def test_global_contrast_stats_are_computed_once_over_the_logical_batch():
+    success = torch.tensor([[-1.0, -2.0, 0.0], [-3.0, -4.0, -5.0]])
+    failure = torch.tensor([[-0.5, -1.0, 0.0], [-2.0, -1.0, -2.0]])
+    response = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool)
+    failed = torch.tensor([True, False])
+    stats = compute_sdc_global_contrast_stats(
+        success_log_prob=success,
+        failure_log_prob=failure,
+        response_mask=response,
+        failure_mask=failed,
+    )
+    # Active contrasts are [0.5, 1.0], so the detached global center/RMS are
+    # independent of how the actor later partitions its micro-batches.
+    assert stats["sdc_active_token_count"] == 2.0
+    torch.testing.assert_close(torch.tensor(stats["sdc_contrast_center"]), torch.tensor(0.75))
+    torch.testing.assert_close(torch.tensor(stats["sdc_contrast_rms"]), torch.tensor(0.25))
+
+
+def test_precomputed_global_stats_make_split_losses_match_one_logical_batch():
+    current = torch.tensor([[0.1, 0.2], [0.3, 0.4]], requires_grad=True)
+    old = torch.zeros_like(current)
+    success = torch.tensor([[-1.0, -0.5], [-0.25, -1.0]])
+    failure = torch.tensor([[-0.5, -0.25], [-1.0, -0.5]])
+    response = torch.ones_like(current, dtype=torch.bool)
+    failed = torch.tensor([True, True])
+    stats = compute_sdc_global_contrast_stats(
+        success_log_prob=success,
+        failure_log_prob=failure,
+        response_mask=response,
+        failure_mask=failed,
+    )
+    whole, _ = compute_sdc_loss(
+        log_prob=current,
+        old_log_prob=old,
+        success_log_prob=success,
+        failure_log_prob=failure,
+        response_mask=response,
+        failure_mask=failed,
+        beta=0.7,
+        importance_weight_clip=0.0,
+        global_batch_info=stats,
+    )
+    split_values = []
+    for row in range(2):
+        split, _ = compute_sdc_loss(
+            log_prob=current[row : row + 1],
+            old_log_prob=old[row : row + 1],
+            success_log_prob=success[row : row + 1],
+            failure_log_prob=failure[row : row + 1],
+            response_mask=response[row : row + 1],
+            failure_mask=torch.ones(1, dtype=torch.bool),
+            beta=0.7,
+            importance_weight_clip=0.0,
+            global_batch_info=stats,
+        )
+        split_values.append(split)
+    torch.testing.assert_close(whole, sum(split_values))
+
+
+def test_shared_lora_adapter_update_isolated_from_backbone_and_other_adapter():
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    model = get_peft_model(
+        GPT2LMHeadModel(GPT2Config(n_layer=1, n_head=1, n_embd=8, vocab_size=32, n_positions=16)),
+        LoraConfig(task_type=TaskType.CAUSAL_LM, r=2, lora_alpha=4, target_modules=["c_attn"], bias="none"),
+    )
+    model.add_adapter("failure", model.peft_config["default"])
+    success = [p for n, p in model.named_parameters() if "lora_A.default" in n or "lora_B.default" in n]
+    failure = [p for n, p in model.named_parameters() if "lora_A.failure" in n or "lora_B.failure" in n]
+    backbone = [p for n, p in model.named_parameters() if "lora_" not in n]
+    success_before = [p.detach().clone() for p in success]
+    failure_before = [p.detach().clone() for p in failure]
+    backbone_before = [p.detach().clone() for p in backbone]
+    optimizer = torch.optim.AdamW(success, lr=0.1)
+    model.set_adapter("default")
+    loss = model(input_ids=torch.tensor([[1, 2, 3, 4]])).logits.sum()
+    loss.backward()
+    optimizer.step()
+    assert any(not torch.equal(before, after) for before, after in zip(success_before, success))
+    for before, after in zip(failure_before, failure):
+        torch.testing.assert_close(before, after)
+    for before, after in zip(backbone_before, backbone):
+        torch.testing.assert_close(before, after)

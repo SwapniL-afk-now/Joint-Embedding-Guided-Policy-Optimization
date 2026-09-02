@@ -54,6 +54,101 @@ def _all_gather_detached_values(value: torch.Tensor) -> torch.Tensor:
     return torch.cat(values).to(device=value.device)
 
 
+def _flatten_sdc_tensor(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return values and optional per-row lengths for padded or jagged input."""
+
+    if getattr(value, "is_nested", False):
+        return value.values(), value.offsets().diff()
+    return value.reshape(-1), None
+
+
+def compute_sdc_global_contrast_stats(
+    *,
+    success_log_prob: torch.Tensor,
+    failure_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    failure_mask: torch.Tensor,
+    group=None,
+) -> dict[str, float]:
+    """Compute detached contrast normalization over one distributed actor batch.
+
+    The actor engine splits a logical batch into micro-batches after this
+    function is called. Computing the statistics here makes the SDC gradient
+    independent of dynamic-batch partitioning and data-parallel rank count.
+    """
+
+    success_values, success_lengths = _flatten_sdc_tensor(success_log_prob)
+    failure_values, failure_lengths = _flatten_sdc_tensor(failure_log_prob)
+    response_values, response_lengths = _flatten_sdc_tensor(response_mask)
+    if success_lengths is None or failure_lengths is None or response_lengths is None:
+        contrast = (failure_values - success_values).to(dtype=torch.float32)
+        response = response_values.to(dtype=torch.bool)
+        failed = failure_mask.to(device=response.device, dtype=torch.bool).reshape(-1, 1)
+        active = response.reshape(failed.shape[0], -1) & failed
+        active = active.reshape(-1)
+    else:
+        if not torch.equal(success_lengths, failure_lengths) or not torch.equal(success_lengths, response_lengths):
+            raise ValueError("SDC teacher and response jagged lengths must match.")
+        contrast = (failure_values - success_values).to(dtype=torch.float32)
+        failed = failure_mask.to(device=contrast.device, dtype=torch.bool).reshape(-1)
+        active = torch.repeat_interleave(failed, response_lengths.to(device=failed.device))
+        if active.numel() != contrast.numel():
+            raise ValueError("SDC failure mask does not match the jagged response batch.")
+
+    selected = contrast[active.to(device=contrast.device)]
+    stats = torch.stack(
+        [
+            torch.tensor(float(selected.numel()), device=contrast.device, dtype=torch.float32),
+            selected.sum(dtype=torch.float32),
+            (selected * selected).sum(dtype=torch.float32),
+        ]
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM, group=group)
+    count, total, squared = stats.detach().cpu().tolist()
+    if count <= 0:
+        return {"sdc_active_token_count": 0.0, "sdc_contrast_center": 0.0, "sdc_contrast_rms": 1.0}
+    center = total / count if count > 1 else 0.0
+    variance = max(squared / count - center * center, 0.0)
+    return {
+        "sdc_active_token_count": float(count),
+        "sdc_contrast_center": float(center),
+        "sdc_contrast_rms": float(max(variance**0.5, 1e-8)),
+    }
+
+
+def normalize_contrast(
+    contrast: torch.Tensor,
+    active_mask: torch.Tensor,
+    *,
+    center: torch.Tensor | float | None = None,
+    rms: torch.Tensor | float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Detach-mean-center and RMS-normalize ``contrast`` over ``active_mask``.
+
+    Shared by the additive SDC loss and the SDC-TR trust-region ratio so the two
+    paths can never numerically drift apart. With a single active element,
+    centering would zero the only signal, so it is skipped there; RMS still
+    normalizes to sign. Stats accumulate in fp32 regardless of input dtype.
+    Returns (normalized_contrast, center, rms) with the two stats detached.
+    """
+
+    norm_mask = active_mask.to(torch.float32)
+    norm_count = norm_mask.sum()
+    centering_scale = (norm_count > 1).to(contrast.dtype)
+    if center is None:
+        center = ((contrast.detach() * norm_mask).sum() / norm_count.clamp_min(1.0)) * centering_scale
+    else:
+        center = torch.as_tensor(center, device=contrast.device, dtype=contrast.dtype)
+    contrast = contrast - center
+    if rms is None:
+        rms = ((contrast.detach() ** 2) * norm_mask).sum().div(norm_count.clamp_min(1.0)).sqrt().clamp_min(1e-8)
+    else:
+        rms = torch.as_tensor(rms, device=contrast.device, dtype=contrast.dtype).clamp_min(1e-8)
+    contrast = contrast / rms
+    return contrast, center, rms
+
+
 def compute_sdc_loss(
     *,
     log_prob: torch.Tensor,
@@ -125,26 +220,16 @@ def compute_sdc_loss(
     # where normalize() = (x - detached_mean) / detached_RMS over active failed
     # tokens. See the normalization comment below.
     contrast = failure_a - success_a
-    # Canonical normalization, always on. Statistics are detached over the
-    # SAME active mask used by the loss sum: they rescale the gradient, never
-    # feed it. Centering strips the common-mode offset of log(pi_F/pi_S)
-    # (sign structure preserved; removes the uniform failed-token-mass push
-    # that overlaps KL-to-old). RMS division keeps beta scale-stable as the
-    # teacher gap sharpens. With a single active token, centering would zero
-    # the only signal, so it is skipped there; RMS still normalizes to sign.
-    # Stats accumulate in fp32 regardless of log_prob dtype (bf16 under mixed
-    # precision would lose precision as failed-token mass grows); they are
-    # detached, so the cast costs nothing numerically or in autograd.
-    norm_mask = resp.to(torch.float32)
-    norm_count = norm_mask.sum()
-    # Branchless single-active-token guard: with exactly one active token the
-    # mean equals that token's contrast and centering would zero the only
-    # signal. Computed on-device so no host sync is added per micro-batch.
-    centering_scale = (norm_count > 1).to(log_prob.dtype)
-    contrast_center_t = ((contrast.detach() * norm_mask).sum() / norm_count.clamp_min(1.0)) * centering_scale
-    contrast = contrast - contrast_center_t
-    contrast_rms_t = ((contrast.detach() ** 2) * norm_mask).sum().div(norm_count.clamp_min(1.0)).sqrt().clamp_min(1e-8)
-    contrast = contrast / contrast_rms_t
+    # Canonical normalization, always on, over the SAME active mask used by the
+    # loss sum: it rescales the gradient, never feeds it. Also reused verbatim
+    # by the SDC-TR trust-region ratio (see normalize_contrast() above) so the
+    # two paths can't numerically drift apart.
+    contrast, contrast_center_t, contrast_rms_t = normalize_contrast(
+        contrast,
+        resp,
+        center=info.get("sdc_contrast_center"),
+        rms=info.get("sdc_contrast_rms"),
+    )
     # Reliability gate: a detached scalar in [0, 1] computed trainer-side from
     # the measured online discrimination AUC (EMA-smoothed). An uninformative
     # discriminator fades the auxiliary term out instead of injecting noise;
