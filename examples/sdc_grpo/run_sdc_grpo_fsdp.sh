@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Match the GXPO reference run: this SDC entrypoint is fixed to physical GPUs
-# 0 and 1, not whichever devices happen to be inherited by the shell.
-export CUDA_VISIBLE_DEVICES=0,1
-
+# Use all four physical H200s on this server, not whichever devices happen to
+# be inherited by the shell.
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export WANDB_DISABLED=false
+export WANDB_MODE=online
+export WANDB_ENTITY=${WANDB_ENTITY:-chapkhabo-dddddddddddddddd}
+LOGGER='["console","wandb"]'
 # vLLM imports matplotlib through its CLI module. Training is non-interactive;
 # force a headless backend so inherited Jupyter MPLBACKEND values cannot abort
 # worker startup.
@@ -16,7 +19,11 @@ export MPLBACKEND=Agg
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 WORKSPACE_ROOT=$(cd -- "${REPO_ROOT}/.." && pwd)
-if [[ -z "${PYTHON_BIN:-}" && -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+H200_REPO_ROOT=${H200_REPO_ROOT:-${WORKSPACE_ROOT}/gradient-extrapolation-based-policy-optimization}
+H200_VENV_ROOT=${H200_VENV_ROOT:-${H200_REPO_ROOT}/.venv-h200}
+if [[ -z "${PYTHON_BIN:-}" && -x "${H200_VENV_ROOT}/bin/python" ]]; then
+    PYTHON_BIN="${H200_VENV_ROOT}/bin/python"
+elif [[ -z "${PYTHON_BIN:-}" && -x "${REPO_ROOT}/.venv/bin/python" ]]; then
     PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 else
     PYTHON_BIN=${PYTHON_BIN:-python3}
@@ -25,50 +32,63 @@ fi
 cd "$REPO_ROOT"
 
 # Reduce CUDA fragmentation on the colocated (vLLM + FSDP) GPUs.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:512}
+# Expandable segments reduce allocator fragmentation during the alternating
+# actor/vLLM/SDC sidecar phases; sidecar optimizer residency is serialized
+# so vLLM's configured memory utilization is unchanged.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}
 
-if [[ -f "${REPO_ROOT}/.env" ]]; then
+if [[ -f "${WORKSPACE_ROOT}/.env" || -f "${REPO_ROOT}/.env" ]]; then
     _XTRACE_WAS_ON=0
     case $- in
         *x*) _XTRACE_WAS_ON=1; set +x ;;
     esac
     set -a
-    # shellcheck disable=SC1091
-    source "${REPO_ROOT}/.env"
+    for _ENV_FILE in "${WORKSPACE_ROOT}/.env" "${REPO_ROOT}/.env"; do
+        if [[ -f "${_ENV_FILE}" ]]; then
+            source "${_ENV_FILE}"
+        fi
+    done
     set +a
     if [[ ${_XTRACE_WAS_ON} -eq 1 ]]; then
         set -x
     fi
-    unset _XTRACE_WAS_ON
+    unset _ENV_FILE _XTRACE_WAS_ON
 fi
+# The image exports an invalid bare host (127.0.0.1). Let ray.init() create a local head.
+unset RAY_ADDRESS
 
 # Keep .env settings from silently moving this reference run to another GPU
 # pair.
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export WANDB_DISABLED=false
+export WANDB_MODE=online
+export WANDB_ENTITY=${WANDB_ENTITY:-chapkhabo-dddddddddddddddd}
+LOGGER='["console","wandb"]'
 
 # ══════════════════════════════════════════════════════════════════════════
 # RUN CONFIGURATION — edit this block to change the campaign.
 # Everything the run needs is set here (env/.env still win if you export
 # a variable before launching). Values below = the frozen 1.5B reference
-# campaign: batch 256 x 8 rollouts, minibatch 64, 2x Blackwell 6000,
+# campaign: batch 256 x 8 rollouts, minibatch 64, 4x H200,
 # full-parameter SDC with HF scoring. Do not add new knobs; edit values.
 # ══════════════════════════════════════════════════════════════════════════
-: "${MODEL_PATH:=/models/Qwen2.5-Math-1.5B-Instruct}"          # ← EDIT: local model dir
-: "${GXPO_DATA_ROOT:=/data/sdc}"                                # ← EDIT: parquet root
+: "${MODEL_PATH:=/workspace/models/Qwen2.5-Math-1.5B-Instruct}"          # ← EDIT: local model dir
+: "${GXPO_DATA_ROOT:=/workspace/data}"                                # ← EDIT: parquet root
 : "${TRAIN_DAPO_FILE:=${GXPO_DATA_ROOT}/dapo_math/train.parquet}"
 : "${TRAIN_LIGHTEVAL_FILE:=${GXPO_DATA_ROOT}/lighteval-math/train.parquet}"
 : "${NNODES:=1}"
-: "${NDEVICES_PER_NODE:=2}"
+: "${NDEVICES_PER_NODE:=4}"
+: "${FSDP_SIZE:=4}"
 
 : "${TRAIN_PROMPT_BATCH_SIZE:=256}"      # prompts per step
 : "${NUM_GENERATIONS:=8}"                # rollouts per prompt -> 2048 rows/step
-: "${PPO_MINI_BATCH_SIZE:=64}"           # 4 optimizer slices; see note below
+: "${PPO_MINI_BATCH_SIZE:=64}"           # 4 PPO optimizer slices per 256-prompt batch
 : "${MAX_PROMPT_LENGTH:=1024}"
 : "${MAX_RESPONSE_LENGTH:=3072}"
-: "${MODEL_DTYPE:=fp32}"                 # fp32 master weights, BF16 compute
-: "${ACTOR_ATTENTION_IMPL:=flash_attention_2}"
-: "${ROLLOUT_MAX_NUM_SEQS:=1024}"
-: "${SAVE_FREQ:=20}"
+: "${MODEL_DTYPE:=bf16}"                 # H200-native compute dtype; FA3 requires BF16/FP16
+: "${ACTOR_ATTENTION_IMPL:=flash_attention_3}"
+: "${ROLLOUT_MAX_NUM_SEQS:=2048}"
+: "${SAVE_FREQ:=50}"
 : "${TEST_FREQ:=5}"
 
 # SDC (single recipe, no variant flags). beta is the only algorithm knob.
@@ -76,26 +96,30 @@ export CUDA_VISIBLE_DEVICES=0,1
 : "${SDC_BASE_MIX_GAMMA:=0.9}"
 : "${SDC_MIN_SFT_UPDATES_BEFORE_USE:=2}"
 : "${SDC_SFT_UPDATE_INTERVAL:=5}"
-: "${SDC_CHECKPOINT_INTERVAL:=20}"
+: "${SDC_CHECKPOINT_INTERVAL:=50}"
 : "${SDC_SFT_LR:=1.0e-5}"
-: "${SDC_DATA_MAX_SIZE:=8192}"
+: "${SDC_SFT_BATCH_SIZE:=8}"
+: "${SDC_SFT_MAX_TOKEN_LEN_PER_GPU:=32768}"
+: "${SDC_SFT_MAX_UPDATES:=1}"
+: "${SDC_DATA_MAX_SIZE:=32768}"
 : "${SDC_SCORING_BACKEND:=hf}"           # hf = full-parameter teachers
+: "${SDC_TEACHER_MODE:=full_fsdp}"
 : "${SDC_DISTRIBUTED_METRICS:=false}"
 # Performance-only toggles; flip after confirming VRAM headroom:
 : "${SDC_SIDECAR_RESIDENCY:=auto_offload}"
-: "${SDC_SIDECAR_GRADIENT_CHECKPOINTING:=}"
+: "${SDC_SIDECAR_GRADIENT_CHECKPOINTING:=false}"
 # ══════════════════════════════════════════════════════════════════════════
 
 # Use the same local model and prepared parquet assets as the GXPO reference
 # launcher. These paths remain overridable for another machine.
-GXPO_REFERENCE_ROOT=${GXPO_REFERENCE_ROOT:-${WORKSPACE_ROOT}/gradient-extrapolation-based-policy-optimization-gxpo-speed-audit}
+GXPO_REFERENCE_ROOT=${GXPO_REFERENCE_ROOT:-${WORKSPACE_ROOT}/gradient-extrapolation-based-policy-optimization}
 GXPO_DATA_ROOT=${GXPO_DATA_ROOT:-${GXPO_REFERENCE_ROOT}/Code/SFPO/data}
 
-# Reuse the verified GXPO CUDA/FlashAttention2/Liger runtime. The SDC venv
-# contains the matching CUDA 13 libraries, while the GXPO venv contains the
-# tested FlashAttention2 and Liger Python packages. Keep SDC's own site-packages
-# first so its PyTorch/Transformers versions remain authoritative.
-LOCAL_CUDA_LIB_ROOT=${LOCAL_CUDA_LIB_ROOT:-${REPO_ROOT}/.venv/lib/python3.12/site-packages/nvidia}
+# Reuse the verified H200 CUDA/FlashAttention3/FlashAttention2/Liger runtime.
+# The H200 environment contains the validated CUDA 13, FA3, FA2, and Liger packages;
+# keep the SDC repository code as the active checkout.
+
+LOCAL_CUDA_LIB_ROOT=${LOCAL_CUDA_LIB_ROOT:-/usr/local/lib/python3.12/dist-packages/nvidia}
 for LOCAL_CUDA_LIB_DIR in \
     "${LOCAL_CUDA_LIB_ROOT}/cu13/lib" \
     "${LOCAL_CUDA_LIB_ROOT}/cublas/lib" \
@@ -115,25 +139,27 @@ for LOCAL_CUDA_LIB_DIR in \
         export LD_LIBRARY_PATH="${LOCAL_CUDA_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     fi
 done
-GXPO_SITE_PACKAGES=${GXPO_SITE_PACKAGES:-${GXPO_REFERENCE_ROOT}/.venv/lib/python3.12/site-packages}
-SDC_SITE_PACKAGES=${SDC_SITE_PACKAGES:-${REPO_ROOT}/.venv/lib/python3.12/site-packages}
+GXPO_SITE_PACKAGES=${GXPO_SITE_PACKAGES:-${H200_VENV_ROOT}/lib/python3.12/site-packages}
+SDC_SITE_PACKAGES=${SDC_SITE_PACKAGES:-${H200_VENV_ROOT}/lib/python3.12/site-packages}
 
-# Resolve FlashAttention2 + Liger: prefer the verified GXPO bundle, fall back
-# to the SDC venv's own packages (e.g. a self-contained Blackwell install),
-# and only fail when NEITHER location provides both packages.
+# Require the requested FA3 + Liger stack; allow FA2 only when explicitly selected.
 _EXTRA_PYTHONPATH=""
-if [[ -d "${GXPO_SITE_PACKAGES}/flash_attn" && -d "${GXPO_SITE_PACKAGES}/liger_kernel" ]]; then
+if [[ "${ACTOR_ATTENTION_IMPL}" == "flash_attention_3" ]]; then
+    if [[ -d "${GXPO_SITE_PACKAGES}/flash_attn_3" && -f "${GXPO_SITE_PACKAGES}/flash_attn_interface.py" && -d "${GXPO_SITE_PACKAGES}/liger_kernel" ]]; then
+        _EXTRA_PYTHONPATH="${GXPO_SITE_PACKAGES}"
+    else
+        echo "ERROR: FA3 and Liger are required for ACTOR_ATTENTION_IMPL=flash_attention_3." >&2
+        echo "Expected packages under ${GXPO_SITE_PACKAGES}." >&2
+        exit 2
+    fi
+elif [[ -d "${GXPO_SITE_PACKAGES}/flash_attn" && -d "${GXPO_SITE_PACKAGES}/liger_kernel" ]]; then
     _EXTRA_PYTHONPATH="${GXPO_SITE_PACKAGES}"
 elif [[ -d "${SDC_SITE_PACKAGES}/flash_attn" && -d "${SDC_SITE_PACKAGES}/liger_kernel" ]]; then
-    echo "Using FlashAttention2/Liger from the SDC venv (${SDC_SITE_PACKAGES}); GXPO bundle not found."
-elif [[ -d "${GXPO_SITE_PACKAGES}/flash_attn" || -d "${SDC_SITE_PACKAGES}/flash_attn" ]] && [[ ! -d "${GXPO_SITE_PACKAGES}/liger_kernel" && ! -d "${SDC_SITE_PACKAGES}/liger_kernel" ]]; then
-    echo "WARNING: flash_attn found but liger_kernel missing; disabling Liger kernels." >&2
-    USE_LIGER=false
+    echo "Using FlashAttention2/Liger from the SDC venv (${SDC_SITE_PACKAGES})."
 else
-    echo "ERROR: no FlashAttention2 package found in either of:" >&2
-    echo "  - ${GXPO_SITE_PACKAGES}" >&2
-    echo "  - ${SDC_SITE_PACKAGES}" >&2
-    echo "Build FA2 for sm_120 (see BLACKWELL_SETUP.md) or point GXPO_SITE_PACKAGES at a bundle that has it." >&2
+    echo "ERROR: required FlashAttention/Liger packages are unavailable." >&2
+    echo "  GXPO/H200 packages: ${GXPO_SITE_PACKAGES}" >&2
+    echo "  SDC packages: ${SDC_SITE_PACKAGES}" >&2
     exit 2
 fi
 export VERL_EXTRA_PYTHONPATH="${_EXTRA_PYTHONPATH}"
@@ -160,7 +186,7 @@ if [[ -f "${PYTHON_DEV_INCLUDE_ROOT}/python3.12/Python.h" ]]; then
     export CPATH="${PYTHON_DEV_INCLUDE_ROOT}/python3.12:${PYTHON_DEV_INCLUDE_ROOT}${CPATH:+:${CPATH}}"
 fi
 
-PROJECT_NAME=${PROJECT_NAME:-verl_sdc_deepscaler}
+PROJECT_NAME=${PROJECT_NAME:-gxpo-efficiency-final}
 export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
 export WANDB_SILENT=${WANDB_SILENT:-true}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
@@ -185,7 +211,7 @@ PREPARE_TRAIN_DATA=${PREPARE_TRAIN_DATA:-false}
 # shared auxiliary columns, which Hugging Face Datasets cannot concatenate.
 # These cached copies retain the RL fields while normalizing the schema and
 # canonical data_source names used by validation and best-checkpoint selection.
-SDC_VAL_CACHE_ROOT=${SDC_VAL_CACHE_ROOT:-${REPO_ROOT}/data/sdc_validation_normalized}
+SDC_VAL_CACHE_ROOT=${SDC_VAL_CACHE_ROOT:-${GXPO_DATA_ROOT}/sdc_validation_normalized}
 MATH500_FILE=${MATH500_FILE:-${SDC_VAL_CACHE_ROOT}/math500.parquet}
 AIME24_FILE=${AIME24_FILE:-${SDC_VAL_CACHE_ROOT}/aime2024.parquet}
 AIME25_FILE=${AIME25_FILE:-${SDC_VAL_CACHE_ROOT}/aime2025.parquet}
@@ -230,7 +256,8 @@ fi
 # ── SDC-GRPO hyperparameters ────────────────────────────────────────────────
 SDC_ENABLE=${SDC_ENABLE:-true}
 SDC_BETA=${SDC_BETA:-0.5}
-SDC_SCORING_BACKEND=${SDC_SCORING_BACKEND:-}
+SDC_SCORING_BACKEND=${SDC_SCORING_BACKEND:-hf}
+SDC_TEACHER_MODE=${SDC_TEACHER_MODE:-full_fsdp}
 SDC_VLLM_SCORE_MICRO_BATCH_SIZE=${SDC_VLLM_SCORE_MICRO_BATCH_SIZE:-16}
 SDC_REUSE_ROLLOUT_LOGPROBS=${SDC_REUSE_ROLLOUT_LOGPROBS:-}
 SDC_VERIFY_ROLLOUT_LOGPROBS=${SDC_VERIFY_ROLLOUT_LOGPROBS:-false}
@@ -241,7 +268,7 @@ SDC_BASE_MIX_GAMMA=${SDC_BASE_MIX_GAMMA:-0.9}
 # contrast contributes to the actor loss.
 SDC_MIN_SFT_UPDATES_BEFORE_USE=${SDC_MIN_SFT_UPDATES_BEFORE_USE:-2}
 SDC_SFT_UPDATE_INTERVAL=${SDC_SFT_UPDATE_INTERVAL:-5}       # run SFT every N policy steps
-SDC_CHECKPOINT_INTERVAL=${SDC_CHECKPOINT_INTERVAL:-20}
+SDC_CHECKPOINT_INTERVAL=${SDC_CHECKPOINT_INTERVAL:-50}
 SDC_SFT_LR=${SDC_SFT_LR:-1.0e-5}
 SDC_SFT_BATCH_SIZE=${SDC_SFT_BATCH_SIZE:-8}
 # 8 rows * (1024 prompt + 3072 response) tokens. The implementation uses the
@@ -249,17 +276,17 @@ SDC_SFT_BATCH_SIZE=${SDC_SFT_BATCH_SIZE:-8}
 SDC_SFT_MAX_TOKEN_LEN_PER_GPU=${SDC_SFT_MAX_TOKEN_LEN_PER_GPU:-32768}
 SDC_SFT_MAX_UPDATES=${SDC_SFT_MAX_UPDATES:-1}
 SDC_SAVE_TO_DISK_INTERVAL=${SDC_SAVE_TO_DISK_INTERVAL:-0}
-SDC_DATA_MAX_SIZE=${SDC_DATA_MAX_SIZE:-8192}
+SDC_DATA_MAX_SIZE=${SDC_DATA_MAX_SIZE:-32768}
 SDC_DATA_SAMPLING=${SDC_DATA_SAMPLING:-recent}
 SDC_FUSED_ADAMW=${SDC_FUSED_ADAMW:-true}
 # Sidecar residency: '' (unset) -> library default 'auto_offload' (per-pass CPU
 # offload, historical behavior). 'resident' keeps the SDC clones on the actor
 # GPU across scoring/SFT; only use it with a trainer that calls
 # sdc_release_residency() before vLLM wake-up.
-SDC_SIDECAR_RESIDENCY=${SDC_SIDECAR_RESIDENCY:-}
+SDC_SIDECAR_RESIDENCY=${SDC_SIDECAR_RESIDENCY:-auto_offload}
 # Sidecar gradient checkpointing: '' (unset) -> library default null (inherit
 # the actor setting). 'true'/'false' force it on/off for the SDC clones only.
-SDC_SIDECAR_GRADIENT_CHECKPOINTING=${SDC_SIDECAR_GRADIENT_CHECKPOINTING:-}
+SDC_SIDECAR_GRADIENT_CHECKPOINTING=${SDC_SIDECAR_GRADIENT_CHECKPOINTING:-false}
 
 
 # Match the GXPO actor optimization stack. These are explicit launcher
@@ -279,22 +306,21 @@ SDC_DISTRIBUTED_METRICS=${SDC_DISTRIBUTED_METRICS:-false}
 TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-256}
 NUM_GENERATIONS=${NUM_GENERATIONS:-8}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
-# Minibatch 64 = 4 optimizer slices over the 2048-row logical batch.
-# NOTE: this disables the fused old-log-prob fast path (it requires
-# ppo_mini_batch_size * rollout.n >= batch rows; 64*8=512 < 2048), so each
+# Minibatch 64 = 4 optimizer slices over the 256-prompt outer batch (2048 logical rollout rows).
+# NOTE: with minibatch 64, the fused old-log-prob shortcut is unavailable (it requires
+# ppo_mini_batch_size * rollout.n >= batch rows), so each
 # step pays one separate old-policy forward. Set 256 to restore the fusion.
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
 FUSE_OLD_LOG_PROB=${FUSE_OLD_LOG_PROB:-true}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
-# Larger per-GPU token budget reduces dynamic microbatching and FSDP synchronization overhead on 98 GiB GPUs.
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-49152}
-# Use the same verified FlashAttention2 path as GXPO. The CUDA 13 runtime
+# Larger per-GPU token budget reduces dynamic microbatching and FSDP synchronization overhead on 141 GiB H200s.
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-131072}
+# Use the same verified FlashAttention3 path as GXPO. The CUDA 13 runtime
 # libraries and package path are configured above before Ray workers start.
-ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
-# Match GXPO's FSDP1 setup: keep master parameters in FP32 while FSDP's
-# mixed-precision policy performs BF16 forward/reduction work.
-MODEL_DTYPE=${MODEL_DTYPE:-fp32}
+ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_3}
+# Keep the actor in H200-native BF16 mode so FA3 can run on the hot path.
+MODEL_DTYPE=${MODEL_DTYPE:-bf16}
 DRGRPO_USE_LORA=${DRGRPO_USE_LORA:-false}
 LORA_RANK=${LORA_RANK:-512}
 LORA_ALPHA=${LORA_ALPHA:-1024}
@@ -306,6 +332,14 @@ if [[ -z "${SDC_SCORING_BACKEND}" ]]; then
     else
         SDC_SCORING_BACKEND=hf
     fi
+fi
+if [[ "${SDC_TEACHER_MODE}" == "full_fsdp" && "${DRGRPO_USE_LORA}" == "true" ]]; then
+    echo "SDC_TEACHER_MODE=full_fsdp requires DRGRPO_USE_LORA=false; use shared_lora for LoRA." >&2
+    exit 2
+fi
+if [[ "${SDC_TEACHER_MODE}" == "shared_lora" && "${DRGRPO_USE_LORA}" != "true" ]]; then
+    echo "SDC_TEACHER_MODE=shared_lora requires DRGRPO_USE_LORA=true." >&2
+    exit 2
 fi
 if [[ "${SDC_SCORING_BACKEND}" == "vllm" && "${DRGRPO_USE_LORA}" != "true" ]]; then
     echo "SDC_SCORING_BACKEND=vllm requires DRGRPO_USE_LORA=true; use hf for full fine-tuning." >&2
@@ -335,11 +369,11 @@ CLIP_RATIO=${CLIP_RATIO:-0.2}
 CLIP_RATIO_C=${CLIP_RATIO_C:-3.0}
 
 ROLLOUT_TP=${ROLLOUT_TP:-1}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.7}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.80}
 ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
-VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
-ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}
-ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-98304}
+export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-2048}
+ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-262144}
 if [[ -z "${ROLLOUT_MAX_LORAS:-}" ]]; then
     ROLLOUT_MAX_LORAS=3
 fi
@@ -350,6 +384,7 @@ VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-1}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-null}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-False}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-0}
+VAL_TOP_K=${VAL_TOP_K:--1}
 VAL_TOP_P=${VAL_TOP_P:-1.0}
 VALIDATION_SEEDS=${VALIDATION_SEEDS:-'[0]'}
 TRAIN_SEED=${TRAIN_SEED:-3407}
@@ -365,11 +400,11 @@ WG_EMBED_MODEL=${WG_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
 WG_DECODE_MODEL=${WG_DECODE_MODEL:-${MODEL_PATH}}  # use actor tokenizer to decode response token IDs
 
 MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}
-SAVE_FREQ=${SAVE_FREQ:-20}
+SAVE_FREQ=${SAVE_FREQ:-50}
 TEST_FREQ=${TEST_FREQ:-5}
-VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}
 # Select checkpoints over the same six validation benchmarks as GXPO.
-BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["math500","aime24","aime25","amc23","minervamath","olympiadbench"]'}
+BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["math500","aime2024","aime2025","amc23","minervamath","olympiadbench"]'}
 # Selection metric(s), e.g. '["pass@1"]'. Unset keeps the trainer default ("combined",
 # = 0.5*(avg@k + pass@k)), which needs BOTH keys -- so a greedy n=1 run must set this
 # to pass@1 or no best/ checkpoint is ever written.
@@ -476,6 +511,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.val_kwargs.do_sample=${VAL_DO_SAMPLE}
     actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}
     actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}
+    actor_rollout_ref.rollout.val_kwargs.top_k=${VAL_TOP_K}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.rollout.agent.num_workers=${ROLLOUT_AGENT_NUM_WORKERS}
@@ -526,6 +562,7 @@ fi
 SDC=(
     custom_sdc.enable="${SDC_ENABLE}"
     custom_sdc.scoring_backend="${SDC_SCORING_BACKEND}"
+    custom_sdc.teacher_mode="${SDC_TEACHER_MODE}"
     custom_sdc.vllm_score_micro_batch_size="${SDC_VLLM_SCORE_MICRO_BATCH_SIZE}"
     custom_sdc.beta="${SDC_BETA}"
     custom_sdc.reuse_rollout_log_probs="${SDC_REUSE_ROLLOUT_LOGPROBS}"
@@ -567,6 +604,21 @@ WASSERSTEIN=(
     actor_rollout_ref.actor.wasserstein_guidance.decode_model="${WG_DECODE_MODEL}"
 )
 
+if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    command -v nvidia-smi >/dev/null || { echo "ERROR: nvidia-smi is unavailable." >&2; exit 2; }
+    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    [[ "${GPU_COUNT}" -ge "${NDEVICES_PER_NODE}" ]] || { echo "ERROR: requested ${NDEVICES_PER_NODE} GPUs but found ${GPU_COUNT}." >&2; exit 2; }
+    [[ "${FSDP_SIZE}" -gt 0 && "${FSDP_SIZE}" -le "${NDEVICES_PER_NODE}" ]] || { echo "ERROR: FSDP_SIZE must be in [1, NDEVICES_PER_NODE]." >&2; exit 2; }
+    echo "SDC launcher dry-run: model=${MODEL_PATH} train=${TRAIN_FILES} val=${VAL_FILES}"
+    echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} GPUs=${GPU_COUNT} actor/ref=fsdp2 fsdp_size=${FSDP_SIZE}"
+    echo "attention=${ACTOR_ATTENTION_IMPL} liger=${USE_LIGER} teacher_mode=${SDC_TEACHER_MODE} scoring=${SDC_SCORING_BACKEND}"
+    printf "resolved hydra command: python -m verl.trainer.main_ppo \
+"
+    printf "  %s \
+" "${DATA[@]}" "${MODEL[@]}" "${ACTOR[@]}" "${ROLLOUT[@]}" "${REF[@]}" "${TRAINER[@]}" "${SDC[@]}" "${WASSERSTEIN[@]}"
+    exit 0
+fi
+
 if [[ "${BASE_ALGO}" == "dapo" ]]; then
     DATA+=(
         algorithm.filter_groups.enable=true
@@ -584,7 +636,9 @@ fi
     "${TRAINER[@]}" \
     "${SDC[@]}" \
     "${WASSERSTEIN[@]}" \
-    actor_rollout_ref.actor.strategy=fsdp \
-    actor_rollout_ref.ref.strategy=fsdp \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=${FSDP_SIZE} \
+    actor_rollout_ref.ref.strategy=fsdp2 \
+    actor_rollout_ref.ref.fsdp_config.fsdp_size=${FSDP_SIZE} \
     critic.enable=false \
     "$@"

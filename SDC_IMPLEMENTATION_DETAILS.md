@@ -338,3 +338,115 @@ synchronization can be model-sized.
 
 See `SDC_FSDP_PERFORMANCE_AUDIT_AND_PLAN.md` for the performance audit and
 `SDC_MODULARIZATION_REPORT.md` for the functional audit and validation status.
+
+
+## Repaired native-sharded implementation
+
+The default SDC teacher mode is `full_fsdp`. The actor engine creates two independent
+teachers through the same HF model construction, remove-padding, Liger, attention,
+mixed-precision, device-mesh, and FSDP wrap path as the actor. FSDP2 uses
+`fully_shard`; FSDP1 remains available through the existing FSDP wrapper.
+
+The actor-to-teacher copy is local-shard to local-shard. No rank summons a complete
+actor, gathers a rank-zero model, or broadcasts complete teacher weights. Each teacher
+has its own AdamW optimizer. The immutable SDC base is stored as a CPU copy of each
+rank's local parameter shard, and post-SFT interpolation is performed in FP32 on that
+local shard.
+
+### Distributed actor data flow
+
+~~~text
+rollout outcomes
+  -> DAPO/group filtering and reordering
+  -> attach sdc_failure_mask to the final actor batch
+  -> HF or rollout-reused teacher log probabilities
+  -> compute global failed-token count, contrast sum, and contrast squared-sum
+  -> one detached global contrast center/RMS
+  -> dynamic microbatching
+  -> additive actor loss
+~~~
+
+The failure mask is attached only after the final filtering/reordering operation.
+Teacher scores and old-policy log probabilities are detached. Failed rows are scored;
+successful rows remain in the actor batch with an inactive SDC mask.
+
+Before actor microbatches are created, the engine computes the failed-token count and
+the first two contrast moments over the complete logical batch. The three FP32
+statistics are reduced over the actor data-parallel group once. Every microbatch
+receives the same detached global count, center, and RMS. The SDC denominator is
+therefore invariant to rank count, dynamic batching, and microbatch partitioning.
+
+The loss keeps importance-ratio clipping, the global failed-token denominator, the
+readiness gate, and additive composition with the base policy loss. A zero failed-token
+batch returns the zero SDC term. Supported old-log-probability paths are:
+
+1. rollout reuse for the vLLM/shared-LoRA path;
+2. a separate pre-update actor forward when reuse is disabled;
+3. fused ratio-equals-one when the PPO batch and optimizer schedule satisfy the
+   existing fusion preconditions.
+
+### Paired distributed SFT
+
+Success and failure records are prompt-paired before token budgeting. The common
+response-token budget is calculated globally and applied before rank partitioning.
+Each logical batch is padded with masked dummy rows to a multiple of the actor data
+parallel size. Every rank executes both the success and failure forward/backward and
+optimizer-step schedule, including when its local slice contains dummies.
+
+`sft_batch_size` is the global logical number of records per teacher update.
+`sft_max_token_len_per_gpu` is a local capacity limit. The sequence-mean loss is
+scaled by the data-parallel size before FSDP gradient averaging, giving the same
+global gradient as a single-process reference. The success and failure teachers are
+trained serially, then each is mixed with its own immutable base shard.
+
+### Residency and scoring
+
+The two sharded teachers can remain resident through scoring and SFT when
+`sidecar_residency=resident`. The trainer must call
+`sdc_release_residency()` before vLLM wake-up or actor weight synchronization.
+`auto_offload` remains a compatibility mode. Scoring runs both teachers serially
+and returns only failed-row scores in the payload; the full actor batch receives
+zero-filled inactive positions.
+
+### SDC checkpoint v2
+
+An SDC v2 directory contains:
+
+~~~text
+sdc/
+  manifest.pt
+  _SUCCESS
+  runtime.pt
+  base_rank_<world>_rank_<rank>.pt
+  success_sft/
+    model_world_size_<world>_rank_<rank>.pt
+    optim_world_size_<world>_rank_<rank>.pt
+    extra_state_world_size_<world>_rank_<rank>.pt
+    fsdp_config.json
+  failure_sft/
+    model_world_size_<world>_rank_<rank>.pt
+    optim_world_size_<world>_rank_<rank>.pt
+    extra_state_world_size_<world>_rank_<rank>.pt
+    fsdp_config.json
+~~~
+
+The native FSDP checkpoint manager writes model, optimizer, and RNG/extra shards.
+The manifest records the format version, world size, FSDP strategy, teacher paths,
+base metadata, counters, readiness, and global step. The completion marker is
+written only after all rank shards and runtime metadata are present.
+
+Loading rejects an absent marker, missing rank shard, world-size mismatch, missing
+immutable base, or incomplete teacher directory. Legacy v1 checkpoints are read only
+during migration: rank zero reads the full legacy payload, validates optimizer-ID to
+parameter-FQN coverage, broadcasts the migration payload, loads the base and teacher
+states into native FSDP shards, restores both AdamW states, and immediately writes v2.
+A slim legacy checkpoint fails clearly when its referenced base checkpoint is absent.
+
+### Explicit shared-LoRA mode
+
+`teacher_mode=shared_lora` requires a LoRA actor, vLLM scoring, and rollout
+log-probability reuse. It creates one FSDP2 backbone with named `default`/success and
+failure adapters, freezes the backbone, and gives each adapter its own optimizer.
+Adapter activation is serialized for SFT and scoring. Base interpolation and vLLM
+exports are adapter-only; updating one adapter does not update the backbone or the
+other adapter.
