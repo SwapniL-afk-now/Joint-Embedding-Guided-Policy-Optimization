@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BASE_ALGO=dapo SDC_MODE=sdc_tr SDC_TR_ALPHA=0.9 exec bash "${SCRIPT_DIR}/../common.sh" "$@"

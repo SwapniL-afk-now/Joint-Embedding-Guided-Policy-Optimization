@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -30,6 +31,7 @@ import torch
 from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
+from verl.experimental.sdc.sdc_loss import normalize_contrast
 from verl.trainer.config import AlgoConfig
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
@@ -2233,6 +2235,119 @@ def compute_policy_loss_cispo(
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("sdc_tr")
+def compute_policy_loss_sdc_tr(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    *,
+    success_log_prob: torch.Tensor | None = None,
+    failure_log_prob: torch.Tensor | None = None,
+    failure_mask: torch.Tensor | None = None,
+    reliability_gate: float = 1.0,
+    contrast_center: torch.Tensor | float | None = None,
+    contrast_rms: torch.Tensor | float | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """SDC as a trust-region ratio: fold the success/failure contrast into the
+    PPO importance ratio instead of adding it as a separate loss term.
+
+    r = (pi_theta/pi_old) * exp(lambda_eff * c), where c is the same
+    detach-mean-centered, RMS-normalized contrast (log pi_F - log pi_S) the
+    additive SDC loss uses (see ``normalize_contrast`` in
+    ``verl.experimental.sdc.sdc_loss``), and lambda_eff = (1 - alpha) *
+    reliability_gate. At alpha=1 or reliability_gate=0 this reduces exactly
+    to vanilla PPO (bit-for-bit: the tilt term is skipped, not just zeroed).
+    The tilt applies only to failed-response tokens; elsewhere -- including
+    when the teacher tensors are absent -- it is exactly zero, matching how
+    pi_S/pi_F are never scored on successful rows.
+    """
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get("clip_ratio_c", 3.0)
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+
+    alpha = float(config.policy_loss.sdc_tr_alpha)
+    tilt_clip = float(config.policy_loss.sdc_tr_tilt_clip)
+    lambda_eff = (1.0 - alpha) * float(reliability_gate)
+
+    response_mask_bool = response_mask.to(torch.bool)
+    log_ratio_base_raw = log_prob - old_log_prob
+    # Diagnostic-only clamped base ratio, decoupled from the (possibly tilted)
+    # loss-path ratio below, matching compute_policy_loss_vanilla's convention.
+    negative_approx_kl = torch.clamp(log_ratio_base_raw, min=-20.0, max=20.0)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    tilt_active = lambda_eff != 0.0 and success_log_prob is not None and failure_log_prob is not None and failure_mask is not None
+    if tilt_active:
+        active_mask = response_mask_bool & failure_mask.to(device=response_mask.device, dtype=torch.bool).reshape(-1, 1)
+        raw_contrast = (failure_log_prob - success_log_prob).detach().to(device=log_prob.device, dtype=log_prob.dtype)
+        c, contrast_center_t, contrast_rms_t = normalize_contrast(
+            raw_contrast, active_mask, center=contrast_center, rms=contrast_rms
+        )
+        tilt_bound = math.log(tilt_clip)
+        raw_tilt = lambda_eff * c
+        tilt_log = torch.where(active_mask, raw_tilt.clamp(min=-tilt_bound, max=tilt_bound), torch.zeros_like(raw_tilt))
+        tilt_clip_fraction = verl_F.masked_mean((raw_tilt.abs() > tilt_bound).float(), active_mask).detach().item()
+        contrast_mean = verl_F.masked_mean(c, active_mask).detach().item()
+    else:
+        active_mask = torch.zeros_like(response_mask_bool)
+        tilt_log = torch.zeros_like(log_ratio_base_raw)
+        contrast_center_t = torch.zeros((), device=log_prob.device)
+        contrast_rms_t = torch.ones((), device=log_prob.device)
+        tilt_clip_fraction = 0.0
+        contrast_mean = 0.0
+
+    log_r = (log_ratio_base_raw + tilt_log).clamp(min=-20.0, max=20.0)
+    ratio = log_r.exp()
+
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+    )
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+    )
+
+    active_token_fraction = verl_F.masked_mean(active_mask.float(), response_mask_bool).detach().item()
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "sdc_tr/alpha": alpha,
+        "sdc_tr/reliability_gate": float(reliability_gate),
+        "sdc_tr/lambda_eff": lambda_eff,
+        "sdc_tr/contrast_mean": contrast_mean,
+        "sdc_tr/contrast_rms": float(contrast_rms_t.detach().item()) if tilt_active else 1.0,
+        "sdc_tr/tilt_clip_fraction": tilt_clip_fraction,
+        "sdc_tr/active_failed_token_fraction": active_token_fraction,
     }
     return pg_loss, pg_metrics
 

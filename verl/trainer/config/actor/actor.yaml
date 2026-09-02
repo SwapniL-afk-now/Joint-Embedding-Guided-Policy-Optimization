@@ -75,6 +75,12 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Mixing coefficient for the 'sdc_tr' loss mode. 1.0 = exact vanilla-PPO equivalence
+  sdc_tr_alpha: 1.0
+
+  # Symmetric multiplicative bound on the SDC-TR tilt factor exp(lambda_eff * c)
+  sdc_tr_tilt_clip: 10.0
+
 # Token-weighted sequence-level Wasserstein guidance auxiliary loss
 wasserstein_guidance:
 

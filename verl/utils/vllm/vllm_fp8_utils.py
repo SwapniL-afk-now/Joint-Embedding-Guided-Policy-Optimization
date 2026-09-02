@@ -24,9 +24,13 @@ from packaging import version
 
 try:
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+except ImportError:
+    # vLLM 0.27 removed this legacy symbol; dense models do not need it.
+    FusedMoE = None
+try:
     from vllm.model_executor.layers.linear import LinearBase
-except ImportError as e:
-    raise ImportError("FP8 quantization not available") from e
+except ImportError:
+    LinearBase = None
 
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
 
@@ -77,7 +81,7 @@ def get_module_from_param_name(model, name: str):
     try:
         # Traverse the model hierarchy
         for part in module_path:
-            if isinstance(current_module, FusedMoE):
+            if (FusedMoE is not None and isinstance(current_module, FusedMoE)):
                 return current_module
             elif isinstance(current_module, torch.nn.ModuleList):
                 current_module = current_module[int(part)]
@@ -97,7 +101,7 @@ def is_fp8_weight(name, model):
             # We currently only quantize linear layers
 
             if (isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn) or (
-                isinstance(module, FusedMoE)
+                (FusedMoE is not None and isinstance(module, FusedMoE))
                 and module.w13_weight.dtype == torch.float8_e4m3fn
                 and module.w2_weight.dtype == torch.float8_e4m3fn
             ):
@@ -146,7 +150,7 @@ def apply_mxfp8_transformation_after_loading(model):
         return
 
     for name, module in model.named_modules():
-        if (isinstance(module, LinearBase) or isinstance(module, FusedMoE)) and hasattr(
+        if (isinstance(module, LinearBase) or (FusedMoE is not None and isinstance(module, FusedMoE))) and hasattr(
             module, "_mxfp8_original_shapes"
         ):
             if hasattr(module, "quant_method") and hasattr(module.quant_method, "process_weights_after_loading"):

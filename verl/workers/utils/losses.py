@@ -92,6 +92,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
     sdc_enabled = bool(sdc_config and sdc_config.get("enable", False))
     sdc_models_ready = bool(sdc_config and sdc_config.get("sdc_models_ready", False))
     sdc_loss_active = sdc_enabled and sdc_models_ready and float(sdc_config.get("beta", 0.0)) != 0.0
+    # Hoisted ahead of field selection: the sdc_tr policy-loss mode needs the
+    # SDC teacher fields included in the padded batch (below) and needs to
+    # skip the separate additive compute_sdc_loss() call further down, so
+    # both this session's own knowledge of loss_mode has to exist this early.
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    sdc_tr_active = sdc_enabled and sdc_models_ready and loss_mode == "sdc_tr"
+    if loss_mode == "sdc_tr" and not sdc_enabled:
+        raise ValueError("policy_loss.loss_mode='sdc_tr' requires sdc.enable=true.")
 
     gpi_config = tu.get_non_tensor_data(data=data, key="custom_gpi_ce", default=None)
     gpi_enabled = bool(gpi_config and gpi_config.get("enable", False))
@@ -137,6 +145,12 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         sdc_global_batch_info["reduce_diagnostics"] = bool(
             sdc_config.get("distributed_metrics", False)
         )
+    # Non-tensor metadata (like sdc_active_token_count above) must be read
+    # before data.select() below, which is scoped to the named tensor fields
+    # and would otherwise drop it.
+    sdc_contrast_center = tu.get_non_tensor_data(data=data, key="sdc_contrast_center", default=None) if sdc_tr_active else None
+    sdc_contrast_rms = tu.get_non_tensor_data(data=data, key="sdc_contrast_rms", default=None) if sdc_tr_active else None
+    if sdc_loss_active or sdc_tr_active:
         for field in ("sdc_failure_mask", "sdc_success_log_probs", "sdc_failure_log_probs"):
             if field in data:
                 fields.append(field)
@@ -172,8 +186,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
 
     loss_agg_mode = config.loss_agg_mode
 
-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
-
     if gpi_enabled:
         # GPI-CE is a finite-group cross entropy, not a policy-gradient surrogate:
         # it needs the candidate group and q*, neither of which the registered
@@ -195,6 +207,27 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         )
     else:
         policy_loss_fn = get_policy_loss_fn(loss_mode)
+        extra_kwargs = {}
+        if loss_mode == "sdc_tr":
+            # Pre-readiness (sdc_tr_active False): pass zeroed teacher tensors
+            # and reliability_gate=0.0, which forces lambda_eff==0.0 inside
+            # compute_policy_loss_sdc_tr -- exact vanilla-PPO equivalence,
+            # not an approximation, until both SDC teachers are trained.
+            extra_kwargs = dict(
+                success_log_prob=data.get("sdc_success_log_probs", torch.zeros_like(log_prob)),
+                failure_log_prob=data.get("sdc_failure_log_probs", torch.zeros_like(log_prob)),
+                failure_mask=data.get(
+                    "sdc_failure_mask", torch.zeros(log_prob.shape[0], dtype=torch.bool, device=log_prob.device)
+                ),
+                reliability_gate=float(sdc_config.get("sdc_reliability_gate", 1.0)) if sdc_tr_active else 0.0,
+                # Global (all-reduced, pre-micro-batch) contrast normalization
+                # stats, the same ones compute_sdc_loss reads -- keeps the
+                # SDC-TR tilt invariant to dynamic-batch partitioning too.
+                # Absent when teacher scores aren't materialized yet; falls
+                # back to local-batch normalization inside normalize_contrast.
+                contrast_center=sdc_contrast_center,
+                contrast_rms=sdc_contrast_rms,
+            )
         pg_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
@@ -203,6 +236,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
             loss_agg_mode=loss_agg_mode,
             config=config,
             rollout_is_weights=rollout_is_weights,
+            **extra_kwargs,
         )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
@@ -258,7 +292,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         metrics["sharpen/alpha"] = Metric(value=sharpening_alpha, aggregation=AggregationType.MAX)
         metrics["sharpen/beta"] = Metric(value=sharpening_beta, aggregation=AggregationType.MAX)
 
-    if sdc_enabled:
+    if sdc_enabled and loss_mode != "sdc_tr":
         if not sdc_loss_active:
             # Before both SFT models are ready, the auxiliary loss is exactly
             # zero. Do not require or materialize its three large padded

@@ -44,6 +44,13 @@ def concat_dict_to_str(dict: dict, step):
         "train/pass_at_8",
         "train/unique_answer_ratio_at_k",
         "train/exploration_collapse_rate",
+        "eval_greedy/math500_pass1",
+        "eval_greedy/aime24_pass1",
+        "eval_greedy/aime25_pass1",
+        "eval_greedy/amc23_pass1",
+        "eval_greedy/minerva_pass1",
+        "eval_greedy/olympiadbench_pass1",
+        "eval_greedy/avg_pass1",
         # GPI-CE: target_mass_offline is the one that says whether the offline
         # candidates earn any of q*'s mass; degenerate_group_fraction is how much of
         # the batch has tied rewards and therefore contributes exactly zero gradient.

@@ -91,6 +91,11 @@ class PolicyLossConfig(BaseConfig):
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
+        sdc_tr_alpha (float): Mixing coefficient for the 'sdc_tr' loss mode. 1.0 = exact
+            vanilla-PPO equivalence; lower values tilt the importance ratio toward the
+            SDC success/failure contrast on failed-response tokens.
+        sdc_tr_tilt_clip (float): Symmetric multiplicative bound on the SDC-TR tilt factor
+            exp(lambda_eff * c), applied before it is combined with the base log-ratio.
     """
 
     loss_mode: str = "vanilla"
@@ -100,6 +105,8 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    sdc_tr_alpha: float = 1.0
+    sdc_tr_tilt_clip: float = 10.0
 
 
 @dataclass
