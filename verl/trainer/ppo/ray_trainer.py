@@ -2197,6 +2197,7 @@ class RayPPOTrainer:
             "vllm_score_micro_batch_size": int(self.sdc_config.vllm_score_micro_batch_size),
             "reuse_rollout_log_probs": bool(self.sdc_config.reuse_rollout_log_probs),
             "verify_rollout_log_probs": bool(self.sdc_config.verify_rollout_log_probs),
+            "use_fused_log_probs": bool(getattr(self.sdc_config, "use_fused_log_probs", True)),
             "use_importance_weight": bool(self.sdc_config.use_importance_weight),
             "importance_weight_clip": float(self.sdc_config.importance_weight_clip),
             "base_mix_gamma": float(self.sdc_config.base_mix_gamma),

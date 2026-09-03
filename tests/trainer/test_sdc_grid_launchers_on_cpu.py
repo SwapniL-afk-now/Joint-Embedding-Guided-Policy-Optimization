@@ -26,28 +26,54 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 GRID_DIR = os.path.join(REPO_ROOT, "examples", "sdc_grid")
 CONFIG_DIR = os.path.join(REPO_ROOT, "verl", "trainer", "config")
 
-MODEL_PATH = "/workspace/models/Qwen2.5-Math-1.5B-Instruct"
-DATA_ROOT = "/workspace/data"
+# Asset locations follow the same env vars common.sh honours, so the suite runs
+# on any box where the checkout lives outside /workspace. Only when the RESOLVED
+# paths are missing do we skip.
+MODEL_PATH = os.environ.get("MODEL_PATH", "/workspace/models/Qwen2.5-Math-1.5B-Instruct")
+DATA_ROOT = os.environ.get("GXPO_DATA_ROOT", "/workspace/data")
+VAL_CACHE_ROOT = os.environ.get("SDC_VAL_CACHE_ROOT", os.path.join(DATA_ROOT, "sdc_validation_normalized"))
+# FA3 is unavailable on some GPUs (e.g. Blackwell sm_120); common.sh preflights
+# whatever ACTOR_ATTENTION_IMPL asks for, so the golden snapshot follows it.
+ACTOR_ATTENTION_IMPL = os.environ.get("ACTOR_ATTENTION_IMPL", "flash_attention_3")
 _REQUIRED_PATHS = [
     os.path.join(MODEL_PATH, "config.json"),
     os.path.join(DATA_ROOT, "dapo_math", "train.parquet"),
     os.path.join(DATA_ROOT, "lighteval-math", "train.parquet"),
-    os.path.join(DATA_ROOT, "sdc_validation_normalized", "math500.parquet"),
+    os.path.join(VAL_CACHE_ROOT, "math500.parquet"),
 ]
+_MISSING_PATHS = [p for p in _REQUIRED_PATHS if not os.path.exists(p)]
 pytestmark = pytest.mark.skipif(
-    not all(os.path.exists(p) for p in _REQUIRED_PATHS),
-    reason="sdc_grid launcher preflight needs the model/dataset checkout under /workspace",
+    bool(_MISSING_PATHS),
+    reason=(
+        "sdc_grid launcher preflight needs the model/dataset checkout; missing "
+        f"{_MISSING_PATHS} (set MODEL_PATH / GXPO_DATA_ROOT / SDC_VAL_CACHE_ROOT)"
+    ),
 )
 
 BASES = ("drgrpo", "dapo", "avspo")
 ALPHAS = ("1.0", "0.9", "0.7", "0.5")
+# Zero-advantage ("all-wrong group") repair arms: sdc_tr at alpha=0.5 plus an
+# explicit policy_loss.sdc_tr_degenerate_coef.
+ZEROADV_ALPHA = "0.5"
+ZEROADV_COEF = "0.5"
 
+# (rel_path, base, mode, alpha, degenerate_coef); degenerate_coef is None when the
+# arm must leave the knob at its 0.0 dataclass default.
 ARMS = []
 for _base in BASES:
-    ARMS.append((f"base/{_base}.sh", _base, "base", None))
-    ARMS.append((f"sdc/{_base}.sh", _base, "sdc", None))
+    ARMS.append((f"base/{_base}.sh", _base, "base", None, None))
+    ARMS.append((f"sdc/{_base}.sh", _base, "sdc", None, None))
     for _alpha in ALPHAS:
-        ARMS.append((f"sdc_tr/{_base}_a{_alpha}.sh", _base, "sdc_tr", _alpha))
+        ARMS.append((f"sdc_tr/{_base}_a{_alpha}.sh", _base, "sdc_tr", _alpha, None))
+    ARMS.append(
+        (
+            f"sdc_tr_zeroadv/{_base}_a{ZEROADV_ALPHA}_dg{ZEROADV_COEF}.sh",
+            _base,
+            "sdc_tr",
+            ZEROADV_ALPHA,
+            ZEROADV_COEF,
+        )
+    )
 
 ARM_IDS = [a[0] for a in ARMS]
 
@@ -67,7 +93,7 @@ GXPO_GOLDEN_FAIRNESS_KEYS = {
     "actor_rollout_ref.model.use_remove_padding": "True",
     "actor_rollout_ref.model.enable_gradient_checkpointing": "True",
     "actor_rollout_ref.model.use_liger": "True",
-    "+actor_rollout_ref.model.override_config.attn_implementation": "flash_attention_3",
+    "+actor_rollout_ref.model.override_config.attn_implementation": ACTOR_ATTENTION_IMPL,
     "actor_rollout_ref.actor.optim.lr": "1e-6",
     "actor_rollout_ref.actor.optim.fused": "True",
     "actor_rollout_ref.actor.use_torch_compile": "True",
@@ -168,16 +194,16 @@ def _values_equal(a, b):
         return False
 
 
-@pytest.mark.parametrize("rel_path,base,mode,alpha", ARMS, ids=ARM_IDS)
-def test_entrypoint_dry_run_succeeds(rel_path, base, mode, alpha):
+@pytest.mark.parametrize("rel_path,base,mode,alpha,degenerate_coef", ARMS, ids=ARM_IDS)
+def test_entrypoint_dry_run_succeeds(rel_path, base, mode, alpha, degenerate_coef):
     proc = _run_entrypoint(rel_path, dry_run=True)
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "preflight OK" in proc.stdout
     assert "resolved launch configuration" in proc.stdout
 
 
-@pytest.mark.parametrize("rel_path,base,mode,alpha", ARMS, ids=ARM_IDS)
-def test_arm_inherits_gxpo_fairness_keys(rel_path, base, mode, alpha):
+@pytest.mark.parametrize("rel_path,base,mode,alpha,degenerate_coef", ARMS, ids=ARM_IDS)
+def test_arm_inherits_gxpo_fairness_keys(rel_path, base, mode, alpha, degenerate_coef):
     overrides = _overrides_to_dict(_dump_overrides(rel_path))
 
     missing = [k for k in GXPO_GOLDEN_FAIRNESS_KEYS if k not in overrides]
@@ -210,8 +236,8 @@ def test_divergences_are_exhaustive():
     assert not extra, f"undocumented divergences appeared in common.sh: {extra}"
 
 
-@pytest.mark.parametrize("rel_path,base,mode,alpha", ARMS, ids=ARM_IDS)
-def test_arm_hydra_composition(rel_path, base, mode, alpha):
+@pytest.mark.parametrize("rel_path,base,mode,alpha,degenerate_coef", ARMS, ids=ARM_IDS)
+def test_arm_hydra_composition(rel_path, base, mode, alpha, degenerate_coef):
     hydra = pytest.importorskip("hydra")
     from hydra import compose, initialize_config_dir
 
@@ -236,11 +262,16 @@ def test_arm_hydra_composition(rel_path, base, mode, alpha):
     if mode == "sdc_tr":
         assert float(cfg.actor_rollout_ref.actor.policy_loss.sdc_tr_alpha) == float(alpha)
         assert cfg.actor_rollout_ref.actor.policy_loss.sdc_tr_tilt_clip is not None
+        # The zero-advantage repair is opt-in: only the sdc_tr_zeroadv arms turn
+        # it on, every other sdc_tr arm must stay at the 0.0 default.
+        expected_coef = float(degenerate_coef) if degenerate_coef is not None else 0.0
+        assert float(cfg.actor_rollout_ref.actor.policy_loss.sdc_tr_degenerate_coef) == expected_coef
     else:
         # base/sdc arms never touch the sdc_tr-only knobs; they should stay at
         # the dataclass default (1.0 / bit-for-bit vanilla) rather than being
         # silently set to something else.
         assert float(cfg.actor_rollout_ref.actor.policy_loss.sdc_tr_alpha) == 1.0
+        assert float(cfg.actor_rollout_ref.actor.policy_loss.sdc_tr_degenerate_coef) == 0.0
 
 
 @pytest.mark.parametrize("base", BASES)
@@ -248,10 +279,19 @@ def test_sdc_tr_alpha_one_differs_from_sdc_sibling_only_in_loss_mode(base):
     sdc_overrides = _overrides_to_dict(_dump_overrides(f"sdc/{base}.sh"))
     tr_overrides = _overrides_to_dict(_dump_overrides(f"sdc_tr/{base}_a1.0.sh"))
 
-    allowed_changed = {"actor_rollout_ref.actor.policy_loss.loss_mode"}
+    # SDC-TR arms intentionally receive distinct run identities so their
+    # checkpoints and metrics cannot overwrite the additive SDC siblings.
+    allowed_changed = {
+        "actor_rollout_ref.actor.policy_loss.loss_mode",
+        "trainer.experiment_name",
+        "trainer.default_local_dir",
+    }
     allowed_tr_only = {
         "actor_rollout_ref.actor.policy_loss.sdc_tr_alpha",
         "actor_rollout_ref.actor.policy_loss.sdc_tr_tilt_clip",
+        # Opt-in zero-advantage repair knob; the a1.0 arms leave it at its 0.0
+        # default, but tolerate it being emitted explicitly.
+        "actor_rollout_ref.actor.policy_loss.sdc_tr_degenerate_coef",
     }
 
     unexpected = {}
@@ -268,3 +308,33 @@ def test_sdc_tr_alpha_one_differs_from_sdc_sibling_only_in_loss_mode(base):
     )
     assert sdc_overrides["actor_rollout_ref.actor.policy_loss.loss_mode"] == "vanilla"
     assert tr_overrides["actor_rollout_ref.actor.policy_loss.loss_mode"] == "sdc_tr"
+
+
+@pytest.mark.parametrize("base", BASES)
+def test_zeroadv_arm_differs_from_sdc_tr_sibling_only_in_degenerate_coef(base):
+    """sdc_tr_zeroadv/<base>_a0.5_dg0.5.sh must be the a0.5 arm plus one knob."""
+    tr_overrides = _overrides_to_dict(_dump_overrides(f"sdc_tr/{base}_a{ZEROADV_ALPHA}.sh"))
+    zeroadv_overrides = _overrides_to_dict(
+        _dump_overrides(f"sdc_tr_zeroadv/{base}_a{ZEROADV_ALPHA}_dg{ZEROADV_COEF}.sh")
+    )
+
+    coef_key = "actor_rollout_ref.actor.policy_loss.sdc_tr_degenerate_coef"
+    # Run identity keys legitimately differ (the arm has its own experiment name
+    # and checkpoint dir).
+    allowed_changed = {coef_key, "trainer.experiment_name", "trainer.default_local_dir"}
+
+    unexpected = {}
+    for key in set(tr_overrides) | set(zeroadv_overrides):
+        a, b = tr_overrides.get(key), zeroadv_overrides.get(key)
+        if a == b or key in allowed_changed:
+            continue
+        unexpected[key] = (a, b)
+
+    assert not unexpected, (
+        f"sdc_tr_zeroadv/{base} diverges from its sdc_tr a{ZEROADV_ALPHA} sibling beyond "
+        f"the repair knob: {unexpected}"
+    )
+    assert float(zeroadv_overrides[coef_key]) == float(ZEROADV_COEF)
+    # The plain sdc_tr arms must not silently start emitting the knob.
+    assert coef_key not in tr_overrides or float(tr_overrides[coef_key]) == 0.0
+    assert "_dg" in zeroadv_overrides["trainer.experiment_name"]

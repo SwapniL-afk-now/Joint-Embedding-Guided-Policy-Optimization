@@ -96,6 +96,14 @@ class PolicyLossConfig(BaseConfig):
             SDC success/failure contrast on failed-response tokens.
         sdc_tr_tilt_clip (float): Symmetric multiplicative bound on the SDC-TR tilt factor
             exp(lambda_eff * c), applied before it is combined with the base log-ratio.
+        sdc_tr_degenerate_coef (float): Zero-advantage (all-wrong group) repair coefficient
+            for the 'sdc_tr' loss mode. Dr.GRPO advantages are group-centered, so a group
+            in which every response is wrong has A == 0 on all of its tokens and produces
+            no gradient. When this coefficient is > 0, a detached pseudo-advantage
+            A_eff = A - sdc_tr_degenerate_coef * reliability_gate * c is injected on those
+            active zero-advantage failed tokens, where c is the normalized
+            (log pi_failure - log pi_success) contrast. 0.0 = disabled (default), which
+            keeps the loss bit-for-bit unchanged.
     """
 
     loss_mode: str = "vanilla"
@@ -107,6 +115,7 @@ class PolicyLossConfig(BaseConfig):
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
     sdc_tr_alpha: float = 1.0
     sdc_tr_tilt_clip: float = 10.0
+    sdc_tr_degenerate_coef: float = 0.0
 
 
 @dataclass

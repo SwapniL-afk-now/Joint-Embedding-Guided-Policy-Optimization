@@ -183,6 +183,10 @@ class FSDPEngine(BaseEngine):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = self.model_config.lora_rank > 0
+        # Lazily constructed by the SDC SFT path. Initialize this on every
+        # FSDP engine, including sharded full-finetune teacher mode, before
+        # the first paired refresh asks the owner for its tokenizer.
+        self._sdc_tokenizer = None
 
         # Defaults for mixed-precision state. _build_fsdp_module overrides these when it
         # runs; subclasses that bypass _build_fsdp_module (e.g. VeOmniEngine) keep the
@@ -1043,6 +1047,10 @@ class FSDPEngine(BaseEngine):
         }
 
     def sdc_init(self, sdc_config: dict):
+        # Some engine construction/deserialization paths do not preserve
+        # constructor-only lazy state. Establish the slot before either the
+        # replicated SFT pair or the legacy SDC path can request it.
+        self._sdc_tokenizer = getattr(self, "_sdc_tokenizer", None)
         teacher_mode = (sdc_config or {}).get("teacher_mode")
         if teacher_mode is None:
             teacher_mode = "legacy_lora" if self._is_lora else "full_fsdp"

@@ -265,6 +265,9 @@ fi
 ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.80}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-2048}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-262144}"
+# Keep CUDA graphs enabled by default. Set ROLLOUT_ENFORCE_EAGER=True only for
+# debugging; eager execution costs rollout throughput.
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-False}"
 ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-True}"
 TRAINER_RESUME_MODE="${TRAINER_RESUME_MODE:-auto}"
 MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-1}"
@@ -305,6 +308,26 @@ SDC_DISTRIBUTED_METRICS="${SDC_DISTRIBUTED_METRICS:-false}"
 SDC_TR_ALPHA="${SDC_TR_ALPHA:-0.9}"
 SDC_TR_TILT_CLIP="${SDC_TR_TILT_CLIP:-10.0}"
 
+# SDC-TR zero-advantage repair. Dr.GRPO-style advantages are group-centered, so a
+# group in which EVERY response is wrong has A == 0 on every token and contributes
+# no gradient at all. With a non-zero coefficient the loss injects a pseudo-advantage
+# on those active failed tokens, built from the (detached, normalized) contrast
+#   c = log pi_failure - log pi_success
+# and scaled by the SDC reliability gate:
+#   mu_eff = SDC_TR_DEGENERATE_COEF * reliability_gate,  A_eff = A - mu_eff * c
+# 0.0 (the default) is bit-for-bit identical to the previous behaviour.
+#
+# The hydra override is emitted ONLY when this variable is set EXPLICITLY in the
+# environment. That keeps the 12 pre-existing sdc_tr arms byte-identical in their
+# override list (see tests/trainer/test_sdc_grid_launchers_on_cpu.py::
+# test_sdc_tr_alpha_one_differs_from_sdc_sibling_only_in_loss_mode).
+if [[ -n "${SDC_TR_DEGENERATE_COEF+x}" ]]; then
+    SDC_TR_DEGENERATE_COEF_EXPLICIT=1
+else
+    SDC_TR_DEGENERATE_COEF_EXPLICIT=0
+fi
+SDC_TR_DEGENERATE_COEF="${SDC_TR_DEGENERATE_COEF:-0.0}"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BASE ALGORITHM
 #
@@ -330,7 +353,15 @@ esac
 # RUN IDENTITY
 # ═══════════════════════════════════════════════════════════════════════════════
 ARM_SUFFIX="${SDC_MODE}"
-[[ "$SDC_MODE" == "sdc_tr" ]] && ARM_SUFFIX="sdc_tr_a${SDC_TR_ALPHA}"
+if [[ "$SDC_MODE" == "sdc_tr" ]]; then
+    ARM_SUFFIX="sdc_tr_a${SDC_TR_ALPHA}"
+    # Keep the zero-advantage-repair arms in their own run/wandb namespace so they
+    # never overwrite the plain sdc_tr_a<alpha> checkpoints.
+    if [[ "${SDC_TR_DEGENERATE_COEF_EXPLICIT}" == "1" && "${SDC_TR_DEGENERATE_COEF}" != "0.0" \
+          && "${SDC_TR_DEGENERATE_COEF}" != "0" ]]; then
+        ARM_SUFFIX="${ARM_SUFFIX}_dg${SDC_TR_DEGENERATE_COEF}"
+    fi
+fi
 ARM_NAME="${BASE_ALGO}_${ARM_SUFFIX}"
 
 PROJECT_NAME="${PROJECT_NAME:-sdc-grid-final}"
@@ -517,6 +548,11 @@ if [[ "$SDC_MODE" == "sdc_tr" ]]; then
         actor_rollout_ref.actor.policy_loss.sdc_tr_alpha="${SDC_TR_ALPHA}"
         actor_rollout_ref.actor.policy_loss.sdc_tr_tilt_clip="${SDC_TR_TILT_CLIP}"
     )
+    if [[ "${SDC_TR_DEGENERATE_COEF_EXPLICIT}" == "1" ]]; then
+        ACTOR+=(
+            actor_rollout_ref.actor.policy_loss.sdc_tr_degenerate_coef="${SDC_TR_DEGENERATE_COEF}"
+        )
+    fi
 fi
 
 ROLLOUT=(
@@ -526,7 +562,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}"
     actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
     actor_rollout_ref.rollout.enable_chunked_prefill=True
-    actor_rollout_ref.rollout.enforce_eager=False
+    actor_rollout_ref.rollout.enforce_eager="${ROLLOUT_ENFORCE_EAGER}"
     actor_rollout_ref.rollout.n="${ROLLOUT_N}"
     actor_rollout_ref.rollout.temperature="${TRAIN_TEMPERATURE}"
     actor_rollout_ref.rollout.top_p="${TRAIN_TOP_P}"
@@ -603,10 +639,11 @@ fi
 
 # DAPO's dynamic sampling: drop groups whose accuracy carries no learning signal.
 if [[ "$BASE_ALGO" == "dapo" ]]; then
+    # filter_groups is optional and defaults to null, so add the complete
+    # structured value in one Hydra override rather than overriding children
+    # beneath a null node.
     ALGORITHM+=(
-        algorithm.filter_groups.enable=true
-        algorithm.filter_groups.metric=acc
-        algorithm.filter_groups.max_num_gen_batches=0
+        +algorithm.filter_groups='{enable:true,metric:acc,max_num_gen_batches:0}'
     )
 fi
 
@@ -646,6 +683,7 @@ if [[ "$SDC_MODE" == "sdc_tr" ]]; then
 cat <<EOT
   sdc_tr_alpha       : ${SDC_TR_ALPHA}   (1.0 == exact vanilla-PPO equivalence)
   sdc_tr_tilt_clip   : ${SDC_TR_TILT_CLIP}
+  sdc_tr_degen_coef  : ${SDC_TR_DEGENERATE_COEF}   (0.0 == off; zero-advantage repair for all-wrong groups)
 EOT
 fi
 if [[ "${SDC_ENABLE}" == "true" ]]; then

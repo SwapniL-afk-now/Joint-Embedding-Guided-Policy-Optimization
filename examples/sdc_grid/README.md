@@ -15,6 +15,7 @@ examples/sdc_grid/
   base/{drgrpo,dapo,avspo}.sh                      # base objective, no SDC term
   sdc/{drgrpo,dapo,avspo}.sh                        # base objective + additive SDC loss
   sdc_tr/{drgrpo,dapo,avspo}_a{1.0,0.9,0.7,0.5}.sh  # base objective + SDC folded into the PPO ratio
+  sdc_tr_zeroadv/{drgrpo,dapo,avspo}_a0.5_dg0.5.sh  # SDC-TR + zero-advantage repair
   queue.sh                     # sequential tmux runner
 ```
 
@@ -30,7 +31,7 @@ Every entrypoint is a 4-line wrapper (`BASE_ALGO=... SDC_MODE=... exec bash comm
 | **dapo** | `base/dapo.sh` | `sdc/dapo.sh` | `sdc_tr/dapo_a{1.0,0.9,0.7,0.5}.sh` |
 | **avspo** | `base/avspo.sh` | `sdc/avspo.sh` | `sdc_tr/avspo_a{1.0,0.9,0.7,0.5}.sh` |
 
-18 scripts total. `ngrpo` is intentionally excluded from this grid — it requires
+18 scripts in the main grid, plus 3 `sdc_tr_zeroadv/` arms (see below) = 21 total. `ngrpo` is intentionally excluded from this grid — it requires
 `policy_loss.loss_mode=ngrpo`, which `sdc_tr` would overwrite. Use
 `examples/sdc/presets/ngrpo.sh` (the additive-SDC launcher) for NGRPO work.
 
@@ -39,6 +40,52 @@ ratio: `1.0` is exact vanilla-PPO equivalence (bit-for-bit — see
 `tests/trainer/test_sdc_tr_paper_fidelity.py`), lower values tilt harder. The `a1.0`
 cell in each base row is therefore also the on-GPU sanity check: its loss curve
 should track the matching `base/*.sh` run step-for-step.
+
+## Zero-advantage repair (`sdc_tr_degenerate_coef`)
+
+Group-centered advantages (Dr.GRPO, and GRPO in general) subtract the group mean.
+If **every** response in a group is wrong, the advantage is exactly `0` on every
+token of that group. The SDC-TR loss is `-A * tilted_ratio`, so such a group gives
+**zero gradient**: the hardest prompts teach the policy nothing. Early training on
+math benchmarks spends a large fraction of its groups in exactly this state.
+
+The opt-in knob `actor_rollout_ref.actor.policy_loss.sdc_tr_degenerate_coef`
+(launcher env var `SDC_TR_DEGENERATE_COEF`, default `0.0`) injects a
+pseudo-advantage on the *active failed* tokens where `A == 0`:
+
+```
+mu_eff = sdc_tr_degenerate_coef * reliability_gate     # gate = SDC teacher trust
+c      = normalize(log pi_failure - log pi_success)    # detached teacher contrast
+A_eff  = A - mu_eff * c
+```
+
+**Sign convention.** `c > 0` means the *failure* teacher likes the token more than
+the success teacher, so `A_eff < 0` and gradient descent **lowers** its log-prob.
+`c < 0` means the *success* teacher wins, `A_eff > 0`, and descent **raises** the
+log-prob. The contrast is detached and normalized, and the pseudo-advantage flows
+through the normal PPO clip / dual-clip path, so the trust region still applies.
+
+**When to use it.** Turn it on when `sdc_tr/degenerate_token_fraction` is large
+(many all-wrong groups) and the base run is stalling on hard prompts. Keep it at
+`0.0` for a clean apples-to-apples SDC-TR baseline: at `0.0` the loss is
+bit-for-bit identical to the previous implementation. It only makes sense with
+SDC enabled, because it needs both teachers; the reliability gate keeps it near
+zero until the teachers are trustworthy.
+
+Ready-made arms: `sdc_tr_zeroadv/{drgrpo,dapo,avspo}_a0.5_dg0.5.sh`
+(`SDC_TR_ALPHA=0.5`, `SDC_TR_DEGENERATE_COEF=0.5`). They get their own run and
+wandb names (`..._sdc_tr_a0.5_dg0.5`) so they never overwrite the plain
+`sdc_tr/*_a0.5` checkpoints. Any other value works too, e.g.
+
+```bash
+SDC_TR_DEGENERATE_COEF=0.25 bash examples/sdc_grid/sdc_tr/dapo_a0.7.sh
+```
+
+The hydra override is emitted **only** when `SDC_TR_DEGENERATE_COEF` is set
+explicitly, so the 12 original `sdc_tr` arms produce an unchanged override list.
+
+New metrics: `sdc_tr/degenerate_coef`, `sdc_tr/mu_eff`,
+`sdc_tr/degenerate_token_fraction`, `sdc_tr/pseudo_advantage_abs_mean`.
 
 ## Running
 

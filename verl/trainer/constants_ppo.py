@@ -115,6 +115,7 @@ def get_ppo_ray_runtime_env():
         "CUDA_HOME",
         "CUDA_PATH",
         "CUDACXX",
+        "CC",
         "CPATH",
         "TRITON_CACHE_DIR",
     ):

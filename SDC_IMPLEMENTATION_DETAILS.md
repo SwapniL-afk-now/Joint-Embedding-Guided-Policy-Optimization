@@ -290,6 +290,64 @@ reliability_gate = clamp(2 * (ema - 0.5), 0, 1)
 
 The gate multiplies `L_SDC`. Probe failures retain the previous gate.
 
+## 12b. SDC-TR zero-advantage repair (`sdc_tr_degenerate_coef`)
+
+`compute_policy_loss_sdc_tr()` in `verl/trainer/ppo/core_algos.py` implements the
+trust-region form of SDC: the teacher contrast tilts the PPO importance ratio
+instead of being added as a separate loss term.
+
+**The problem.** Group-centered advantages (Dr.GRPO / GRPO) subtract the group
+mean. A group in which every sampled response is wrong therefore has `A == 0` on
+every one of its tokens. The objective is `-A * tilted_ratio`, so the whole group
+produces **no gradient at all** — the hardest prompts are silently dropped from
+the update. The tilt cannot fix this, because it is a multiplicative factor on a
+quantity that is already zero.
+
+**The repair.** The opt-in knob
+`actor_rollout_ref.actor.policy_loss.sdc_tr_degenerate_coef` (default `0.0`)
+injects a pseudo-advantage on the *active failed* tokens whose advantage is
+exactly zero:
+
+```text
+mu_eff            = sdc_tr_degenerate_coef * reliability_gate
+c_t               = normalize(log pi_failure_t - log pi_success_t)   # detached
+degenerate_mask   = response_mask AND failure_mask AND (A == 0)
+pseudo_A_t        = -mu_eff * c_t          on degenerate_mask, else 0
+A_eff_t           = A_t + pseudo_A_t
+```
+
+`c_t` is the same detached, centered-and-RMS-normalized teacher contrast the tilt
+uses, so the two share one normalization and one reliability gate.
+
+**Sign convention.** `c_t > 0` means the *failure* teacher assigns the token more
+probability than the success teacher, i.e. the token looks like failure-specific
+behaviour. Then `pseudo_A_t < 0`, and gradient descent **lowers** its log-prob.
+`c_t < 0` means the *success* teacher wins, `pseudo_A_t > 0`, and descent
+**raises** the log-prob. The pseudo-advantage is detached and is consumed by the
+normal PPO clip / dual-clip path, so the trust region and `clip_ratio_c` still
+bound the update exactly as for a real advantage.
+
+**Safety properties.**
+- `sdc_tr_degenerate_coef == 0.0` (the default) is bit-for-bit identical to the
+  previous SDC-TR implementation; the repair branch never runs.
+- The repair also requires both teachers to be available; without them `mu_eff`
+  has no contrast to act on and the branch is skipped.
+- `mu_eff` is scaled by the reliability gate (Section 12), so an untrusted
+  discriminator injects (near) nothing.
+- Only tokens with `A == 0` are touched. Groups with real learning signal are
+  untouched.
+
+**Metrics.** `sdc_tr/degenerate_coef` (the configured constant),
+`sdc_tr/mu_eff` (after gating), `sdc_tr/degenerate_token_fraction` (share of
+response tokens that received a pseudo-advantage) and
+`sdc_tr/pseudo_advantage_abs_mean` (its mean magnitude on those tokens).
+
+**When to use it.** Enable it when `sdc_tr/degenerate_token_fraction` is large —
+typically early math-RL training, where many groups are all-wrong — and progress
+on hard prompts has stalled. Keep it at `0.0` for a clean SDC-TR baseline.
+Launchers: `SDC_TR_DEGENERATE_COEF` in `examples/sdc_grid/common.sh`, with
+ready-made arms in `examples/sdc_grid/sdc_tr_zeroadv/`.
+
 ## 13. Checkpoint format
 
 ```text

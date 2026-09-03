@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
 import torch
@@ -116,6 +117,26 @@ class SDCShardedTeacherPair:
         if int(getattr(self.owner.model_config, "lora_rank", 0) or 0) > 0:
             raise ValueError("full_fsdp SDC teachers require actor model.lora_rank=0")
         module = self.owner._build_module()
+        # The ordinary HF causal-LM forward materializes logits for every input
+        # position and vocabulary entry. SDC only needs the exact log-probability
+        # of each sampled token. Install the existing Triton fused linear
+        # cross-entropy forward on each sidecar instance (not its class, so the
+        # actor's forward path is untouched) before FSDP wraps the module.
+        model_type = str(getattr(getattr(module, "config", None), "model_type", ""))
+        if (
+            bool(self.config.get("use_fused_log_probs", True))
+            and not model_type.endswith("_vl")
+            and hasattr(module, "model")
+            and hasattr(module, "lm_head")
+        ):
+            from verl.models.transformers.dense_common import forward_with_triton_backend
+
+            # Keep both modes: scoring runs no-grad and can use the fused
+            # sampled-token path, whereas SFT backward needs the ordinary
+            # logits-producing forward and its lower activation/scratch profile.
+            module._sdc_standard_forward = module.forward
+            module._sdc_fused_forward = MethodType(forward_with_triton_backend, module)
+            module.forward = module._sdc_fused_forward
         module = self.owner._build_fsdp_module(module)
         module.train(True)
         optimizer = torch.optim.AdamW(
@@ -383,6 +404,16 @@ class SDCShardedTeacherPair:
             response[index, : row.numel()] = masks[index]
         return ids, attention, response
 
+    @staticmethod
+    def _sdc_select_forward(teacher: torch.nn.Module, *, fused: bool) -> None:
+        """Switch a sidecar between no-grad scoring and trainable SFT forward."""
+        module = getattr(teacher, "_fsdp_wrapped_module", teacher)
+        standard = getattr(module, "_sdc_standard_forward", None)
+        fused_forward = getattr(module, "_sdc_fused_forward", None)
+        if standard is None or fused_forward is None:
+            return
+        module.forward = fused_forward if fused else standard
+
     def _sft_loss(self, teacher: torch.nn.Module, ids, attention, response, global_valid: int) -> torch.Tensor:
         output = teacher(input_ids=ids, attention_mask=attention, use_cache=False, return_dict=True)
         labels = ids[:, 1:].contiguous()
@@ -419,6 +450,10 @@ class SDCShardedTeacherPair:
         total_loss = 0.0
         total_tokens = 0
         updates = 0
+        # Fused linear CE is for inference-like scoring only. SFT needs the
+        # standard logits forward because its backward path retains large
+        # vocabulary scratch buffers.
+        self._sdc_select_forward(teacher, fused=False)
         for start in range(0, len(records), batch_size):
             batch_records = records[start : start + batch_size]
             # Every rank receives the same number of examples and therefore the
@@ -440,6 +475,7 @@ class SDCShardedTeacherPair:
             total_loss += float(loss.detach().cpu())
             total_tokens += int(self._all_reduce(torch.tensor([int(response.sum())], device=self.device, dtype=torch.int64)).item())
             updates += 1
+        self._sdc_select_forward(teacher, fused=True)
         return {
             f"sdc/{outcome}_sft_updates": float(updates),
             f"sdc/{outcome}_sft_loss": total_loss / max(updates, 1),

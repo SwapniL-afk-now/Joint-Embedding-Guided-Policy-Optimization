@@ -2283,7 +2283,11 @@ def compute_policy_loss_sdc_tr(
 
     alpha = float(config.policy_loss.sdc_tr_alpha)
     tilt_clip = float(config.policy_loss.sdc_tr_tilt_clip)
+    # Zero-advantage repair coefficient. 0.0 (default) keeps this function
+    # bit-for-bit identical to the ratio-tilt-only formulation.
+    degenerate_coef = float(getattr(config.policy_loss, "sdc_tr_degenerate_coef", 0.0) or 0.0)
     lambda_eff = (1.0 - alpha) * float(reliability_gate)
+    mu_eff = degenerate_coef * float(reliability_gate)
 
     response_mask_bool = response_mask.to(torch.bool)
     log_ratio_base_raw = log_prob - old_log_prob
@@ -2292,25 +2296,60 @@ def compute_policy_loss_sdc_tr(
     negative_approx_kl = torch.clamp(log_ratio_base_raw, min=-20.0, max=20.0)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    tilt_active = lambda_eff != 0.0 and success_log_prob is not None and failure_log_prob is not None and failure_mask is not None
-    if tilt_active:
+    teachers_available = success_log_prob is not None and failure_log_prob is not None and failure_mask is not None
+    tilt_active = lambda_eff != 0.0 and teachers_available
+    degenerate_active = mu_eff != 0.0 and teachers_available
+    if tilt_active or degenerate_active:
         active_mask = response_mask_bool & failure_mask.to(device=response_mask.device, dtype=torch.bool).reshape(-1, 1)
         raw_contrast = (failure_log_prob - success_log_prob).detach().to(device=log_prob.device, dtype=log_prob.dtype)
         c, contrast_center_t, contrast_rms_t = normalize_contrast(
             raw_contrast, active_mask, center=contrast_center, rms=contrast_rms
         )
+        contrast_mean = verl_F.masked_mean(c, active_mask).detach().item()
+    else:
+        active_mask = torch.zeros_like(response_mask_bool)
+        c = None
+        contrast_center_t = torch.zeros((), device=log_prob.device)
+        contrast_rms_t = torch.ones((), device=log_prob.device)
+        contrast_mean = 0.0
+
+    if tilt_active:
         tilt_bound = math.log(tilt_clip)
         raw_tilt = lambda_eff * c
         tilt_log = torch.where(active_mask, raw_tilt.clamp(min=-tilt_bound, max=tilt_bound), torch.zeros_like(raw_tilt))
         tilt_clip_fraction = verl_F.masked_mean((raw_tilt.abs() > tilt_bound).float(), active_mask).detach().item()
-        contrast_mean = verl_F.masked_mean(c, active_mask).detach().item()
     else:
-        active_mask = torch.zeros_like(response_mask_bool)
         tilt_log = torch.zeros_like(log_ratio_base_raw)
-        contrast_center_t = torch.zeros((), device=log_prob.device)
-        contrast_rms_t = torch.ones((), device=log_prob.device)
         tilt_clip_fraction = 0.0
-        contrast_mean = 0.0
+
+    # Zero-advantage (all-wrong group) repair.
+    #
+    # Dr.GRPO/GRPO advantages are group-centered, so a group in which every
+    # sampled response is wrong has A == 0 on every token. The tilted ratio
+    # above multiplies A, so such a group contributes no gradient at all --
+    # exactly the region SDC is meant to help. Here the detached contrast is
+    # injected as a pseudo-advantage on those tokens instead:
+    #
+    #     A_eff = A - mu_eff * c   (only where A == 0 on active failed tokens)
+    #
+    # Descent on -A_eff * ratio then moves log pi_theta DOWN where the failure
+    # teacher wins (c > 0) and UP where the success teacher wins (c < 0). The
+    # term flows through the ordinary PPO clip / dual-clip machinery, so its
+    # step size stays bounded, and it vanishes on any group that already
+    # carries a reward signal.
+    if degenerate_active:
+        degenerate_mask = active_mask & (advantages == 0)
+        pseudo_advantages = torch.where(degenerate_mask, -mu_eff * c, torch.zeros_like(c)).detach()
+        advantages = advantages + pseudo_advantages
+        degenerate_token_fraction = verl_F.masked_mean(degenerate_mask.float(), response_mask_bool).detach().item()
+        pseudo_adv_abs_mean = (
+            verl_F.masked_mean(pseudo_advantages.abs(), degenerate_mask).detach().item()
+            if bool(degenerate_mask.any())
+            else 0.0
+        )
+    else:
+        degenerate_token_fraction = 0.0
+        pseudo_adv_abs_mean = 0.0
 
     log_r = (log_ratio_base_raw + tilt_log).clamp(min=-20.0, max=20.0)
     ratio = log_r.exp()
@@ -2345,9 +2384,13 @@ def compute_policy_loss_sdc_tr(
         "sdc_tr/reliability_gate": float(reliability_gate),
         "sdc_tr/lambda_eff": lambda_eff,
         "sdc_tr/contrast_mean": contrast_mean,
-        "sdc_tr/contrast_rms": float(contrast_rms_t.detach().item()) if tilt_active else 1.0,
+        "sdc_tr/contrast_rms": float(contrast_rms_t.detach().item()) if (tilt_active or degenerate_active) else 1.0,
         "sdc_tr/tilt_clip_fraction": tilt_clip_fraction,
         "sdc_tr/active_failed_token_fraction": active_token_fraction,
+        "sdc_tr/degenerate_coef": degenerate_coef,
+        "sdc_tr/mu_eff": mu_eff,
+        "sdc_tr/degenerate_token_fraction": degenerate_token_fraction,
+        "sdc_tr/pseudo_advantage_abs_mean": pseudo_adv_abs_mean,
     }
     return pg_loss, pg_metrics
 

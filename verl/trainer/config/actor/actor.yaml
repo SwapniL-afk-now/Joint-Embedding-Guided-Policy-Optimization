@@ -81,6 +81,13 @@ policy_loss:
   # Symmetric multiplicative bound on the SDC-TR tilt factor exp(lambda_eff * c)
   sdc_tr_tilt_clip: 10.0
 
+  # Zero-advantage (all-wrong group) repair coefficient for the 'sdc_tr' loss mode.
+  # Dr.GRPO advantages are group-centered, so a group where every response is wrong has
+  # A == 0 everywhere and yields no gradient. When > 0, a detached pseudo-advantage
+  # A_eff = A - coef * reliability_gate * c is injected on those active zero-advantage
+  # failed tokens. 0.0 = disabled (loss bit-for-bit unchanged).
+  sdc_tr_degenerate_coef: 0.0
+
 # Token-weighted sequence-level Wasserstein guidance auxiliary loss
 wasserstein_guidance:
 

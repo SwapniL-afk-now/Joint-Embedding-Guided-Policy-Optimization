@@ -20,6 +20,10 @@ class SDCConfig:
     vllm_score_micro_batch_size: int = 16
     reuse_rollout_log_probs: bool = False
     verify_rollout_log_probs: bool = False
+    # Use the model's fused linear-cross-entropy path when available for SDC
+    # teacher scoring. This computes exact sampled-token log-probs without
+    # materializing a dense [batch, sequence, vocab] logits tensor.
+    use_fused_log_probs: bool = True
     use_importance_weight: bool = True
     importance_weight_clip: float = 10.0
     base_mix_gamma: float = 0.9
